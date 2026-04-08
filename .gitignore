@@ -17,6 +17,9 @@ external/
 # Built binaries
 .local/
 
+# Search databases (built locally)
+data/
+
 # Run outputs
 runs/
 experiments/runs/

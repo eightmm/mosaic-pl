@@ -389,6 +389,14 @@ def write_example_config(path: Path, preset: str = "balanced") -> None:
     config["protenix_dock"]["size_x"] = 20.0
     config["protenix_dock"]["size_y"] = 20.0
     config["protenix_dock"]["size_z"] = 20.0
+    config["autodock_gpu"]["receptor_pdbqt"] = "/path/to/receptor.pdbqt"
+    config["autodock_gpu"]["ligand_pdbqt"] = "/path/to/ligand.pdbqt"
+    config["autodock_gpu"]["center_x"] = 0.0
+    config["autodock_gpu"]["center_y"] = 0.0
+    config["autodock_gpu"]["center_z"] = 0.0
+    config["autodock_gpu"]["size_x"] = 20.0
+    config["autodock_gpu"]["size_y"] = 20.0
+    config["autodock_gpu"]["size_z"] = 20.0
     config["slurm"]["partition"] = "gpu"
     dump_structured_file(config, path)
 

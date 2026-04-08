@@ -142,23 +142,109 @@ def pdb_to_pdbqt(pdb_path: Path, output_path: Path) -> Path:
 def find_best_cofolding_structure(cofolding_dir: Path, model: str) -> Path | None:
     """Find the best-ranked structure from cofolding output."""
     if model == "boltz":
-        # Boltz: boltz_results_*/predictions/*/*.cif
         for cif in sorted(cofolding_dir.rglob("predictions/**/*.cif")):
             return cif
     elif model == "protenix":
-        # Protenix: **/*.cif ranked by name
         for cif in sorted(cofolding_dir.rglob("*.cif")):
             return cif
     elif model == "alphafold3":
-        # AF3: **/fold_*_model.cif
         for cif in sorted(cofolding_dir.rglob("*model*.cif")):
             return cif
 
-    # Generic fallback
     for cif in sorted(cofolding_dir.rglob("*.cif")):
         return cif
     for pdb in sorted(cofolding_dir.rglob("*.pdb")):
         return pdb
+    return None
+
+
+def read_confidence_score(cofolding_dir: Path, model: str) -> float:
+    """Read average confidence score from cofolding output."""
+    try:
+        if model == "boltz":
+            for npz in cofolding_dir.rglob("plddt_*model_0.npz"):
+                import numpy as np
+                data = np.load(str(npz))
+                return float(data[data.files[0]].mean())
+        elif model == "protenix":
+            for json_f in cofolding_dir.rglob("*confidence*.json"):
+                data = json.loads(json_f.read_text())
+                if "plddt" in data:
+                    return float(sum(data["plddt"]) / len(data["plddt"]))
+        elif model == "alphafold3":
+            for json_f in cofolding_dir.rglob("*confidence*.json"):
+                data = json.loads(json_f.read_text())
+                if "atom_plddts" in data:
+                    return float(sum(data["atom_plddts"]) / len(data["atom_plddts"]))
+    except Exception:
+        pass
+    return -1.0
+
+
+def select_best_model(output_root: Path) -> tuple[str, Path]:
+    """Auto-select best cofolding model by confidence score."""
+    candidates = []
+    for model in ("boltz", "protenix", "alphafold3"):
+        model_dir = output_root / "outputs" / model
+        if not model_dir.exists():
+            continue
+        structure = find_best_cofolding_structure(model_dir, model)
+        if structure is None:
+            continue
+        score = read_confidence_score(model_dir, model)
+        candidates.append((model, model_dir, structure, score))
+        print(f"  Model {model}: pLDDT={score:.1f}, structure={structure.name}")
+
+    if not candidates:
+        return ("", Path())
+
+    # Sort by confidence score descending, pick best
+    candidates.sort(key=lambda x: x[3], reverse=True)
+    best = candidates[0]
+    print(f"  Selected: {best[0]} (pLDDT={best[3]:.1f})")
+    return (best[0], best[1])
+
+
+def run_p2rank(pdb_path: Path, output_dir: Path) -> tuple[list[float], list[float]] | None:
+    """Run P2Rank binding site prediction and return (center, size) of top pocket."""
+    import subprocess
+    import csv
+
+    prank_bin = Path(__file__).resolve().parent.parent / ".local" / "bin" / "prank"
+    if not prank_bin.exists():
+        print("  P2Rank not found, skipping binding site prediction.")
+        return None
+
+    p2rank_out = output_dir / "p2rank"
+    try:
+        subprocess.run(
+            [str(prank_bin), "predict", "-f", str(pdb_path), "-o", str(p2rank_out)],
+            check=True, capture_output=True, text=True, timeout=120,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+        print(f"  P2Rank failed: {e}")
+        return None
+
+    # Parse predictions CSV
+    pred_file = p2rank_out / f"{pdb_path.name}_predictions.csv"
+    if not pred_file.exists():
+        print("  P2Rank produced no predictions file.")
+        return None
+
+    with open(pred_file) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            # First row = top-ranked pocket
+            cx = float(row["center_x"].strip())
+            cy = float(row["center_y"].strip())
+            cz = float(row["center_z"].strip())
+            # Estimate box size from SAS points (rough heuristic)
+            sas = int(row["sas_points"].strip())
+            box_side = max(15.0, min(35.0, sas * 0.3))
+            print(f"  P2Rank pocket 1: center=[{cx:.1f}, {cy:.1f}, {cz:.1f}], score={row['score'].strip()}")
+            return ([cx, cy, cz], [box_side, box_side, box_side])
+
+    print("  P2Rank found no pockets.")
     return None
 
 
@@ -232,10 +318,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Prepare docking inputs from unified input + cofolding output.")
     parser.add_argument("--input-yaml", type=Path, help="Unified input YAML (Boltz format).")
     parser.add_argument("--input-json", type=Path, help="Protenix/AF3 input JSON (alternative to YAML).")
-    parser.add_argument("--cofolding-dir", type=Path, required=True, help="Cofolding output directory.")
+    parser.add_argument("--cofolding-dir", type=Path, help="Cofolding output directory (single model).")
+    parser.add_argument("--run-dir", type=Path, help="Run directory (auto-selects best model from outputs/).")
     parser.add_argument("--output-dir", type=Path, required=True, help="Output directory for docking inputs.")
-    parser.add_argument("--model", type=str, default="boltz", choices=["boltz", "protenix", "alphafold3"],
-                        help="Which cofolding model produced the structure.")
+    parser.add_argument("--model", type=str, default="auto", choices=["auto", "boltz", "protenix", "alphafold3"],
+                        help="Which cofolding model to use. 'auto' selects by confidence score.")
+    parser.add_argument("--use-p2rank", action="store_true", default=True,
+                        help="Use P2Rank for binding site prediction (default: true).")
+    parser.add_argument("--no-p2rank", action="store_true", help="Disable P2Rank binding site prediction.")
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -253,29 +343,57 @@ def main() -> int:
         print("  No ligands with SMILES found, skipping ligand preparation.")
         return 0
 
-    # 2. Convert SMILES → SDF → PDBQT for each ligand
+    # 2. Convert SMILES → SDF → PDBQT for ALL ligands
     for lig_id, smiles in ligands:
         print(f"  Preparing ligand {lig_id}: {smiles}")
         sdf_path = smiles_to_sdf(smiles, args.output_dir / f"ligand_{lig_id}.sdf", name=lig_id)
         sdf_to_pdbqt(sdf_path, args.output_dir / f"ligand_{lig_id}.pdbqt")
 
-    # 3. Find best cofolding structure → receptor PDB → PDBQT
-    structure = find_best_cofolding_structure(args.cofolding_dir, args.model)
+    # 3. Select best cofolding structure
+    cofolding_dir = args.cofolding_dir
+    model = args.model
+
+    if model == "auto" and args.run_dir:
+        # Auto-select by comparing confidence scores across all models
+        print("  Auto-selecting best cofolding model...")
+        model, cofolding_dir = select_best_model(args.run_dir)
+        if not model:
+            print("  ERROR: No cofolding outputs found for auto-selection.")
+            return 1
+    elif model == "auto" and cofolding_dir:
+        # Single dir provided, guess model from path
+        dirname = cofolding_dir.name
+        model = dirname if dirname in ("boltz", "protenix", "alphafold3") else "boltz"
+
+    structure = find_best_cofolding_structure(cofolding_dir, model)
     if structure is None:
-        print(f"  WARNING: No cofolding structure found in {args.cofolding_dir}")
+        print(f"  WARNING: No cofolding structure found in {cofolding_dir}")
         return 0
 
     print(f"  Using cofolding structure: {structure}")
     if structure.suffix in (".cif", ".mmcif"):
         pdb_path = cif_to_pdb(structure, args.output_dir / "receptor.pdb")
     else:
-        pdb_path = structure  # Already PDB
+        pdb_path = structure
 
     pdb_to_pdbqt(pdb_path, args.output_dir / "receptor.pdbqt")
 
-    # 4. Compute docking box from ligand
-    first_sdf = args.output_dir / f"ligand_{ligands[0][0]}.sdf"
-    center, size = compute_box_from_ligand(first_sdf)
+    # 4. Determine docking box: P2Rank > ligand coordinates fallback
+    center, size = None, None
+    box_method = "fallback"
+
+    if not args.no_p2rank:
+        print("  Running P2Rank binding site prediction...")
+        p2rank_result = run_p2rank(pdb_path, args.output_dir)
+        if p2rank_result:
+            center, size = p2rank_result
+            box_method = "p2rank"
+
+    if center is None:
+        # Fallback: compute from ligand 3D coordinates
+        first_sdf = args.output_dir / f"ligand_{ligands[0][0]}.sdf"
+        center, size = compute_box_from_ligand(first_sdf)
+        box_method = "ligand_coordinates"
 
     # 5. Write summary JSON
     summary = {
@@ -292,13 +410,14 @@ def main() -> int:
         ],
         "box_center": center,
         "box_size": size,
+        "box_method": box_method,
         "cofolding_structure": str(structure),
-        "cofolding_model": args.model,
+        "cofolding_model": model,
     }
     summary_path = args.output_dir / "docking_prep_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2) + "\n")
     print(f"  Summary: {summary_path}")
-    print(f"  Box center: {center}")
+    print(f"  Box center: {center} (method: {box_method})")
     print(f"  Box size: {size}")
 
     return 0

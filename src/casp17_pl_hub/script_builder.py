@@ -115,9 +115,9 @@ def build_wrapper_shell_script(
                 f'echo "----------------------------------------------------------------"',
                 f"{shlex.quote(str(dock_python))} {shlex.quote(str(prep_script))} "
                 f"--input-yaml {shlex.quote(str(run_dir / 'inputs' / 'boltz_input.yaml'))} "
-                f"--cofolding-dir {shlex.quote(str(run_dir / 'outputs' / 'boltz'))} "
+                f"--run-dir {shlex.quote(str(run_dir))} "
                 f"--output-dir {shlex.quote(str(run_dir / 'inputs' / 'docking'))} "
-                f"--model boltz",
+                f"--model auto",
                 "",
             ])
         lines.extend(

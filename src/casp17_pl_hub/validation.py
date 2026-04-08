@@ -204,8 +204,12 @@ def validate_run(
             warnings.append(
                 "Protenix-Dock currently expects prebuilt receptor_pdb and ligand_sdf files; file generation is not automated from the Boltz YAML input yet."
             )
-        if not config.vina.enabled and not config.protenix_dock.enabled:
-            errors.append("Docking stage is selected but neither AutoDock Vina nor Protenix-Dock is enabled.")
+        if config.autodock_gpu.enabled:
+            _validate_command_target(
+                errors, repo_root, config.autodock_gpu.binary, "autodock_gpu.binary", enabled=True
+            )
+        if not config.vina.enabled and not config.protenix_dock.enabled and not config.autodock_gpu.enabled:
+            errors.append("Docking stage is selected but no docking tool (vina, autodock_gpu, protenix_dock) is enabled.")
 
     return ValidationReport(errors=errors, warnings=warnings, infos=infos)
 
@@ -248,7 +252,7 @@ def _resolve_stages(
         resolved.append("cofolding")
     if config.template_search_structure.enabled:
         resolved.append("template-search-structure")
-    if config.vina.enabled or config.protenix_dock.enabled:
+    if config.vina.enabled or config.autodock_gpu.enabled or config.protenix_dock.enabled:
         resolved.append("docking")
     if not resolved and not allow_empty:
         raise ValueError("No stage is enabled or requested.")
