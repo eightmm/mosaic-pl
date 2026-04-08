@@ -1,0 +1,35 @@
+# Python
+.venv/
+.venvs/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+dist/
+build/
+
+# External models (cloned separately via install script)
+external/
+
+# Built binaries
+.local/
+
+# Run outputs
+runs/
+experiments/runs/
+experiments/logs/
+
+# SLURM logs
+slurm-*.out
+slurm-*.err
+
+# OS
+.DS_Store
+
+# Claude Code / OMC
+.agents/
+.omc/
+plugins/
