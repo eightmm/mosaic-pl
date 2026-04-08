@@ -35,6 +35,8 @@ if [[ "${1:-}" == "--verify" ]]; then
   .venvs/alphafold3/bin/python -c "import alphafold3; print('alphafold3-import-ok')" && ok "AlphaFold3" || fail "AlphaFold3"
   .venvs/protenix-dock/bin/python -c "from pxdock import ProtenixDock; print('pxdock-ok')" && ok "Protenix-Dock" || fail "Protenix-Dock"
   .venvs/protenix-dock/bin/python -c "import vina; print('vina-ok')" && ok "Vina (Python)" || fail "Vina"
+  .local/bin/mmseqs version 2>/dev/null && ok "MMseqs2" || fail "MMseqs2"
+  .local/bin/foldseek version 2>/dev/null && ok "Foldseek" || fail "Foldseek"
   .local/bin/autogrid4 --version 2>/dev/null | head -1 && ok "autogrid4" || fail "autogrid4"
   [ -f .local/bin/autodock_gpu_128wi ] && ok "AutoDock-GPU binary" || echo "  ⚠ AutoDock-GPU not built yet (run: srun ... bash scripts/build_autodock_gpu.sh)"
 
@@ -134,11 +136,31 @@ PATH=".venvs/protenix-dock/bin:$PATH" \
 ok "Protenix-Dock + Vina installed"
 
 # ---------------------------------------------------------------------------
-# [5/5] AutoGrid4 + AutoDock-GPU
+# [5/5] Search & Docking Binaries
 # ---------------------------------------------------------------------------
-banner "[5/5] Building AutoGrid4"
+banner "[5/5] Installing search & docking binaries"
 
 mkdir -p .local/bin
+
+# MMseqs2 (sequence search)
+if [ ! -f .local/bin/mmseqs ]; then
+  curl -L https://mmseqs.com/latest/mmseqs-linux-avx2.tar.gz | tar -xz -C /tmp/
+  cp /tmp/mmseqs/bin/mmseqs .local/bin/
+  ok "MMseqs2 installed"
+else
+  ok "MMseqs2 already installed"
+fi
+
+# Foldseek (structure search)
+if [ ! -f .local/bin/foldseek ]; then
+  curl -L https://mmseqs.com/foldseek/foldseek-linux-avx2.tar.gz | tar -xz -C /tmp/
+  cp /tmp/foldseek/bin/foldseek .local/bin/
+  ok "Foldseek installed"
+else
+  ok "Foldseek already installed"
+fi
+
+# AutoGrid4 (required by AutoDock-GPU)
 pushd external/AutoGrid >/dev/null
 autoreconf -i 2>/dev/null
 ./configure --prefix="${ROOT_DIR}/.local" --quiet
