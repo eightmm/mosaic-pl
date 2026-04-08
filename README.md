@@ -1,106 +1,168 @@
 # CASP17 Protein-Ligand Hub
 
 Unified Python workspace for CASP17 protein-ligand structure prediction and docking pipelines.
-Orchestrates external ML models (Boltz, Protenix, AlphaFold3) and template search tools (MMseqs2, Foldseek) with final docking via AutoDock Vina or Protenix-Dock.
+Orchestrates external ML models (Boltz2, Protenix v2, AlphaFold3) and template search tools (MMseqs2, Foldseek) with docking via AutoDock Vina, AutoDock-GPU, and Protenix-Dock.
 
 ## Setup
 
-```bash
-# Install dependencies
-uv sync --dev
+### Prerequisites
 
-# Install external models (Boltz, Protenix, AlphaFold3) into isolated venvs
+```bash
+# System packages (Ubuntu)
+sudo apt-get install -y libboost-all-dev autoconf automake libtool
+
+# uv (Python package manager)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+### Installation
+
+```bash
+# 1. Clone and enter project
+git clone <repo-url> CASP17 && cd CASP17
+
+# 2. Install all external models + tools
 bash scripts/install_external_models.sh
 
-# Verify installation
-bash scripts/verify_external_models.sh
+# 3. Build AutoDock-GPU on a GPU node
+srun --partition=6000ada --gres=gpu:1 bash scripts/build_autodock_gpu.sh
 
-# Check workspace status
+# 4. Verify everything
+bash scripts/install_external_models.sh --verify
+
+# 5. Check workspace status
 uv run casp17-pl status
 ```
 
-`status` shows: Python version, external model venv status, SLURM partition info, available tools (mmseqs, foldseek, vina).
+### What Gets Installed
+
+| Tool | venv / Location | Version |
+|------|----------------|---------|
+| Boltz2 | `.venvs/boltz` (Python 3.12) | latest + cuequivariance |
+| Protenix v2 | `.venvs/protenix` (Python 3.12) | v2.0.0 + TFG guidance |
+| AlphaFold3 | `.venvs/alphafold3` (Python 3.12) | latest |
+| Protenix-Dock | `.venvs/protenix-dock` (Python 3.11) | v0.0.1 |
+| AutoDock Vina | `.venvs/protenix-dock` (shared) | 1.2.7 |
+| AutoDock-GPU | `.local/bin/autodock_gpu_128wi` | v1.6 (CUDA) |
+| autogrid4 | `.local/bin/autogrid4` | 4.2.8 |
+| meeko | `.venvs/protenix-dock` (shared) | ligand PDBQT prep |
+| gemmi | `.venvs/protenix-dock` (shared) | CIF/PDB conversion |
+| pdb2pqr | `.venvs/protenix-dock` (shared) | receptor protonation |
 
 ## Quick Start
 
 ```bash
-# 1. Generate example input and config files
-uv run casp17-pl write-example-input
-uv run casp17-pl write-example-config --preset balanced
+# 1. Create input YAML (protein sequence + ligand SMILES)
+cat > my_target.yaml << 'EOF'
+version: 1
+seed: 42
+sequences:
+  - protein:
+      id: A
+      sequence: MVTPEGNVSLVDESLLVGVT...
+      msa: empty
+  - ligand:
+      id: L
+      smiles: "N[C@@H](Cc1ccc(O)cc1)C(=O)O"
+EOF
 
-# 2. Edit the generated files for your target
-#    - examples/unified_input.example.yaml  (protein sequence, ligand SMILES)
-#    - examples/runner_config.example.yaml   (model settings, paths, SLURM config)
-
-# 3. Validate configuration before submission
-uv run casp17-pl validate-run \
-  --input examples/unified_input.example.yaml \
-  --config examples/runner_config.example.yaml \
-  --backend slurm
-
-# 4. Prepare and submit cofolding job
+# 2. Run cofolding (Boltz + Protenix)
 uv run casp17-pl run-all \
-  --input examples/unified_input.example.yaml \
+  --input my_target.yaml \
   --config examples/runner_config.example.yaml \
-  --backend slurm \
+  --submit
+
+# 3. Or run full pipeline (cofolding + auto docking prep + docking)
+uv run casp17-pl run-wrapper \
+  --input my_target.yaml \
+  --config my_config.yaml \
+  --stages cofolding docking \
   --submit
 ```
 
 ## Pipeline Stages
 
-4 modular stages that can be combined in any order (respecting dependencies):
+```
+unified YAML (protein + ligand SMILES)
+  |
+  v
+[template-search-sequence]  MMseqs2 sequence search
+[template-search-structure] Foldseek structure search
+  |
+  v
+[cofolding]  Boltz2 / Protenix v2 / AlphaFold3
+  |
+  |--- [BRIDGE: Boltz MSA -> AF3]  (MSA reuse)
+  |
+  v
+[BRIDGE: Docking Input Prep]
+  |  SMILES -> 3D SDF -> PDBQT (RDKit + meeko)
+  |  CIF -> PDB -> PDBQT (gemmi + pdb2pqr)
+  |  Docking box auto-computed from ligand
+  |
+  v
+[docking]  AutoDock Vina / AutoDock-GPU / Protenix-Dock
+  |
+  v
+experiments/runs/<target>/outputs/
+```
 
-| Stage | Tool | Purpose |
-|-------|------|---------|
-| `template-search-sequence` | MMseqs2 | Sequence homology search against RCSB DB |
-| `template-search-structure` | Foldseek | Structure similarity search against RCSB DB |
-| `cofolding` | Boltz / Protenix / AlphaFold3 | Protein-ligand structure prediction |
-| `docking` | AutoDock Vina / Protenix-Dock | Molecular docking |
+### Stage Details
 
-### Stage Dependencies
+| Stage | Tools | GPU | Description |
+|-------|-------|-----|-------------|
+| `template-search-sequence` | MMseqs2 | No | Sequence homology search against RCSB DB |
+| `template-search-structure` | Foldseek | No | Structure similarity search, can use cofolding output |
+| `cofolding` | Boltz2, Protenix v2, AF3 | Yes | Protein-ligand complex structure prediction |
+| `docking` | Vina, AutoDock-GPU, Protenix-Dock | GPU optional | Molecular docking with auto-prepared inputs |
 
-- `template-search-structure` can reuse cofolding outputs as query (`query_from_cofolding: true`), in which case it must run AFTER `cofolding`
-- `docking` requires prebuilt receptor/ligand files (PDBQT for Vina, PDB+SDF for Protenix-Dock)
+### Automatic Bridge Steps
+
+The wrapper pipeline automatically inserts bridge steps:
+
+- **Boltz MSA -> AF3**: When both Boltz (with MSA server) and AF3 are enabled, Boltz's MSA CSV is converted to A3M and injected into AF3 input.
+- **Docking Input Prep**: Between cofolding and docking, SMILES are converted to SDF/PDBQT, receptor CIF is converted to PDB/PDBQT with protonation and charges, and the docking box is auto-computed.
 
 ## Input Format
 
-Single unified input in Boltz YAML format:
+Single unified Boltz-style YAML:
 
 ```yaml
 version: 1
+seed: 42
 sequences:
   - protein:
       id: A
       sequence: MVTPEGNVSLQ...
-      msa: empty                  # "empty" or path to .a3m file
+      msa: empty                  # "empty", path to .a3m, or omit for MSA server
   - ligand:
       id: L
       smiles: "N[C@@H](Cc1ccc(O)cc1)C(=O)O"
-constraints:
+templates:                         # optional structural templates
+  - path: /path/to/template.pdb
+    ids: [A]
+constraints:                       # optional
   - bond:
       atom1: [A, 1, CA]
       atom2: [L, 1, C1]
-properties:
+properties:                        # optional
   - affinity:
       binder: L
-seed: 101
 ```
 
-Adapters automatically convert this to model-specific formats (Boltz YAML, Protenix JSON, AlphaFold3 JSON, Vina config, etc.).
+Adapters automatically convert this to model-specific formats (Boltz YAML, Protenix JSON, AlphaFold3 JSON).
 
 ## Runner Config
 
-`runner_config.yaml` controls all model hyperparameters, tool paths, and SLURM settings.
+Controls all model hyperparameters, tool paths, and SLURM settings.
 
 ### Hyperparameter Presets
 
-| Preset | Boltz recycling | Boltz diffusion | Protenix cycle/step | AF3 recycles | Use Case |
-|--------|----------------|-----------------|---------------------|--------------|----------|
-| `fast` | 1 | 1 | 4/75 | 3 | Quick test runs |
-| `balanced` | 3 | 1 | 10/200 | 10 | Default production |
-| `quality` | 6 | 5 | 20/400 | 20 | Maximum accuracy |
-
-Generate a full config template with:
+| Preset | Boltz recycling/diffusion | Protenix cycle/step/sample | AF3 recycles/samples |
+|--------|--------------------------|---------------------------|---------------------|
+| `fast` | 1 / 1 | 4 / 75 / 1 | 3 / 1 |
+| `balanced` | 3 / 1 | 10 / 200 / 5 | 10 / 5 |
+| `quality` | 6 / 5 | 20 / 400 / 8 | 20 / 10 |
 
 ```bash
 uv run casp17-pl write-example-config --preset quality
@@ -109,175 +171,106 @@ uv run casp17-pl write-example-config --preset quality
 ### Key Config Sections
 
 ```yaml
-preset: balanced              # fast | balanced | quality
+preset: balanced
 
 boltz:
   enabled: true
-  binary: .venvs/boltz/bin/boltz
-  recycling_steps: 3
-  sampling_steps: 200
-  diffusion_samples: 1
+  use_msa_server: false        # true to fetch MSA from ColabFold
+  override: true               # overwrite existing results
 
 protenix:
   enabled: true
-  binary: .venvs/protenix/bin/protenix
-  cycle: 10
-  step: 200
-  sample: 5
+  model_name: protenix-v2      # new v2 model
+  use_tfg_guidance: false      # Training-Free Guidance
+  trimul_kernel: cuequivariance
+  triatt_kernel: cuequivariance
 
 alphafold3:
-  enabled: true
-  python_bin: .venvs/alphafold3/bin/python
-  script: external/alphafold3/run_alphafold.py
-  model_dir: /path/to/alphafold3/models
-  run_inference: true
+  enabled: false               # requires model weights
+  model_dir: /path/to/models
 
 vina:
-  enabled: false
-  receptor_pdbqt: /path/to/receptor.pdbqt
-  ligand_pdbqt: /path/to/ligand.pdbqt
-  center_x: 0.0
-  center_y: 0.0
-  center_z: 0.0
-  size_x: 20.0
-  size_y: 20.0
-  size_z: 20.0
+  enabled: true                # auto-detects receptor/ligand from prep bridge
+
+autodock_gpu:
+  enabled: true                # requires autogrid4 + GPU
+  nrun: 100
+  autostop: true
 
 protenix_dock:
-  enabled: false
-  receptor_pdb: /path/to/receptor.pdb
-  ligand_sdf: /path/to/ligand.sdf
+  enabled: true                # auto-detects receptor/ligand from prep bridge
+  cache_map_spacing: 0.175
 
 slurm:
   partition: 6000ada
   gpus: 1
-  cpus_per_task: 8
   mem: 64G
   time: "04:00:00"
 ```
 
+When using the wrapper pipeline (cofolding + docking), docking tools **auto-detect** receptor/ligand files and box parameters from the docking prep bridge output. No need to manually specify paths.
+
 ## CLI Commands
 
-### Status & Configuration
-
 ```bash
-casp17-pl status                                    # Check environment
-casp17-pl write-example-input                       # Generate input template
-casp17-pl write-example-config --preset balanced    # Generate config template
-```
+# Status & config
+casp17-pl status
+casp17-pl write-example-input
+casp17-pl write-example-config --preset balanced
 
-### Prepare (generate artifacts without execution)
+# Prepare (generate scripts without submitting)
+casp17-pl prepare-run --input IN --config CFG
+casp17-pl prepare-wrapper --input IN --config CFG --stages S1 S2
 
-```bash
-casp17-pl prepare-run --input IN --config CFG                        # Cofolding
-casp17-pl prepare-template-search-sequence --input IN --config CFG   # MMseqs2
-casp17-pl prepare-template-search-structure --input IN --config CFG  # Foldseek
-casp17-pl prepare-vina --input IN --config CFG                       # Vina docking
-casp17-pl prepare-protenix-dock --input IN --config CFG              # Protenix-Dock
-casp17-pl prepare-wrapper --input IN --config CFG --stages S1 S2     # Multi-stage
-```
-
-### Run (prepare + optional submit)
-
-```bash
-casp17-pl run-all --input IN --config CFG --submit                   # Cofolding
-casp17-pl run-template-search-sequence --input IN --config CFG --submit
-casp17-pl run-template-search-structure --input IN --config CFG --submit
+# Run (prepare + submit)
+casp17-pl run-all --input IN --config CFG --submit
+casp17-pl run-wrapper --input IN --config CFG --stages cofolding docking --submit
 casp17-pl run-vina --input IN --config CFG --submit
 casp17-pl run-protenix-dock --input IN --config CFG --submit
-casp17-pl run-wrapper --input IN --config CFG --stages S1 S2 --submit
-```
 
-### Validate
-
-```bash
+# Validate
 casp17-pl validate-run --input IN --config CFG --stages cofolding docking
 ```
 
-Checks: binary paths, file existence, stage ordering, entity IDs, bond constraints, SLURM config.
-
-### Common Arguments
-
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `--input` | (required) | Unified input YAML |
-| `--config` | (required) | Runner config YAML |
-| `--output-root` | `runs/` | Output directory |
-| `--backend` | `slurm` | `slurm` or `local` |
-| `--submit` | false | Execute generated script |
-| `--stages` | auto | Stage subset for wrapper/validate |
-
 ## Output Structure
 
-Each run generates artifacts in `runs/<target>/`:
-
 ```
-runs/target-name/
-├── inputs/
-│   ├── boltz_input.yaml
-│   ├── protenix_input.json
-│   ├── alphafold3_input.json
-│   └── vina_config.txt
-├── outputs/
-│   ├── boltz/
-│   ├── protenix/
-│   ├── alphafold3/
-│   └── vina/
-├── scripts/
-│   ├── run_structure.sbatch.sh
-│   └── run_wrapper.sbatch.sh
-└── run_manifest.json
-```
+experiments/runs/<target>/
+  inputs/
+    boltz_input.yaml
+    protenix_input.json
+    alphafold3_input.json
+    vina_config.txt
+    docking/
+      docking_prep_summary.json
+      receptor.pdb
+      receptor.pdbqt
+      ligand_L.sdf
+      ligand_L.pdbqt
+    autodock_gpu_grid/
+      receptor.gpf
+      receptor.maps.fld
+  outputs/
+    boltz/          -> .cif structures, PAE/PDE/pLDDT
+    protenix/       -> .cif structures, confidence scores
+    alphafold3/     -> .cif structures, confidence .json
+    vina/           -> docked.pdbqt, vina.log
+    autodock_gpu/   -> docking.dlg, poses
+    protenix_dock/  -> docking_results.json
+  scripts/
+    run_structure.sbatch.sh
+    run_docking.sbatch.sh
+    run_autodock_gpu.sh
+    run_protenix_dock.py
+    run_wrapper.sbatch.sh
+  run_manifest.json
 
-## Example Workflows
-
-### Cofolding only (Boltz + Protenix)
-
-```bash
-uv run casp17-pl run-all \
-  --input my_target.yaml \
-  --config my_config.yaml \
-  --submit
-```
-
-### Full pipeline (template search + cofolding + docking)
-
-```bash
-uv run casp17-pl run-wrapper \
-  --input my_target.yaml \
-  --config my_config.yaml \
-  --stages template-search-sequence cofolding docking \
-  --submit
+experiments/logs/
+  slurm-<jobid>.out
+  slurm-<jobid>.err
 ```
 
-### Structure search using cofolding outputs
-
-Set `query_from_cofolding: true` in config, then:
-
-```bash
-uv run casp17-pl run-wrapper \
-  --input my_target.yaml \
-  --config my_config.yaml \
-  --stages cofolding template-search-structure \
-  --submit
-```
-
-### Prepare only (dry run)
-
-```bash
-# Generate scripts without submitting
-uv run casp17-pl prepare-run --input my_target.yaml --config my_config.yaml
-
-# Inspect generated scripts
-cat runs/target-name/scripts/run_structure.sbatch.sh
-
-# Submit manually
-sbatch runs/target-name/scripts/run_structure.sbatch.sh
-```
-
-## MCP Server
-
-For Claude Code integration, an MCP server exposes 4 tools:
+## MCP Server (Claude Code Integration)
 
 ```bash
 uv run casp17-pl-mcp
@@ -288,40 +281,84 @@ uv run casp17-pl-mcp
 | `status` | Check workspace environment |
 | `validate` | Validate pipeline configuration |
 | `prepare_cofolding` | Prepare a cofolding run |
-| `list_presets` | List available hyperparameter presets |
+| `list_presets` | List hyperparameter presets |
+| `add_template` | Add PDB/CIF template to input YAML |
+| `create_input` | Create input YAML from parameters (sequence, SMILES, template) |
 
-## Template Search Databases
+## Template Support
 
-Build local MMseqs2/Foldseek databases from RCSB data:
+Add structural templates via input YAML or MCP:
 
-```bash
-bash scripts/build_template_search_dbs.sh \
-  --fasta /path/to/rcsb_pdb_seqres.txt \
-  --structures /path/to/rcsb_structures/ \
-  --output /path/to/search_dbs/
+```yaml
+# In unified input YAML
+templates:
+  - path: /path/to/template.pdb
+    ids: [A]  # optional chain filter
 ```
 
-See [docs/template_search.md](docs/template_search.md) for details.
+Templates are automatically passed to:
+- **Boltz**: native YAML template section
+- **Protenix**: `templatesPath` in proteinChain + `--use_template true`
+
+## Example Workflows
+
+### Cofolding only (Boltz + Protenix v2)
+
+```bash
+uv run casp17-pl run-all \
+  --input my_target.yaml \
+  --config my_config.yaml \
+  --submit
+```
+
+### Full pipeline (cofolding + docking with auto-prep)
+
+```bash
+uv run casp17-pl run-wrapper \
+  --input my_target.yaml \
+  --config my_config.yaml \
+  --stages cofolding docking \
+  --submit
+```
+
+### Boltz MSA -> AF3 reuse
+
+Enable `use_msa_server: true` in Boltz config + enable AF3. The bridge automatically converts Boltz MSA to A3M and patches AF3 input.
+
+### Template-guided prediction
+
+```yaml
+# my_target.yaml
+sequences:
+  - protein:
+      id: A
+      sequence: MMAS...
+      msa: empty
+templates:
+  - path: ./templates/7qtb_A.pdb
+    ids: [A]
+```
 
 ## Cluster Notes
 
 - **Master node has no GPU** -- only safe for YAML parsing, manifest generation, validation
-- **All inference/CUDA must run on compute nodes** via SLURM (`--submit` or manual `sbatch`)
-- **Isolated venvs** prevent dependency conflicts between models (`.venvs/boltz/`, `.venvs/protenix/`, `.venvs/alphafold3/`)
+- **All inference/CUDA must run on compute nodes** via SLURM
+- **Isolated venvs** prevent torch version conflicts (Boltz: 2.11+cu130, Protenix: 2.7+cu126, AF3: JAX)
+- Scripts auto-run `module load cuda/12.8` and add venv bins to PATH
 
 ## Development
 
 ```bash
 make sync       # uv sync --dev
-make test       # pytest
+make test       # pytest (19 tests)
 make lint       # ruff check src/
 ```
 
 ### Adding a New Model
 
-1. Add config dataclass to `models.py`
-2. Create `prepare_<model>()` in `adapters.py`
-3. Add orchestration function in `orchestrator.py`
+1. Add config dataclass to `configs.py`
+2. Create `prepare_<model>()` in `adapters.py` returning `PreparedModelRun`
+3. Add to `prepare_docking_run()` in `orchestrator.py`
 4. Add CLI subcommand in `cli.py`
 5. Add tests in `tests/test_cli.py`
 
@@ -329,10 +366,21 @@ make lint       # ruff check src/
 
 ```
 src/casp17_pl_hub/
-├── models.py        # Data models, validation, presets
-├── adapters.py      # Unified input -> model-specific format
-├── orchestrator.py  # Pipeline preparation, script generation
-├── cli.py           # CLI entry point (12+ subcommands)
-├── mcp_server.py    # MCP server (status, validate, prepare, presets)
-└── yaml_utils.py    # YAML serialization utilities
+  models.py          # CommonInput parsing, validation
+  configs.py         # RunnerConfig, model configs, presets
+  adapters.py        # Unified input -> model-specific formats
+  orchestrator.py    # Pipeline preparation, script generation
+  script_builder.py  # Shell script generation with banners/timing
+  cli.py             # CLI (15+ subcommands)
+  mcp_server.py      # MCP server (6 tools)
+  validation.py      # Pre-flight checks
+  io_utils.py        # File I/O helpers
+  yaml_utils.py      # YAML serialization
+
+scripts/
+  install_external_models.sh    # Full installation (clone + venv + build)
+  build_autodock_gpu.sh         # AutoDock-GPU CUDA build (GPU node)
+  bridge_boltz_msa_to_af3.py    # Boltz MSA CSV -> AF3 A3M conversion
+  prepare_docking_inputs.py     # SMILES -> SDF/PDBQT, CIF -> PDB/PDBQT
+  build_template_search_dbs.sh  # MMseqs2/Foldseek DB construction
 ```
