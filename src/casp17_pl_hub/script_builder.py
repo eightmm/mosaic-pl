@@ -43,6 +43,7 @@ def build_shell_script(
 
     for idx, model_run in enumerate(model_runs, 1):
         name_upper = model_run.model_name.upper()
+        var_name = model_run.model_name.replace("-", "_")
         venv_bin = Path(model_run.command[0]).resolve().parent
 
         # Insert bridge step: Boltz MSA → AF3 input patching
@@ -64,10 +65,10 @@ def build_shell_script(
             f'echo "  [{idx}/{total}] {name_upper}"',
             f'echo "================================================================"',
             f"export PATH={shlex.quote(str(venv_bin))}:$PATH",
-            f"_start_{model_run.model_name}=$SECONDS",
+            f"_start_{var_name}=$SECONDS",
             _render_command(model_run.command),
-            f'_elapsed_{model_run.model_name}=$(( SECONDS - _start_{model_run.model_name} ))',
-            f'echo "  [{idx}/{total}] {name_upper} done in ${{_elapsed_{model_run.model_name}}}s"',
+            f'_elapsed_{var_name}=$(( SECONDS - _start_{var_name} ))',
+            f'echo "  [{idx}/{total}] {name_upper} done in ${{_elapsed_{var_name}}}s"',
             f'echo "================================================================"',
             "",
         ])
