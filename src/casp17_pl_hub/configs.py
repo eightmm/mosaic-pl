@@ -763,53 +763,57 @@ class RunnerConfig:
                 "alphafold3.db_dirs must be set when AlphaFold3 data pipeline is enabled."
             )
         if pipeline in {"all", "vina", "docking"} and self.vina.enabled:
-            if not self.vina.receptor_pdbqt:
+            # In wrapper mode, docking prep bridge auto-generates receptor/ligand files
+            if pipeline != "docking" and not self.vina.receptor_pdbqt:
                 raise ValueError("vina.receptor_pdbqt must be set when AutoDock Vina is enabled.")
-            if not self.vina.ligand_pdbqt:
+            if pipeline != "docking" and not self.vina.ligand_pdbqt:
                 raise ValueError("vina.ligand_pdbqt must be set when AutoDock Vina is enabled.")
-            if not _all_or_none(
-                [
-                    self.vina.center_x,
-                    self.vina.center_y,
-                    self.vina.center_z,
-                    self.vina.size_x,
-                    self.vina.size_y,
-                    self.vina.size_z,
-                ]
-            ):
-                raise ValueError(
-                    "vina center_* and size_* must either all be set or all be omitted."
-                )
-            if self.vina.center_x is None:
-                raise ValueError(
-                    "vina center_* and size_* must be set when AutoDock Vina is enabled."
-                )
+            # In docking pipeline mode, bridge auto-generates box params
+            if pipeline != "docking":
+                if not _all_or_none(
+                    [
+                        self.vina.center_x,
+                        self.vina.center_y,
+                        self.vina.center_z,
+                        self.vina.size_x,
+                        self.vina.size_y,
+                        self.vina.size_z,
+                    ]
+                ):
+                    raise ValueError(
+                        "vina center_* and size_* must either all be set or all be omitted."
+                    )
+                if self.vina.center_x is None:
+                    raise ValueError(
+                        "vina center_* and size_* must be set when AutoDock Vina is enabled."
+                    )
         if pipeline in {"all", "protenix_dock", "docking"} and self.protenix_dock.enabled:
-            if not self.protenix_dock.receptor_pdb:
+            if pipeline != "docking" and not self.protenix_dock.receptor_pdb:
                 raise ValueError(
                     "protenix_dock.receptor_pdb must be set when Protenix-Dock is enabled."
                 )
-            if not self.protenix_dock.ligand_sdf:
+            if pipeline != "docking" and not self.protenix_dock.ligand_sdf:
                 raise ValueError(
                     "protenix_dock.ligand_sdf must be set when Protenix-Dock is enabled."
                 )
-            if not _all_or_none(
-                [
-                    self.protenix_dock.center_x,
-                    self.protenix_dock.center_y,
-                    self.protenix_dock.center_z,
-                    self.protenix_dock.size_x,
-                    self.protenix_dock.size_y,
-                    self.protenix_dock.size_z,
-                ]
-            ):
-                raise ValueError(
-                    "protenix_dock center_* and size_* must either all be set or all be omitted."
-                )
-            if self.protenix_dock.center_x is None:
-                raise ValueError(
-                    "protenix_dock center_* and size_* must be set when Protenix-Dock is enabled."
-                )
+            if pipeline != "docking":
+                if not _all_or_none(
+                    [
+                        self.protenix_dock.center_x,
+                        self.protenix_dock.center_y,
+                        self.protenix_dock.center_z,
+                        self.protenix_dock.size_x,
+                        self.protenix_dock.size_y,
+                        self.protenix_dock.size_z,
+                    ]
+                ):
+                    raise ValueError(
+                        "protenix_dock center_* and size_* must either all be set or all be omitted."
+                    )
+                if self.protenix_dock.center_x is None:
+                    raise ValueError(
+                        "protenix_dock center_* and size_* must be set when Protenix-Dock is enabled."
+                    )
         if pipeline in {"all", "template_search_sequence"} and self.template_search_sequence.enabled:
             if not self.template_search_sequence.database_path:
                 raise ValueError(

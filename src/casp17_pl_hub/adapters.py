@@ -690,6 +690,14 @@ def prepare_autodock_gpu(
             "Use the wrapper pipeline with cofolding+docking stages for auto-preparation."
         )
 
+    # Default box if not yet determined (bridge will override at runtime)
+    center_x = center_x if center_x is not None else 0.0
+    center_y = center_y if center_y is not None else 0.0
+    center_z = center_z if center_z is not None else 0.0
+    size_x = size_x if size_x is not None else 22.5
+    size_y = size_y if size_y is not None else 22.5
+    size_z = size_z if size_z is not None else 22.5
+
     # Generate autogrid4 GPF (Grid Parameter File) and run script
     npts_x = max(1, int(size_x / 0.375))
     npts_y = max(1, int(size_y / 0.375))
