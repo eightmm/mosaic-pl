@@ -912,8 +912,11 @@ def prepare_protenix_dock(
     log_path = output_dir / "protenix_dock.log"
     summary_path = run_dir / "inputs" / "docking" / "docking_prep_summary.json"
     script_lines = [
-        "import json",
+        "import json, os, sys",
         "from pathlib import Path",
+        "",
+        "# Ensure protenix-dock venv bin is in PATH (for pdb4amber, tleap, etc.)",
+        "os.environ['PATH'] = os.path.dirname(sys.executable) + ':' + os.environ.get('PATH', '')",
         "",
         "from pxdock import ProtenixDock",
         "",
