@@ -40,13 +40,11 @@ def prepare_run(common: CommonInput, config: RunnerConfig, output_root: Path, ba
     _ensure_run_dirs(run_dir)
 
     model_runs = [
-        model_run
-        for model_run in [
-            prepare_boltz(common, config, run_dir),
+        *prepare_boltz(common, config, run_dir),
+        *[m for m in [
             prepare_protenix(common, config, run_dir),
             prepare_alphafold3(common, config, run_dir),
-        ]
-        if model_run is not None
+        ] if m is not None],
     ]
     if not model_runs:
         raise ValueError("No model is enabled in the runner config.")

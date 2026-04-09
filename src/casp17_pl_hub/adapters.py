@@ -28,14 +28,10 @@ class PreparedModelRun:
         }
 
 
-def prepare_boltz(common: CommonInput, config: RunnerConfig, run_dir: Path) -> PreparedModelRun | None:
-    if not config.boltz.enabled:
-        return None
-
-    input_path = run_dir / "inputs" / "boltz_input.yaml"
-    output_dir = run_dir / "outputs" / "boltz"
-    dump_yaml_file(common.spec, input_path)
-
+def _build_boltz_command(
+    config: RunnerConfig, common: CommonInput, input_path: Path, output_dir: Path, *, use_potentials: bool
+) -> list[str]:
+    """Build a boltz predict command."""
     command = [
         config.boltz.binary,
         "predict",
@@ -86,7 +82,7 @@ def prepare_boltz(common: CommonInput, config: RunnerConfig, run_dir: Path) -> P
     _append_option(command, "--preprocessing-threads", config.boltz.preprocessing_threads)
     if config.boltz.override:
         command.append("--override")
-    if config.boltz.use_potentials:
+    if use_potentials:
         command.append("--use_potentials")
     if config.boltz.affinity_mw_correction:
         command.append("--affinity_mw_correction")
@@ -101,7 +97,39 @@ def prepare_boltz(common: CommonInput, config: RunnerConfig, run_dir: Path) -> P
     if config.boltz.write_embeddings:
         command.append("--write_embeddings")
     command.extend(config.boltz.extra_args)
-    return PreparedModelRun("boltz", input_path, output_dir, command)
+    return command
+
+
+def prepare_boltz(common: CommonInput, config: RunnerConfig, run_dir: Path) -> list[PreparedModelRun]:
+    """Prepare Boltz runs. Returns both boltz2 and boltz2x if use_potentials is enabled."""
+    if not config.boltz.enabled:
+        return []
+
+    # Auto-inject affinity properties if ligands present
+    spec = dict(common.spec)
+    has_ligand = any(_entity(e)[0] == "ligand" for e in common.sequences)
+    if has_ligand and not common.properties:
+        ligand_ids = [_entity_ids(_entity(e)[1]) for e in common.sequences if _entity(e)[0] == "ligand"]
+        if ligand_ids:
+            spec["properties"] = [{"affinity": {"binder": ligand_ids[0][0]}}]
+
+    input_path = run_dir / "inputs" / "boltz_input.yaml"
+    dump_yaml_file(spec, input_path)
+
+    runs: list[PreparedModelRun] = []
+
+    # Boltz-2 (without potentials)
+    output_dir_b2 = run_dir / "outputs" / "boltz"
+    cmd_b2 = _build_boltz_command(config, common, input_path, output_dir_b2, use_potentials=False)
+    runs.append(PreparedModelRun("boltz", input_path, output_dir_b2, cmd_b2))
+
+    # Boltz-2x (with potentials)
+    if config.boltz.use_potentials:
+        output_dir_b2x = run_dir / "outputs" / "boltz2x"
+        cmd_b2x = _build_boltz_command(config, common, input_path, output_dir_b2x, use_potentials=True)
+        runs.append(PreparedModelRun("boltz2x", input_path, output_dir_b2x, cmd_b2x))
+
+    return runs
 
 
 def prepare_protenix(
