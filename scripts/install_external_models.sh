@@ -52,6 +52,10 @@ if [[ "${1:-}" == "--verify" ]]; then
   .venvs/protenix-dock/bin/python -c "import meeko, gemmi, pdb2pqr; from rdkit import Chem; print('ok')" \
     && ok "Helper libs (meeko, gemmi, pdb2pqr, RDKit)" || fail "Helper libs"
 
+  # Post-processing
+  .venvs/pred/bin/python -c "import bapred, rmsdpred, dgl; print('ok')" \
+    && ok "BA-Pred + RMSD-Pred (dgl $(. .venvs/pred/bin/python -c 'import dgl;print(dgl.__version__)' 2>/dev/null))" || fail "BA-Pred / RMSD-Pred"
+
   # Model weights
   [ -f external/alphafold3/models/af3.bin ] && ok "AF3 weights" || echo "  ⚠ AF3 weights not found"
   [ -f external/Protenix/models/protenix_base_default_v1.0.0.pt ] && ok "Protenix weights" || echo "  ⚠ Protenix weights not in external/Protenix/models/"
@@ -93,6 +97,8 @@ clone_if_missing "https://github.com/google-deepmind/alphafold3.git"   "external
 clone_if_missing "https://github.com/bytedance/Protenix-Dock.git"      "external/Protenix-Dock"
 clone_if_missing "https://github.com/ccsb-scripps/AutoDock-GPU.git"    "external/AutoDock-GPU"
 clone_if_missing "https://github.com/ccsb-scripps/AutoGrid.git"        "external/AutoGrid"
+clone_if_missing "https://github.com/eightmm/BA-Pred.git"             "external/BA-Pred"
+clone_if_missing "https://github.com/eightmm/RMSD-Pred.git"           "external/RMSD-Pred"
 
 # ---------------------------------------------------------------------------
 # Create virtual environments
@@ -103,6 +109,7 @@ uv venv .venvs/boltz          --python 3.12
 uv venv .venvs/protenix       --python 3.12
 uv venv .venvs/alphafold3     --python 3.12
 uv venv .venvs/protenix-dock  --python 3.11
+uv venv .venvs/pred           --python 3.12
 ok "All venvs created"
 
 # ---------------------------------------------------------------------------
@@ -227,6 +234,19 @@ ok "P2Rank wrapper created"
 echo ""
 echo "  NOTE: AutoDock-GPU requires CUDA and must be built on a GPU node:"
 echo "    srun --partition=<gpu_partition> --gres=gpu:1 bash scripts/build_autodock_gpu.sh"
+
+# ---------------------------------------------------------------------------
+# [6/6] BA-Pred + RMSD-Pred (post-processing)
+# ---------------------------------------------------------------------------
+banner "[6/6] Installing BA-Pred + RMSD-Pred"
+
+uv pip install --python .venvs/pred/bin/python \
+  "torch==2.4.0" packaging gemmi
+uv pip install --python .venvs/pred/bin/python \
+  "dgl==2.4.0" -f https://data.dgl.ai/wheels/torch-2.4/cu124/repo.html
+uv pip install --python .venvs/pred/bin/python \
+  -e external/BA-Pred -e external/RMSD-Pred
+ok "BA-Pred + RMSD-Pred installed"
 
 # ---------------------------------------------------------------------------
 # Hub project itself
