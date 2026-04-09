@@ -45,7 +45,7 @@ PRESET_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "energy_range": 3.0,
         },
         "protenix_dock": {
-            "cache_map_spacing": 0.25,
+            "cache_map_spacing": 0.375,
         },
     },
     "balanced": {
@@ -73,7 +73,7 @@ PRESET_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "energy_range": 4.0,
         },
         "protenix_dock": {
-            "cache_map_spacing": 0.175,
+            "cache_map_spacing": 0.375,
         },
     },
     "quality": {
@@ -104,7 +104,7 @@ PRESET_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "energy_range": 6.0,
         },
         "protenix_dock": {
-            "cache_map_spacing": 0.1,
+            "cache_map_spacing": 0.375,
         },
     },
 }
@@ -598,7 +598,7 @@ class ProtenixDockConfig:
     size_x: float | None = None
     size_y: float | None = None
     size_z: float | None = None
-    cache_map_spacing: float = 0.175
+    cache_map_spacing: float = 0.375
     use_cache_maps: bool = True
     extra_args: list[str] = field(default_factory=list)
 
@@ -617,7 +617,7 @@ class ProtenixDockConfig:
             size_x=float(data["size_x"]) if data.get("size_x") is not None else None,
             size_y=float(data["size_y"]) if data.get("size_y") is not None else None,
             size_z=float(data["size_z"]) if data.get("size_z") is not None else None,
-            cache_map_spacing=float(data.get("cache_map_spacing", 0.175)),
+            cache_map_spacing=float(data.get("cache_map_spacing", 0.375)),
             use_cache_maps=_to_bool(data.get("use_cache_maps"), True),
             extra_args=[str(arg) for arg in data.get("extra_args", [])],
         )

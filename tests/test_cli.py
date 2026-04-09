@@ -471,7 +471,7 @@ def test_write_example_config_includes_protenix_dock(tmp_path: Path) -> None:
     assert config["protenix_dock"]["receptor_pdb"] == "/path/to/receptor.pdb"
     assert config["protenix_dock"]["ligand_sdf"] == "/path/to/ligand.sdf"
     assert config["protenix_dock"]["size_x"] == 20.0
-    assert config["protenix_dock"]["cache_map_spacing"] == 0.175
+    assert config["protenix_dock"]["cache_map_spacing"] == 0.375
 
 
 def test_bool_string_coercion_in_from_dict() -> None:

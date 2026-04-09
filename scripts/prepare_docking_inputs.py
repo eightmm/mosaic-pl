@@ -261,7 +261,7 @@ def run_p2rank(pdb_path: Path, output_dir: Path) -> tuple[list[float], list[floa
             cz = float(row["center_z"])
             # Estimate box size from SAS points (rough heuristic)
             sas = int(row["sas_points"])
-            box_side = max(15.0, min(25.0, sas * 0.3))
+            box_side = 22.5
             print(f"  P2Rank pocket 1: center=[{cx:.1f}, {cy:.1f}, {cz:.1f}], score={row['score'].strip()}")
             return ([cx, cy, cz], [box_side, box_side, box_side])
 
@@ -330,7 +330,7 @@ def run_swinsite(pdb_path: Path, output_dir: Path) -> tuple[list[float], list[fl
         arr = _np.array(coords)
         center = arr.mean(axis=0).tolist()
         extent = (arr.max(axis=0) - arr.min(axis=0))
-        box_side = max(15.0, min(25.0, float(extent.max()) + 10.0))
+        box_side = 22.5
         print(f"  SwinSite pocket 1: center=[{center[0]:.1f}, {center[1]:.1f}, {center[2]:.1f}], atoms={len(coords)}")
         return (center, [box_side, box_side, box_side])
 
@@ -384,14 +384,14 @@ def extract_smiles_from_json(input_json: Path) -> list[tuple[str, str]]:
     return results
 
 
-def compute_box_from_ligand(sdf_path: Path, padding: float = 10.0) -> tuple[list[float], list[float]]:
-    """Compute docking box center and size from ligand 3D coordinates."""
+def compute_box_from_ligand(sdf_path: Path, box_side: float = 22.5) -> tuple[list[float], list[float]]:
+    """Compute docking box center from ligand 3D coordinates. Box size fixed."""
     from rdkit import Chem
 
     supplier = Chem.SDMolSupplier(str(sdf_path), removeHs=False)
     mol = next(supplier)
     if mol is None:
-        return [0.0, 0.0, 0.0], [20.0, 20.0, 20.0]
+        return [0.0, 0.0, 0.0], [box_side, box_side, box_side]
 
     conf = mol.GetConformer()
     positions = conf.GetPositions()
@@ -399,9 +399,8 @@ def compute_box_from_ligand(sdf_path: Path, padding: float = 10.0) -> tuple[list
     min_xyz = positions.min(axis=0)
     max_xyz = positions.max(axis=0)
     center = ((min_xyz + max_xyz) / 2).tolist()
-    size = (max_xyz - min_xyz + padding).tolist()
 
-    return center, size
+    return center, [box_side, box_side, box_side]
 
 
 def main() -> int:
