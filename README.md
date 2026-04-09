@@ -1,58 +1,137 @@
 # CASP17 Protein-Ligand Hub
 
 Unified Python workspace for CASP17 protein-ligand structure prediction and docking pipelines.
-Orchestrates external ML models (Boltz2, Protenix v2, AlphaFold3) and template search tools (MMseqs2, Foldseek) with docking via AutoDock Vina, AutoDock-GPU, and Protenix-Dock.
+Orchestrates external ML models (Boltz2/2x, Protenix v2, AlphaFold3), template search (MMseqs2, Foldseek), binding site prediction (P2Rank, SwinSite), docking (Vina, AutoDock-GPU, Protenix-Dock), and post-analysis (BA-Pred, RMSD-Pred).
+
+## Full Pipeline Overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  INPUT: protein sequence + ligand SMILES (unified YAML)        │
+└─────────────────┬───────────────────────────────────────────────┘
+                  │
+    ┌─────────────▼─────────────┐
+    │  Stage 1: Sequence Search │
+    │  MMseqs2 (488k seqs DB)   │──→ template hits
+    │  + ligand filtering       │    (rcsb_index.db lookup)
+    └─────────────┬─────────────┘
+                  │
+    ┌─────────────▼─────────────────────────────────────────┐
+    │  Stage 2: Co-folding (4 models parallel)              │
+    │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ │
+    │  │ Boltz-2  │ │ Boltz-2x │ │ Protenix │ │   AF3    │ │
+    │  │(no pot.) │ │(potent.) │ │   v1/v2  │ │  (JAX)   │ │
+    │  │+affinity │ │+affinity │ │          │ │          │ │
+    │  └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘ │
+    │       │             │            │             │       │
+    │       └──── BRIDGE: Boltz MSA → AF3 ──────────┘       │
+    └──────────────────────┬────────────────────────────────-┘
+                           │
+    ┌──────────────────────▼──────────────────────┐
+    │  Stage 3: Structure Search (Foldseek)       │
+    │  Each model output → Foldseek (251k DB)     │
+    │  + ligand filtering + cross-model consensus  │
+    └──────────────────────┬──────────────────────┘
+                           │
+    ┌──────────────────────▼──────────────────────┐
+    │  Stage 4: Docking Prep (automatic)          │
+    │  • Auto-select best model (pLDDT score)     │
+    │  • Binding site: SwinSite > P2Rank          │
+    │  • SMILES → 3D SDF → PDBQT (RDKit + meeko) │
+    │  • CIF → PDB → PDBQT (gemmi + pdb2pqr)     │
+    │  • Box: 22.5Å, spacing 0.375Å              │
+    └──────────────────────┬──────────────────────┘
+                           │
+    ┌──────────────────────▼──────────────────────┐
+    │  Stage 5: Docking (3 tools)                 │
+    │  ┌────────┐  ┌─────────────┐  ┌───────────┐│
+    │  │  Vina  │  │ AutoDock-GPU│  │Protenix-  ││
+    │  │(Py API)│  │  (CUDA)     │  │   Dock    ││
+    │  │  ~3s   │  │   ~10s      │  │ ~5-30min  ││
+    │  └───┬────┘  └──────┬──────┘  └─────┬─────┘│
+    └──────┼──────────────┼───────────────┼──────-┘
+           │              │               │
+    ┌──────▼──────────────▼───────────────▼──────┐
+    │  Stage 6: Post-analysis                    │
+    │  • PDBQT/DLG → SDF (meeko mk_export.py)   │
+    │  • BA-Pred: binding affinity (GNN)         │
+    │  • RMSD-Pred: pose RMSD prediction (GNN)   │
+    └──────────────────────┬─────────────────────┘
+                           │
+    ┌──────────────────────▼──────────────────────┐
+    │  OUTPUT: experiments/runs/<target>/          │
+    │  ├── outputs/boltz2/     (CIF + affinity)   │
+    │  ├── outputs/boltz2x/    (CIF + affinity)   │
+    │  ├── outputs/protenix/   (CIF + confidence) │
+    │  ├── outputs/alphafold3/ (CIF + confidence) │
+    │  ├── outputs/vina/       (docked SDF/PDBQT) │
+    │  ├── outputs/autodock_gpu/ (DLG + SDF)      │
+    │  ├── outputs/protenix_dock/ (results JSON)  │
+    │  ├── outputs/structure_search/ (consensus)  │
+    │  └── outputs/analysis/   (BA/RMSD TSVs)     │
+    └─────────────────────────────────────────────┘
+```
 
 ## Setup
 
 ### Prerequisites
 
 ```bash
-# System packages (Ubuntu)
 sudo apt-get install -y libboost-all-dev autoconf automake libtool
-
-# uv (Python package manager)
-curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
 ### Installation
 
 ```bash
-# 1. Clone and enter project
 git clone <repo-url> CASP17 && cd CASP17
-
-# 2. Install all external models + tools
-bash scripts/install_external_models.sh
-
-# 3. Build AutoDock-GPU on a GPU node
-srun --partition=6000ada --gres=gpu:1 bash scripts/build_autodock_gpu.sh
-
-# 4. Verify everything
-bash scripts/install_external_models.sh --verify
-
-# 5. Check workspace status
-uv run casp17-pl status
+bash scripts/install_external_models.sh              # all tools + models
+srun --partition=6000ada --gres=gpu:1 bash scripts/build_autodock_gpu.sh  # GPU build
+bash scripts/install_external_models.sh --verify      # verify all
+bash scripts/build_search_dbs.sh                      # MMseqs2 + Foldseek DBs
 ```
 
 ### What Gets Installed
 
-| Tool | venv / Location | Version |
+| Tool | venv / Location | Purpose |
 |------|----------------|---------|
-| Boltz2 | `.venvs/boltz` (Python 3.12) | latest + cuequivariance |
-| Protenix v2 | `.venvs/protenix` (Python 3.12) | v2.0.0 + TFG guidance |
-| AlphaFold3 | `.venvs/alphafold3` (Python 3.12) | latest |
-| Protenix-Dock | `.venvs/protenix-dock` (Python 3.11) | v0.0.1 |
-| AutoDock Vina | `.venvs/protenix-dock` (shared) | 1.2.7 |
-| AutoDock-GPU | `.local/bin/autodock_gpu_128wi` | v1.6 (CUDA) |
-| autogrid4 | `.local/bin/autogrid4` | 4.2.8 |
-| meeko | `.venvs/protenix-dock` (shared) | ligand PDBQT prep |
-| gemmi | `.venvs/protenix-dock` (shared) | CIF/PDB conversion |
-| pdb2pqr | `.venvs/protenix-dock` (shared) | receptor protonation |
+| Boltz2 | `.venvs/boltz` (Py3.12) | Co-folding + affinity |
+| Protenix v2 | `.venvs/protenix` (Py3.12) | Co-folding |
+| AlphaFold3 | `.venvs/alphafold3` (Py3.12) | Co-folding (JAX) |
+| Protenix-Dock | `.venvs/protenix-dock` (micromamba) | Classical docking |
+| Vina | `.venvs/protenix-dock` (shared) | Classical docking |
+| AutoDock-GPU | `.local/bin/autodock_gpu_128wi` | GPU docking |
+| autogrid4 | `.local/bin/autogrid4` | Grid maps for ADG |
+| MMseqs2 | `.local/bin/mmseqs` | Sequence search |
+| Foldseek | `.local/bin/foldseek` | Structure search |
+| P2Rank | `.local/bin/prank` (JDK 21) | Binding site (surface) |
+| SwinSite | `.venvs/pred` (shared) | Binding site (ML) |
+| BA-Pred | `.venvs/pred` (shared) | Affinity prediction (GNN) |
+| RMSD-Pred | `.venvs/pred` (shared) | Pose RMSD prediction (GNN) |
+
+### Search Databases
+
+| DB | Size | Contents |
+|----|------|----------|
+| MMseqs2 sequence DB | 2.0 GB | 488,841 RCSB protein sequences (preindexed) |
+| Foldseek structure DB | 7.7 GB | 251,422 RCSB structures (3Di+AA preindexed) |
+| RCSB ligand index | SQLite | 251k entries, 2.5M ligand instances, CCD classification |
 
 ## Quick Start
 
+### Full pipeline (one command)
+
 ```bash
-# 1. Create input YAML (protein sequence + ligand SMILES)
+uv run casp17-pl run-wrapper \
+  --input examples/full_pipeline_test.yaml \
+  --config examples/full_pipeline_config.yaml \
+  --stages template-search-sequence cofolding docking \
+  --submit
+```
+
+### Step by step
+
+```bash
+# 1. Create input
 cat > my_target.yaml << 'EOF'
 version: 1
 seed: 42
@@ -60,214 +139,237 @@ sequences:
   - protein:
       id: A
       sequence: MVTPEGNVSLVDESLLVGVT...
-      msa: empty
   - ligand:
       id: L
       smiles: "N[C@@H](Cc1ccc(O)cc1)C(=O)O"
 EOF
 
-# 2. Run cofolding (Boltz + Protenix)
-uv run casp17-pl run-all \
-  --input my_target.yaml \
-  --config examples/runner_config.example.yaml \
-  --submit
+# 2. Run co-folding (Boltz2 + Boltz2x + Protenix + AF3)
+uv run casp17-pl run-all --input my_target.yaml --config examples/full_pipeline_config.yaml --submit
 
-# 3. Or run full pipeline (cofolding + auto docking prep + docking)
-uv run casp17-pl run-wrapper \
-  --input my_target.yaml \
-  --config my_config.yaml \
-  --stages cofolding docking \
-  --submit
+# 3. Structure search on cofolding outputs
+uv run python scripts/run_structure_search.py \
+  --run-dir experiments/runs/my_target \
+  --foldseek-db data/search_dbs/structure/rcsb_structDB \
+  --rcsb-db /home/jaemin/DB/RCSB/processed/rcsb_index.db
+
+# 4. Post-analysis (BA-Pred + RMSD-Pred)
+srun --partition=6000ada --gres=gpu:1 \
+  .venvs/pred/bin/python scripts/run_post_analysis.py \
+  --run-dir experiments/runs/my_target --device cuda
 ```
 
-## Pipeline Stages
+## Pipeline Stages Detail
 
-```
-unified YAML (protein + ligand SMILES)
-  |
-  v
-[template-search-sequence]  MMseqs2 sequence search
-[template-search-structure] Foldseek structure search
-  |
-  v
-[cofolding]  Boltz2 / Protenix v2 / AlphaFold3
-  |
-  |--- [BRIDGE: Boltz MSA -> AF3]  (MSA reuse)
-  |
-  v
-[BRIDGE: Docking Input Prep]
-  |  SMILES -> 3D SDF -> PDBQT (RDKit + meeko)
-  |  CIF -> PDB -> PDBQT (gemmi + pdb2pqr)
-  |  Docking box auto-computed from ligand
-  |
-  v
-[docking]  AutoDock Vina / AutoDock-GPU / Protenix-Dock
-  |
-  v
-experiments/runs/<target>/outputs/
+### Stage 1: Template Search (Sequence)
+
+**Tool**: MMseqs2 (`easy-search` against preindexed RCSB sequence DB)
+**Input**: Protein sequence from unified YAML
+**Output**: `outputs/template_search_sequence/mmseqs_hits.tsv`
+**Post-filter**: `template_filter.py` queries `rcsb_index.db` to find hits with drug-like ligands
+
+```python
+from casp17_pl_hub.template_filter import filter_hits_with_ligands
+hits = filter_hits_with_ligands(hits_tsv, db_path)
+# → hits sorted by ligand presence + sequence identity
 ```
 
-### Stage Details
+### Stage 2: Co-folding
 
-| Stage | Tools | GPU | Description |
-|-------|-------|-----|-------------|
-| `template-search-sequence` | MMseqs2 | No | Sequence homology search against RCSB DB |
-| `template-search-structure` | Foldseek | No | Structure similarity search, can use cofolding output |
-| `cofolding` | Boltz2, Protenix v2, AF3 | Yes | Protein-ligand complex structure prediction |
-| `docking` | Vina, AutoDock-GPU, Protenix-Dock | GPU optional | Molecular docking with auto-prepared inputs |
+4 models run sequentially on GPU:
 
-### Automatic Bridge Steps
+| Model | Output | Time | Features |
+|-------|--------|------|----------|
+| **Boltz-2** | `outputs/boltz2/` | ~50-140s | Structure + confidence + MSA + **affinity** |
+| **Boltz-2x** | `outputs/boltz2x/` | ~50-140s | Structure + confidence + MSA + **affinity** (with potentials) |
+| **Protenix** | `outputs/protenix/` | ~80-190s | Structure + confidence |
+| **AlphaFold3** | `outputs/alphafold3/` | ~110-130s | Structure + confidence + ranking |
 
-The wrapper pipeline automatically inserts bridge steps:
+**Automatic features:**
+- Affinity auto-enabled when ligand present (`properties.affinity.binder`)
+- Boltz MSA → AF3 bridge (CSV → A3M conversion)
+- Boltz uses `--use_msa_server` to fetch MSA from ColabFold
+- AF3 runner has dedicated CUDA LD_LIBRARY_PATH for JAX
 
-- **Boltz MSA -> AF3**: When both Boltz (with MSA server) and AF3 are enabled, Boltz's MSA CSV is converted to A3M and injected into AF3 input.
-- **Docking Input Prep**: Between cofolding and docking, SMILES are converted to SDF/PDBQT, receptor CIF is converted to PDB/PDBQT with protonation and charges, and the docking box is auto-computed.
-
-## Input Format
-
-Single unified Boltz-style YAML:
-
-```yaml
-version: 1
-seed: 42
-sequences:
-  - protein:
-      id: A
-      sequence: MVTPEGNVSLQ...
-      msa: empty                  # "empty", path to .a3m, or omit for MSA server
-  - ligand:
-      id: L
-      smiles: "N[C@@H](Cc1ccc(O)cc1)C(=O)O"
-templates:                         # optional structural templates
-  - path: /path/to/template.pdb
-    ids: [A]
-constraints:                       # optional
-  - bond:
-      atom1: [A, 1, CA]
-      atom2: [L, 1, C1]
-properties:                        # optional
-  - affinity:
-      binder: L
+**Boltz affinity output:**
+```json
+{
+  "affinity_pred_value": 2.62,           // log10(IC50) in μM
+  "affinity_probability_binary": 0.41    // binder probability [0-1]
+}
 ```
 
-Adapters automatically convert this to model-specific formats (Boltz YAML, Protenix JSON, AlphaFold3 JSON).
+### Stage 3: Structure Search (Foldseek)
 
-## Runner Config
+**Tool**: `scripts/run_structure_search.py`
+**Input**: CIF structures from each cofolding model
+**Output**: `outputs/structure_search/consensus_summary.json`
 
-Controls all model hyperparameters, tool paths, and SLURM settings.
+For each model:
+1. Run Foldseek against RCSB structure DB
+2. Collect all hits, lookup ligands via `rcsb_index.db`
+3. Cross-model consensus: PDBs found by multiple models ranked highest
+4. Ligand-containing hits highlighted
+
+### Stage 4: Docking Preparation (Automatic Bridge)
+
+**Tool**: `scripts/prepare_docking_inputs.py`
+Runs automatically between cofolding and docking in the wrapper pipeline.
+
+| Step | Tool | Output |
+|------|------|--------|
+| Auto-select best model | pLDDT comparison | Best CIF |
+| CIF → PDB | gemmi | `receptor.pdb` |
+| PDB → protonated PDB | pdb2pqr (AMBER) | `receptor_protonated.pdb` (HIS→HID/HIE/HIP) |
+| PDB → PDBQT | pdb2pqr + AD4 typing | `receptor.pdbqt` (charges + atom types) |
+| SMILES → 3D SDF | RDKit (ETKDG + MMFF) | `ligand_L.sdf` |
+| SDF → PDBQT | meeko | `ligand_L.pdbqt` |
+| Binding site | SwinSite > P2Rank | Box center + size |
+
+**Binding site prediction priority:**
+1. **SwinSite** (Swin-Unet ML, `.venvs/pred`) — preferred
+2. **P2Rank** (surface-based, Java) — fallback
+3. **Ligand coordinates** (RDKit 3D) — last resort
+
+**Unified box**: 22.5Å × 22.5Å × 22.5Å, grid spacing 0.375Å
+
+### Stage 5: Docking
+
+3 docking tools run sequentially:
+
+| Tool | Type | Time | Output |
+|------|------|------|--------|
+| **Vina** | Python API | ~3s | `outputs/vina/docked.pdbqt` |
+| **AutoDock-GPU** | CUDA GPU | ~10s | `outputs/autodock_gpu/docking.dlg` |
+| **Protenix-Dock** | CPU force field | ~5-30min | `outputs/protenix_dock/docking_results.json` |
+
+All tools auto-detect receptor/ligand from `docking_prep_summary.json` at runtime.
+
+### Stage 6: Post-analysis
+
+**Tool**: `scripts/run_post_analysis.py` (runs on GPU node with `.venvs/pred`)
+
+| Step | Tool | Input | Output |
+|------|------|-------|--------|
+| PDBQT → SDF | meeko `mk_export.py` | Vina/ADG output | `docked.sdf`, `docking.sdf` |
+| Affinity prediction | BA-Pred (GNN) | receptor PDB + ligand SDF | `ba_pred_*.tsv` (pKd, kcal/mol) |
+| Pose RMSD prediction | RMSD-Pred (GNN) | receptor PDB + ligand SDF | `rmsd_pred_*.tsv` (pRMSD, >2Å prob) |
+
+### CCD Ligand Classification
+
+Built-in module (`src/casp17_pl_hub/ccd/`) classifies 48,965 CCD codes into 10 categories:
+
+| Category | is_candidate | Examples |
+|----------|-------------|---------|
+| small_molecule | ✓ | STI (imatinib), drug-like |
+| cofactor | ✓ | ATP, NAD, FAD, HEM |
+| metabolite | ✓ | cholesterol, bile acids |
+| peptide_like | ✓ | short peptide inhibitors |
+| nucleotide_like | ✓ | nucleoside analogs |
+| ion | ✗ | ZN, MG, FE, CA |
+| crystallization_aid | ✗ | GOL, EDO, PEG, SO4 |
+| glycan | ✗ | NAG, MAN, GAL |
+| membrane_lipid | ✗ | phospholipids, detergents |
+| pigment | ✗ | carotenoids, chlorophylls |
+
+## Configuration
 
 ### Hyperparameter Presets
 
-| Preset | Boltz recycling/diffusion | Protenix cycle/step/sample | AF3 recycles/samples |
-|--------|--------------------------|---------------------------|---------------------|
-| `fast` | 1 / 1 | 4 / 75 / 1 | 3 / 1 |
-| `balanced` | 3 / 1 | 10 / 200 / 5 | 10 / 5 |
-| `quality` | 6 / 5 | 20 / 400 / 8 | 20 / 10 |
+| Preset | Boltz recycling/diffusion | Protenix cycle/step | AF3 recycles |
+|--------|--------------------------|---------------------|-------------|
+| `fast` | 1 / 1 | 4 / 75 | 3 |
+| `balanced` | 3 / 1 | 10 / 200 | 10 |
+| `quality` | 6 / 5 | 20 / 400 | 20 |
 
-```bash
-uv run casp17-pl write-example-config --preset quality
-```
-
-### Key Config Sections
+### Key Config Options
 
 ```yaml
-preset: balanced
+preset: fast
 
 boltz:
   enabled: true
-  use_msa_server: false        # true to fetch MSA from ColabFold
-  override: true               # overwrite existing results
+  use_msa_server: true          # fetch MSA from ColabFold
+  use_potentials: true          # Boltz-2x mode
+  override: true
 
 protenix:
   enabled: true
-  model_name: protenix-v2      # new v2 model
-  use_tfg_guidance: false      # Training-Free Guidance
-  trimul_kernel: cuequivariance
-  triatt_kernel: cuequivariance
+  model_name: protenix-v2       # or protenix_base_default_v1.0.0
+  use_tfg_guidance: false
 
 alphafold3:
-  enabled: false               # requires model weights
-  model_dir: /path/to/models
+  enabled: true
+  model_dir: external/alphafold3/models
+  run_data_pipeline: false
+  run_inference: true
 
 vina:
-  enabled: true                # auto-detects receptor/ligand from prep bridge
-
+  enabled: true
 autodock_gpu:
-  enabled: true                # requires autogrid4 + GPU
-  nrun: 100
-  autostop: true
-
+  enabled: true
 protenix_dock:
-  enabled: true                # auto-detects receptor/ligand from prep bridge
-  cache_map_spacing: 0.175
+  enabled: true
 
 slurm:
   partition: 6000ada
   gpus: 1
   mem: 64G
-  time: "04:00:00"
-```
-
-When using the wrapper pipeline (cofolding + docking), docking tools **auto-detect** receptor/ligand files and box parameters from the docking prep bridge output. No need to manually specify paths.
-
-## CLI Commands
-
-```bash
-# Status & config
-casp17-pl status
-casp17-pl write-example-input
-casp17-pl write-example-config --preset balanced
-
-# Prepare (generate scripts without submitting)
-casp17-pl prepare-run --input IN --config CFG
-casp17-pl prepare-wrapper --input IN --config CFG --stages S1 S2
-
-# Run (prepare + submit)
-casp17-pl run-all --input IN --config CFG --submit
-casp17-pl run-wrapper --input IN --config CFG --stages cofolding docking --submit
-casp17-pl run-vina --input IN --config CFG --submit
-casp17-pl run-protenix-dock --input IN --config CFG --submit
-
-# Validate
-casp17-pl validate-run --input IN --config CFG --stages cofolding docking
+  time: 06:00:00
 ```
 
 ## Output Structure
 
 ```
 experiments/runs/<target>/
-  inputs/
-    boltz_input.yaml
-    protenix_input.json
-    alphafold3_input.json
-    vina_config.txt
-    docking/
-      docking_prep_summary.json
-      receptor.pdb
-      receptor.pdbqt
-      ligand_L.sdf
-      ligand_L.pdbqt
-    autodock_gpu_grid/
-      receptor.gpf
-      receptor.maps.fld
-  outputs/
-    boltz/          -> .cif structures, PAE/PDE/pLDDT
-    protenix/       -> .cif structures, confidence scores
-    alphafold3/     -> .cif structures, confidence .json
-    vina/           -> docked.pdbqt, vina.log
-    autodock_gpu/   -> docking.dlg, poses
-    protenix_dock/  -> docking_results.json
-  scripts/
-    run_structure.sbatch.sh
-    run_docking.sbatch.sh
-    run_autodock_gpu.sh
-    run_protenix_dock.py
-    run_wrapper.sbatch.sh
-  run_manifest.json
+├── inputs/
+│   ├── boltz_input.yaml           # Boltz unified YAML (+ affinity properties)
+│   ├── protenix_input.json        # Protenix JSON
+│   ├── alphafold3_input.json      # AF3 JSON (+ MSA from Boltz bridge)
+│   └── docking/
+│       ├── docking_prep_summary.json  # auto-generated paths + box
+│       ├── receptor.pdb / .pdbqt      # receptor (protonated, charged)
+│       ├── receptor_protonated.pdb    # for Protenix-Dock
+│       ├── ligand_L.sdf / .pdbqt      # ligand (3D from SMILES)
+│       ├── p2rank/                     # P2Rank pocket predictions
+│       └── swinsite/                   # SwinSite pocket predictions
+├── outputs/
+│   ├── template_search_sequence/  # MMseqs2 hits
+│   ├── boltz2/                    # structure + confidence + affinity + MSA
+│   ├── boltz2x/                   # structure + confidence + affinity (potentials)
+│   ├── protenix/                  # structure + confidence
+│   ├── alphafold3/                # structure + confidence + ranking
+│   ├── structure_search/          # Foldseek consensus across models
+│   ├── vina/                      # docked.pdbqt + docked.sdf
+│   ├── autodock_gpu/              # docking.dlg + docking.sdf
+│   ├── protenix_dock/             # docking_results.json
+│   └── analysis/                  # BA-Pred + RMSD-Pred TSVs
+├── scripts/                       # generated runner scripts
+├── run_manifest.json
+└── wrapper_manifest.json
+```
 
-experiments/logs/
-  slurm-<jobid>.out
-  slurm-<jobid>.err
+## CLI Commands
+
+```bash
+# Status
+casp17-pl status
+
+# Full pipeline
+casp17-pl run-wrapper --input IN --config CFG --stages template-search-sequence cofolding docking --submit
+
+# Individual stages
+casp17-pl run-all --input IN --config CFG --submit                    # cofolding only
+casp17-pl run-template-search-sequence --input IN --config CFG --submit
+casp17-pl run-vina --input IN --config CFG --submit
+casp17-pl run-protenix-dock --input IN --config CFG --submit
+
+# Post-pipeline
+python scripts/run_structure_search.py --run-dir DIR --foldseek-db DB --rcsb-db DB
+python scripts/run_post_analysis.py --run-dir DIR --device cuda
+
+# Validation
+casp17-pl validate-run --input IN --config CFG --stages cofolding docking
 ```
 
 ## MCP Server (Claude Code Integration)
@@ -283,68 +385,27 @@ uv run casp17-pl-mcp
 | `prepare_cofolding` | Prepare a cofolding run |
 | `list_presets` | List hyperparameter presets |
 | `add_template` | Add PDB/CIF template to input YAML |
-| `create_input` | Create input YAML from parameters (sequence, SMILES, template) |
+| `create_input` | Create input YAML from natural language |
 
-## Template Support
+## Tested End-to-End Results
 
-Add structural templates via input YAML or MCP:
+Full pipeline test on RTX 6000 Ada (37 min total):
 
-```yaml
-# In unified input YAML
-templates:
-  - path: /path/to/template.pdb
-    ids: [A]  # optional chain filter
-```
-
-Templates are automatically passed to:
-- **Boltz**: native YAML template section
-- **Protenix**: `templatesPath` in proteinChain + `--use_template true`
-
-## Example Workflows
-
-### Cofolding only (Boltz + Protenix v2)
-
-```bash
-uv run casp17-pl run-all \
-  --input my_target.yaml \
-  --config my_config.yaml \
-  --submit
-```
-
-### Full pipeline (cofolding + docking with auto-prep)
-
-```bash
-uv run casp17-pl run-wrapper \
-  --input my_target.yaml \
-  --config my_config.yaml \
-  --stages cofolding docking \
-  --submit
-```
-
-### Boltz MSA -> AF3 reuse
-
-Enable `use_msa_server: true` in Boltz config + enable AF3. The bridge automatically converts Boltz MSA to A3M and patches AF3 input.
-
-### Template-guided prediction
-
-```yaml
-# my_target.yaml
-sequences:
-  - protein:
-      id: A
-      sequence: MMAS...
-      msa: empty
-templates:
-  - path: ./templates/7qtb_A.pdb
-    ids: [A]
-```
-
-## Cluster Notes
-
-- **Master node has no GPU** -- only safe for YAML parsing, manifest generation, validation
-- **All inference/CUDA must run on compute nodes** via SLURM
-- **Isolated venvs** prevent torch version conflicts (Boltz: 2.11+cu130, Protenix: 2.7+cu126, AF3: JAX)
-- Scripts auto-run `module load cuda/12.8` and add venv bins to PATH
+| Stage | Time | Status |
+|-------|------|--------|
+| MMseqs2 sequence search | 3s | ✓ |
+| Boltz-2 + affinity | 143s | ✓ |
+| Boltz-2x + affinity | 88s | ✓ |
+| Protenix v1 | 133s | ✓ |
+| Bridge: Boltz MSA → AF3 | <1s | ✓ |
+| AlphaFold3 | 129s | ✓ |
+| Docking prep (P2Rank + auto-select) | 3s | ✓ |
+| Vina | 3s | ✓ |
+| AutoDock-GPU | 10s | ✓ |
+| Protenix-Dock | ~29min | ✓ |
+| Foldseek structure search (4 models) | ~30s | ✓ |
+| BA-Pred (3 docking tools) | ~10s | ✓ |
+| RMSD-Pred (3 docking tools) | ~10s | ✓ |
 
 ## Development
 
@@ -354,33 +415,32 @@ make test       # pytest (19 tests)
 make lint       # ruff check src/
 ```
 
-### Adding a New Model
-
-1. Add config dataclass to `configs.py`
-2. Create `prepare_<model>()` in `adapters.py` returning `PreparedModelRun`
-3. Add to `prepare_docking_run()` in `orchestrator.py`
-4. Add CLI subcommand in `cli.py`
-5. Add tests in `tests/test_cli.py`
-
-### Project Layout
+## Project Layout
 
 ```
 src/casp17_pl_hub/
-  models.py          # CommonInput parsing, validation
-  configs.py         # RunnerConfig, model configs, presets
-  adapters.py        # Unified input -> model-specific formats
-  orchestrator.py    # Pipeline preparation, script generation
-  script_builder.py  # Shell script generation with banners/timing
-  cli.py             # CLI (15+ subcommands)
-  mcp_server.py      # MCP server (6 tools)
-  validation.py      # Pre-flight checks
-  io_utils.py        # File I/O helpers
-  yaml_utils.py      # YAML serialization
+├── models.py            # CommonInput parsing
+├── configs.py           # RunnerConfig, presets, model configs
+├── adapters.py          # Unified input → model-specific formats
+├── orchestrator.py      # Pipeline preparation, script generation
+├── script_builder.py    # Shell scripts with banners/timing/env setup
+├── cli.py               # 15+ subcommands
+├── mcp_server.py        # MCP server (6 tools)
+├── validation.py        # Pre-flight checks
+├── template_filter.py   # Template hit → ligand filtering via SQLite
+├── ccd/                 # CCD classification (48,965 entries, 10 categories)
+│   ├── ccd_categories.py
+│   ├── ccd_lookup.py
+│   └── ligands.py
+├── io_utils.py
+└── yaml_utils.py
 
 scripts/
-  install_external_models.sh    # Full installation (clone + venv + build)
-  build_autodock_gpu.sh         # AutoDock-GPU CUDA build (GPU node)
-  bridge_boltz_msa_to_af3.py    # Boltz MSA CSV -> AF3 A3M conversion
-  prepare_docking_inputs.py     # SMILES -> SDF/PDBQT, CIF -> PDB/PDBQT
-  build_template_search_dbs.sh  # MMseqs2/Foldseek DB construction
+├── install_external_models.sh     # Full installation + verify
+├── build_autodock_gpu.sh          # AutoDock-GPU CUDA build
+├── build_search_dbs.sh            # MMseqs2 + Foldseek DB build
+├── bridge_boltz_msa_to_af3.py     # Boltz MSA CSV → AF3 A3M
+├── prepare_docking_inputs.py      # Auto docking prep + binding site
+├── run_structure_search.py        # Foldseek consensus across models
+└── run_post_analysis.py           # BA-Pred + RMSD-Pred
 ```
