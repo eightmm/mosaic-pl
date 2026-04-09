@@ -156,7 +156,10 @@ uv pip install --python .venvs/protenix-dock/bin/python cmake "vina==1.2.7" \
 PATH=".venvs/protenix-dock/bin:$PATH" \
   uv pip install --python .venvs/protenix-dock/bin/python \
     --no-deps --no-build-isolation external/Protenix-Dock
-ok "Protenix-Dock + Vina installed"
+# Copy boost libs for compute nodes (may not have libboost installed)
+mkdir -p .local/lib
+cp -n /usr/lib/x86_64-linux-gnu/libboost_python3*.so* .local/lib/ 2>/dev/null || true
+ok "Protenix-Dock + Vina installed (boost libs copied to .local/lib)"
 
 # ---------------------------------------------------------------------------
 # [5/5] Search & Docking Binaries
