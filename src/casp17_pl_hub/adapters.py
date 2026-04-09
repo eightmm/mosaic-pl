@@ -119,9 +119,9 @@ def prepare_boltz(common: CommonInput, config: RunnerConfig, run_dir: Path) -> l
     runs: list[PreparedModelRun] = []
 
     # Boltz-2 (without potentials)
-    output_dir_b2 = run_dir / "outputs" / "boltz"
+    output_dir_b2 = run_dir / "outputs" / "boltz2"
     cmd_b2 = _build_boltz_command(config, common, input_path, output_dir_b2, use_potentials=False)
-    runs.append(PreparedModelRun("boltz", input_path, output_dir_b2, cmd_b2))
+    runs.append(PreparedModelRun("boltz2", input_path, output_dir_b2, cmd_b2))
 
     # Boltz-2x (with potentials)
     if config.boltz.use_potentials:

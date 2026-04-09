@@ -40,7 +40,7 @@ def build_shell_script(
     )
     total = len(model_runs)
     model_names = [m.model_name for m in model_runs]
-    has_boltz = "boltz" in model_names
+    has_boltz = any(n.startswith("boltz") for n in model_names)
     boltz_output_dir = ""
     bridge_script = repo_root / "scripts" / "bridge_boltz_msa_to_af3.py"
 
@@ -76,7 +76,7 @@ def build_shell_script(
             "",
         ])
 
-        if model_run.model_name == "boltz":
+        if model_run.model_name.startswith("boltz") and not boltz_output_dir:
             boltz_output_dir = str(model_run.output_dir)
     lines.extend([
         'echo ""',

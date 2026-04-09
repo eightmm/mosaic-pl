@@ -160,7 +160,7 @@ def pdb_to_pdbqt(pdb_path: Path, output_path: Path) -> Path:
 
 def find_best_cofolding_structure(cofolding_dir: Path, model: str) -> Path | None:
     """Find the best-ranked structure from cofolding output."""
-    if model == "boltz":
+    if model.startswith("boltz"):
         for cif in sorted(cofolding_dir.rglob("predictions/**/*.cif")):
             return cif
     elif model == "protenix":
@@ -180,7 +180,7 @@ def find_best_cofolding_structure(cofolding_dir: Path, model: str) -> Path | Non
 def read_confidence_score(cofolding_dir: Path, model: str) -> float:
     """Read average confidence score from cofolding output."""
     try:
-        if model == "boltz":
+        if model.startswith("boltz"):
             for npz in cofolding_dir.rglob("plddt_*model_0.npz"):
                 import numpy as np
                 data = np.load(str(npz))
@@ -203,7 +203,7 @@ def read_confidence_score(cofolding_dir: Path, model: str) -> float:
 def select_best_model(output_root: Path) -> tuple[str, Path]:
     """Auto-select best cofolding model by confidence score."""
     candidates = []
-    for model in ("boltz", "protenix", "alphafold3"):
+    for model in ("boltz2", "boltz2x", "protenix", "alphafold3"):
         model_dir = output_root / "outputs" / model
         if not model_dir.exists():
             continue
