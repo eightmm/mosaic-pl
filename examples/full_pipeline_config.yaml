@@ -20,6 +20,7 @@ boltz:
   use_msa_server: true
   override: true
   no_kernels: false
+  use_potentials: true
   extra_args: []
 protenix:
   enabled: true
