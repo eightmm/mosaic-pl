@@ -29,6 +29,9 @@ def build_shell_script(
             "# This repository runs on a SLURM cluster.",
             "# The master/login node has no GPU; actual inference should run on compute nodes.",
             "module load cuda/12.8 2>/dev/null || true",
+            'export LD_LIBRARY_PATH="${CUDA_HOME:-/appl/cuda/12.8}/targets/x86_64-linux/lib:${CUDA_HOME:-/appl/cuda/12.8}/lib64:${LD_LIBRARY_PATH:-}"',
+            f'for _nv_lib in {shlex.quote(str(repo_root))}/.venvs/*/lib/python*/site-packages/nvidia/*/lib; do '
+            'export LD_LIBRARY_PATH="$_nv_lib:$LD_LIBRARY_PATH"; done',
             f"export PATH={shlex.quote(str(repo_root / '.local' / 'bin'))}:$PATH",
             f'echo "Starting CASP17 {stage_label} stage"',
             f'echo "run_dir={run_dir}"',
