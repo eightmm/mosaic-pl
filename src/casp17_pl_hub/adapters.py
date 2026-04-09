@@ -627,28 +627,45 @@ def prepare_vina(common: CommonInput, config: RunnerConfig, run_dir: Path) -> Pr
 
     out_path = output_dir / "docked.pdbqt"
     log_path = output_dir / "vina.log"
-    config_lines = [
-        f"receptor = {receptor_pdbqt}",
-        f"ligand = {ligand_pdbqt}",
-        f"out = {out_path}",
-        f"log = {log_path}",
-        f"center_x = {center_x}",
-        f"center_y = {center_y}",
-        f"center_z = {center_z}",
-        f"size_x = {size_x}",
-        f"size_y = {size_y}",
-        f"size_z = {size_z}",
-        f"cpu = {config.vina.cpu}",
-        f"exhaustiveness = {config.vina.exhaustiveness}",
-        f"num_modes = {config.vina.num_modes}",
-        f"energy_range = {config.vina.energy_range}",
-        f"seed = {config.vina.seed if config.vina.seed is not None else common.seed}",
-    ]
-    if config.vina.scoring:
-        config_lines.append(f"scoring = {config.vina.scoring}")
-    input_path.write_text("\n".join(config_lines) + "\n")
+    seed = config.vina.seed if config.vina.seed is not None else common.seed
 
-    command = [config.vina.binary, "--config", str(input_path), *config.vina.extra_args]
+    runner_script = run_dir / "scripts" / "run_vina.py"
+    runner_script.parent.mkdir(parents=True, exist_ok=True)
+    script_lines = [
+        "from vina import Vina",
+        "",
+        f"receptor_pdbqt = {receptor_pdbqt!r}",
+        f"ligand_pdbqt = {ligand_pdbqt!r}",
+        f"out_path = {str(out_path)!r}",
+        f"log_path = {str(log_path)!r}",
+        f"center = [{center_x}, {center_y}, {center_z}]",
+        f"size = [{size_x}, {size_y}, {size_z}]",
+        f"exhaustiveness = {config.vina.exhaustiveness}",
+        f"n_poses = {config.vina.num_modes}",
+        f"energy_range = {config.vina.energy_range}",
+        f"seed = {seed}",
+        "",
+        'print(f"Vina: receptor={receptor_pdbqt}")',
+        'print(f"Vina: ligand={ligand_pdbqt}")',
+        'print(f"Vina: center={center}, size={size}")',
+        "",
+        "v = Vina(sf_name='vina', seed=seed)",
+        "v.set_receptor(receptor_pdbqt)",
+        "v.set_ligand_from_file(ligand_pdbqt)",
+        "v.compute_vina_maps(center=center, box_size=size)",
+        "v.dock(exhaustiveness=exhaustiveness, n_poses=n_poses)",
+        "",
+        "v.write_poses(out_path, n_poses=n_poses, overwrite=True)",
+        "",
+        "with open(log_path, 'w') as f:",
+        "    f.write(v.score().__repr__())",
+        "",
+        'print(f"Vina: results written to {out_path}")',
+    ]
+    runner_script.write_text("\n".join(script_lines) + "\n")
+
+    input_path = runner_script
+    command = [".venvs/protenix-dock/bin/python", str(runner_script)]
     return PreparedModelRun("vina", input_path, output_dir, command, notes)
 
 

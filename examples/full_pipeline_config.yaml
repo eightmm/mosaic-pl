@@ -17,21 +17,26 @@ boltz:
   model: boltz2
   accelerator: gpu
   devices: 1
-  use_msa_server: false
+  use_msa_server: true
   override: true
   no_kernels: false
   extra_args: []
 protenix:
   enabled: true
   binary: .venvs/protenix/bin/protenix
-  model_name: protenix-v2
+  model_name: protenix_base_default_v1.0.0
   dtype: bf16
   trimul_kernel: cuequivariance
   triatt_kernel: cuequivariance
   use_tfg_guidance: false
   extra_args: []
 alphafold3:
-  enabled: false
+  enabled: true
+  python_bin: .venvs/alphafold3/bin/python
+  script: external/alphafold3/run_alphafold.py
+  model_dir: external/alphafold3/models
+  run_data_pipeline: false
+  run_inference: true
 vina:
   enabled: true
 autodock_gpu:

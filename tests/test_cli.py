@@ -312,7 +312,7 @@ def test_prepare_vina_and_validate_docking_stage(tmp_path: Path) -> None:
 
     prepared = prepare_vina_run(common, config, tmp_path, "slurm")
     assert prepared.model_runs[0].model_name == "vina"
-    assert (prepared.run_dir / "inputs" / "vina_config.txt").exists()
+    assert (prepared.run_dir / "scripts" / "run_vina.py").exists()
 
     report = validate_run(common, config, "slurm", repo_root=tmp_path, stages=["docking"])
     assert report.ok

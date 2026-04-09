@@ -232,14 +232,16 @@ def run_p2rank(pdb_path: Path, output_dir: Path) -> tuple[list[float], list[floa
         return None
 
     with open(pred_file) as f:
-        reader = csv.DictReader(f)
+        reader = csv.DictReader(f, skipinitialspace=True)
         for row in reader:
+            # Normalize keys (P2Rank pads headers with spaces)
+            row = {k.strip(): v.strip() for k, v in row.items()}
             # First row = top-ranked pocket
-            cx = float(row["center_x"].strip())
-            cy = float(row["center_y"].strip())
-            cz = float(row["center_z"].strip())
+            cx = float(row["center_x"])
+            cy = float(row["center_y"])
+            cz = float(row["center_z"])
             # Estimate box size from SAS points (rough heuristic)
-            sas = int(row["sas_points"].strip())
+            sas = int(row["sas_points"])
             box_side = max(15.0, min(35.0, sas * 0.3))
             print(f"  P2Rank pocket 1: center=[{cx:.1f}, {cy:.1f}, {cz:.1f}], score={row['score'].strip()}")
             return ([cx, cy, cz], [box_side, box_side, box_side])
