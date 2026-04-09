@@ -711,6 +711,8 @@ def prepare_autodock_gpu(
     if not config.autodock_gpu.enabled:
         return None
 
+    repo_root = Path(__file__).resolve().parents[2]
+
     output_dir = run_dir / "outputs" / "autodock_gpu"
     output_dir.mkdir(parents=True, exist_ok=True)
     grid_dir = run_dir / "inputs" / "autodock_gpu_grid"
@@ -799,7 +801,7 @@ def prepare_autodock_gpu(
         f"grid_dir = Path({str(grid_dir)!r})",
         f"fld_path = grid_dir / 'receptor.maps.fld'",
         f"output_dir = Path({str(output_dir)!r})",
-        f"binary = {config.autodock_gpu.binary!r}",
+        f"binary = {str(repo_root / config.autodock_gpu.binary)!r}",
         f"nrun = {config.autodock_gpu.nrun}",
         f"nev = {config.autodock_gpu.nev}",
         f"heuristics = {config.autodock_gpu.heuristics}",
@@ -843,7 +845,7 @@ def prepare_autodock_gpu(
         "",
         "# Run autogrid4",
         "os.chdir(str(grid_dir))",
-        "subprocess.run(['autogrid4', '-p', 'receptor.gpf', '-l', 'autogrid.log'], check=True)",
+        f"subprocess.run([{str(repo_root / '.local' / 'bin' / 'autogrid4')!r}, '-p', 'receptor.gpf', '-l', 'autogrid.log'], check=True)",
         "",
         "# Run AutoDock-GPU",
         "subprocess.run([",
