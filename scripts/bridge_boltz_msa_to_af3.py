@@ -50,25 +50,30 @@ def find_boltz_msa_csvs(boltz_output_dir: Path) -> dict[str, Path]:
 
 
 def patch_af3_input(af3_json_path: Path, a3m_paths: dict[str, Path]) -> None:
-    """Patch AF3 input JSON with unpairedMsaPath for matching protein chains."""
+    """Patch AF3 input JSON with unpairedMsaPath for matching protein chains.
+
+    Boltz names MSA files by index (boltz_input_0, boltz_input_1, ...),
+    not by chain ID. We match by order: first protein chain gets first MSA, etc.
+    """
     data = json.loads(af3_json_path.read_text())
 
-    patched = 0
-    for seq_entry in data.get("sequences", []):
-        if "protein" not in seq_entry:
-            continue
-        protein = seq_entry["protein"]
-        chain_id = protein.get("id")
-        chain_ids = [chain_id] if isinstance(chain_id, str) else (chain_id or [])
+    # Sort MSA paths by name to match order
+    sorted_a3m = sorted(a3m_paths.values(), key=lambda p: p.stem)
 
-        for cid in chain_ids:
-            if cid in a3m_paths:
-                protein["unpairedMsaPath"] = str(a3m_paths[cid])
-                protein.pop("unpairedMsa", None)
-                protein.pop("pairedMsa", None)
-                patched += 1
-                print(f"  Patched chain {cid} with MSA from {a3m_paths[cid]}")
-                break
+    # Collect protein chains in order
+    protein_entries = []
+    for seq_entry in data.get("sequences", []):
+        if "protein" in seq_entry:
+            protein_entries.append(seq_entry["protein"])
+
+    patched = 0
+    for protein, a3m_path in zip(protein_entries, sorted_a3m):
+        chain_id = protein.get("id", "?")
+        protein["unpairedMsaPath"] = str(a3m_path)
+        protein.pop("unpairedMsa", None)
+        protein.pop("pairedMsa", None)
+        patched += 1
+        print(f"  Patched chain {chain_id} with MSA from {a3m_path.name}")
 
     af3_json_path.write_text(json.dumps(data, indent=2) + "\n")
     print(f"  Total {patched} chain(s) patched in {af3_json_path}")
