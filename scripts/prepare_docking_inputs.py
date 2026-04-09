@@ -269,6 +269,74 @@ def run_p2rank(pdb_path: Path, output_dir: Path) -> tuple[list[float], list[floa
     return None
 
 
+def run_swinsite(pdb_path: Path, output_dir: Path) -> tuple[list[float], list[float]] | None:
+    """Run SwinSite binding site prediction and return (center, size) of top pocket."""
+    repo_root = Path(__file__).resolve().parent.parent
+    swinsite_dir = repo_root / "external" / "swinsite"
+    pred_python = repo_root / ".venvs" / "pred" / "bin" / "python"
+
+    if not swinsite_dir.exists() or not pred_python.exists():
+        print("  SwinSite not found, skipping.")
+        return None
+
+    swinsite_out = output_dir / "swinsite"
+    # SwinSite expects a directory of PDB files
+    input_dir = swinsite_out / "input"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    import shutil
+    shutil.copy2(str(pdb_path), str(input_dir / pdb_path.name))
+
+    try:
+        import subprocess as _sp
+        _sp.run(
+            [str(pred_python), str(swinsite_dir / "predict.py"),
+             "-i", str(input_dir), "-f", "pdb", "-of", "pdb",
+             "-o", str(swinsite_out / "results"),
+             "-l", str(swinsite_out / "log.txt"),
+             "-m",
+             str(swinsite_dir / "model/fold_1/best_epoch.h5"),
+             str(swinsite_dir / "model/fold_2/best_epoch.h5"),
+             str(swinsite_dir / "model/fold_3/best_epoch.h5"),
+             str(swinsite_dir / "model/fold_4/best_epoch.h5"),
+            ],
+            check=True, capture_output=True, text=True, timeout=300,
+        )
+    except Exception as e:
+        print(f"  SwinSite failed: {e}")
+        return None
+
+    # Parse pocket PDB files to find center
+    results_dir = swinsite_out / "results" / "input"
+    if not results_dir.exists():
+        print("  SwinSite produced no output.")
+        return None
+
+    for pocket_pdb in sorted(results_dir.glob("pocket_*.pdb")):
+        # Read coordinates and compute centroid
+        coords = []
+        for line in pocket_pdb.read_text().splitlines():
+            if line.startswith(("ATOM", "HETATM")):
+                try:
+                    x = float(line[30:38])
+                    y = float(line[38:46])
+                    z = float(line[46:54])
+                    coords.append((x, y, z))
+                except ValueError:
+                    continue
+        if not coords:
+            continue
+        import numpy as _np
+        arr = _np.array(coords)
+        center = arr.mean(axis=0).tolist()
+        extent = (arr.max(axis=0) - arr.min(axis=0))
+        box_side = max(15.0, min(25.0, float(extent.max()) + 10.0))
+        print(f"  SwinSite pocket 1: center=[{center[0]:.1f}, {center[1]:.1f}, {center[2]:.1f}], atoms={len(coords)}")
+        return (center, [box_side, box_side, box_side])
+
+    print("  SwinSite found no pockets.")
+    return None
+
+
 def extract_smiles_from_yaml(input_yaml: Path) -> list[tuple[str, str]]:
     """Extract (ligand_id, smiles) pairs from unified input YAML."""
     # Simple YAML parsing to avoid heavy dependency
@@ -410,15 +478,29 @@ def main() -> int:
     center, size = None, None
     box_method = "fallback"
 
+    # Try binding site predictors: SwinSite (ML) > P2Rank (surface) > ligand fallback
+    binding_site_results = {}
+
     if not args.no_p2rank:
         print("  Running P2Rank binding site prediction...")
         p2rank_result = run_p2rank(pdb_path, args.output_dir)
         if p2rank_result:
-            center, size = p2rank_result
-            box_method = "p2rank"
+            binding_site_results["p2rank"] = p2rank_result
+
+    print("  Running SwinSite binding site prediction...")
+    swinsite_result = run_swinsite(pdb_path, args.output_dir)
+    if swinsite_result:
+        binding_site_results["swinsite"] = swinsite_result
+
+    # Pick best: prefer SwinSite (ML-based), fallback to P2Rank, then ligand coords
+    if "swinsite" in binding_site_results:
+        center, size = binding_site_results["swinsite"]
+        box_method = "swinsite"
+    elif "p2rank" in binding_site_results:
+        center, size = binding_site_results["p2rank"]
+        box_method = "p2rank"
 
     if center is None:
-        # Fallback: compute from ligand 3D coordinates
         first_sdf = args.output_dir / f"ligand_{ligands[0][0]}.sdf"
         center, size = compute_box_from_ligand(first_sdf)
         box_method = "ligand_coordinates"
@@ -440,6 +522,9 @@ def main() -> int:
         "box_center": center,
         "box_size": size,
         "box_method": box_method,
+        "binding_site_predictions": {
+            k: {"center": v[0], "size": v[1]} for k, v in binding_site_results.items()
+        },
         "cofolding_structure": str(structure),
         "cofolding_model": model,
     }
