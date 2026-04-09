@@ -54,7 +54,9 @@ if [[ "${1:-}" == "--verify" ]]; then
 
   # Post-processing
   .venvs/pred/bin/python -c "import bapred, rmsdpred, dgl; print('ok')" \
-    && ok "BA-Pred + RMSD-Pred (dgl $(. .venvs/pred/bin/python -c 'import dgl;print(dgl.__version__)' 2>/dev/null))" || fail "BA-Pred / RMSD-Pred"
+    && ok "BA-Pred + RMSD-Pred" || fail "BA-Pred / RMSD-Pred"
+  (cd "${ROOT_DIR}/external/swinsite" && "${ROOT_DIR}/.venvs/pred/bin/python" -c "from SwinUnet import SwinSite; print('ok')") \
+    && ok "SwinSite" || fail "SwinSite"
 
   # Model weights
   [ -f external/alphafold3/models/af3.bin ] && ok "AF3 weights" || echo "  ⚠ AF3 weights not found"
@@ -99,6 +101,7 @@ clone_if_missing "https://github.com/ccsb-scripps/AutoDock-GPU.git"    "external
 clone_if_missing "https://github.com/ccsb-scripps/AutoGrid.git"        "external/AutoGrid"
 clone_if_missing "https://github.com/eightmm/BA-Pred.git"             "external/BA-Pred"
 clone_if_missing "https://github.com/eightmm/RMSD-Pred.git"           "external/RMSD-Pred"
+clone_if_missing "https://github.com/ding-oh/swinsite.git"            "external/swinsite"
 
 # ---------------------------------------------------------------------------
 # Create virtual environments
@@ -249,7 +252,9 @@ uv pip install --python .venvs/pred/bin/python \
   "dgl==2.4.0" -f https://data.dgl.ai/wheels/torch-2.4/cu124/repo.html
 uv pip install --python .venvs/pred/bin/python \
   -e external/BA-Pred -e external/RMSD-Pred
-ok "BA-Pred + RMSD-Pred installed"
+uv pip install --python .venvs/pred/bin/python \
+  openbabel-wheel einops scikit-image h5py timm
+ok "BA-Pred + RMSD-Pred + SwinSite installed"
 
 # ---------------------------------------------------------------------------
 # Hub project itself
