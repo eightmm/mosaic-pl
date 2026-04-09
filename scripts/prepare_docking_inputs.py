@@ -105,11 +105,10 @@ def pqr_to_protonated_pdb(pqr_path: Path, output_path: Path) -> Path:
     pdb_lines = []
     for line in lines:
         if line.startswith(("ATOM", "HETATM")):
-            # PQR → PDB: reconstruct standard PDB columns
-            parts = line.split()
-            # PQR has no occupancy/bfactor but has charge/radius at end
-            # Take first 54 chars (coordinates) and pad to PDB format
-            pdb_lines.append(f"{line[:54]:<54s}  1.00  0.00")
+            atom_name = line[12:16].strip()
+            element = atom_name.lstrip("0123456789")[0:1].upper()
+            # PDB format: cols 1-54 (coords), 55-60 (occ), 61-66 (bfactor), 77-78 (element)
+            pdb_lines.append(f"{line[:54]:<54s}  1.00  0.00          {element:>2s}  ")
         elif line.startswith(("TER", "END")):
             pdb_lines.append(line)
     output_path.write_text("\n".join(pdb_lines) + "\n")
