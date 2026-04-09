@@ -48,6 +48,9 @@ if [[ "${1:-}" == "--verify" ]]; then
   # Binding site prediction
   .local/bin/prank -version 2>/dev/null | head -1 && ok "P2Rank" || fail "P2Rank"
 
+  # Structure alignment
+  .local/bin/USalign -h 2>/dev/null | head -1 && ok "US-align" || fail "US-align"
+
   # Helper libraries (docking prep)
   .venvs/protenix-dock/bin/python -c "import meeko, gemmi, pdb2pqr; from rdkit import Chem; print('ok')" \
     && ok "Helper libs (meeko, gemmi, pdb2pqr, RDKit)" || fail "Helper libs"
@@ -237,6 +240,14 @@ PRANK_WRAPPER
 chmod +x .local/bin/prank
 ok "P2Rank wrapper created"
 
+# US-align / TMalign (structure alignment)
+if [ ! -f .local/bin/USalign ]; then
+  curl -L "https://zhanggroup.org/US-align/bin/module/USalign.cpp" -o /tmp/USalign.cpp
+  g++ -O3 -o .local/bin/USalign /tmp/USalign.cpp
+  ok "US-align installed"
+else
+  ok "US-align already installed"
+fi
 echo ""
 echo "  NOTE: AutoDock-GPU requires CUDA and must be built on a GPU node:"
 echo "    srun --partition=<gpu_partition> --gres=gpu:1 bash scripts/build_autodock_gpu.sh"
