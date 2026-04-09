@@ -72,6 +72,8 @@ def patch_af3_input(af3_json_path: Path, a3m_paths: dict[str, Path]) -> None:
         protein["unpairedMsaPath"] = str(a3m_path)
         protein.pop("unpairedMsa", None)
         protein["pairedMsa"] = ""
+        if "templates" not in protein:
+            protein["templates"] = []
         patched += 1
         print(f"  Patched chain {chain_id} with MSA from {a3m_path.name}")
 
