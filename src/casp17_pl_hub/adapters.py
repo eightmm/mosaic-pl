@@ -380,11 +380,13 @@ def prepare_alphafold3(
     repo_root = Path(__file__).resolve().parents[2]
     af3_runner = run_dir / "scripts" / "run_alphafold3.sh"
     af3_runner.parent.mkdir(parents=True, exist_ok=True)
-    af3_venv = (repo_root / config.alphafold3.python_bin).resolve().parent.parent
+    af3_python = str(repo_root / config.alphafold3.python_bin)
+    af3_script = str(repo_root / config.alphafold3.script)
+    af3_venv = Path(af3_python).parent.parent
     nv_lib_glob = str(af3_venv / "lib" / "python*" / "site-packages" / "nvidia" / "*" / "lib")
     af3_cmd_args = [
-        str((repo_root / config.alphafold3.python_bin).resolve()),
-        str((repo_root / config.alphafold3.script).resolve()),
+        af3_python,
+        af3_script,
         f"--json_path={input_path}",
         f"--output_dir={output_dir}",
         f"--run_data_pipeline={'true' if config.alphafold3.run_data_pipeline else 'false'}",
