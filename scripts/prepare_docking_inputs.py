@@ -261,7 +261,7 @@ def run_p2rank(pdb_path: Path, output_dir: Path) -> tuple[list[float], list[floa
             cz = float(row["center_z"])
             # Estimate box size from SAS points (rough heuristic)
             sas = int(row["sas_points"])
-            box_side = max(15.0, min(35.0, sas * 0.3))
+            box_side = max(15.0, min(25.0, sas * 0.3))
             print(f"  P2Rank pocket 1: center=[{cx:.1f}, {cy:.1f}, {cz:.1f}], score={row['score'].strip()}")
             return ([cx, cy, cz], [box_side, box_side, box_side])
 
