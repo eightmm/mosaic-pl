@@ -376,64 +376,82 @@ def prepare_alphafold3(
     if common.properties:
         notes.append("AlphaFold3 adapter currently ignores Boltz properties such as affinity.")
 
-    command = [
-        config.alphafold3.python_bin,
-        config.alphafold3.script,
+    # AF3 uses JAX which needs explicit CUDA library paths
+    repo_root = Path(__file__).resolve().parents[2]
+    af3_runner = run_dir / "scripts" / "run_alphafold3.sh"
+    af3_runner.parent.mkdir(parents=True, exist_ok=True)
+    af3_venv = (repo_root / config.alphafold3.python_bin).resolve().parent.parent
+    nv_lib_glob = str(af3_venv / "lib" / "python*" / "site-packages" / "nvidia" / "*" / "lib")
+    af3_cmd_args = [
+        str((repo_root / config.alphafold3.python_bin).resolve()),
+        str((repo_root / config.alphafold3.script).resolve()),
         f"--json_path={input_path}",
         f"--output_dir={output_dir}",
         f"--run_data_pipeline={'true' if config.alphafold3.run_data_pipeline else 'false'}",
         f"--run_inference={'true' if config.alphafold3.run_inference else 'false'}",
     ]
     if config.alphafold3.model_dir:
-        command.append(f"--model_dir={config.alphafold3.model_dir}")
+        af3_cmd_args.append(f"--model_dir={repo_root / config.alphafold3.model_dir}")
     for db_dir in config.alphafold3.db_dirs:
-        command.append(f"--db_dir={db_dir}")
-    _append_option_eq(command, "--jackhmmer_binary_path", config.alphafold3.jackhmmer_binary_path)
-    _append_option_eq(command, "--nhmmer_binary_path", config.alphafold3.nhmmer_binary_path)
-    _append_option_eq(command, "--hmmalign_binary_path", config.alphafold3.hmmalign_binary_path)
-    _append_option_eq(command, "--hmmsearch_binary_path", config.alphafold3.hmmsearch_binary_path)
-    _append_option_eq(command, "--hmmbuild_binary_path", config.alphafold3.hmmbuild_binary_path)
-    _append_option_eq(command, "--jackhmmer_n_cpu", config.alphafold3.jackhmmer_n_cpu)
+        af3_cmd_args.append(f"--db_dir={db_dir}")
+    _append_option_eq(af3_cmd_args, "--jackhmmer_binary_path", config.alphafold3.jackhmmer_binary_path)
+    _append_option_eq(af3_cmd_args, "--nhmmer_binary_path", config.alphafold3.nhmmer_binary_path)
+    _append_option_eq(af3_cmd_args, "--hmmalign_binary_path", config.alphafold3.hmmalign_binary_path)
+    _append_option_eq(af3_cmd_args, "--hmmsearch_binary_path", config.alphafold3.hmmsearch_binary_path)
+    _append_option_eq(af3_cmd_args, "--hmmbuild_binary_path", config.alphafold3.hmmbuild_binary_path)
+    _append_option_eq(af3_cmd_args, "--jackhmmer_n_cpu", config.alphafold3.jackhmmer_n_cpu)
     _append_option_eq(
-        command, "--jackhmmer_max_parallel_shards", config.alphafold3.jackhmmer_max_parallel_shards
+        af3_cmd_args, "--jackhmmer_max_parallel_shards", config.alphafold3.jackhmmer_max_parallel_shards
     )
-    _append_option_eq(command, "--nhmmer_n_cpu", config.alphafold3.nhmmer_n_cpu)
+    _append_option_eq(af3_cmd_args, "--nhmmer_n_cpu", config.alphafold3.nhmmer_n_cpu)
     _append_option_eq(
-        command, "--nhmmer_max_parallel_shards", config.alphafold3.nhmmer_max_parallel_shards
+        af3_cmd_args, "--nhmmer_max_parallel_shards", config.alphafold3.nhmmer_max_parallel_shards
     )
     if config.alphafold3.resolve_msa_overlaps is not None:
-        command.append(
+        af3_cmd_args.append(
             f"--resolve_msa_overlaps={'true' if config.alphafold3.resolve_msa_overlaps else 'false'}"
         )
-    _append_option_eq(command, "--max_template_date", config.alphafold3.max_template_date)
+    _append_option_eq(af3_cmd_args, "--max_template_date", config.alphafold3.max_template_date)
     _append_option_eq(
-        command, "--conformer_max_iterations", config.alphafold3.conformer_max_iterations
+        af3_cmd_args, "--conformer_max_iterations", config.alphafold3.conformer_max_iterations
     )
     _append_option_eq(
-        command, "--jax_compilation_cache_dir", config.alphafold3.jax_compilation_cache_dir
+        af3_cmd_args, "--jax_compilation_cache_dir", config.alphafold3.jax_compilation_cache_dir
     )
-    _append_option_eq(command, "--gpu_device", config.alphafold3.gpu_device)
+    _append_option_eq(af3_cmd_args, "--gpu_device", config.alphafold3.gpu_device)
     if config.alphafold3.buckets:
-        command.append("--buckets=" + ",".join(str(item) for item in config.alphafold3.buckets))
+        af3_cmd_args.append("--buckets=" + ",".join(str(item) for item in config.alphafold3.buckets))
     _append_option_eq(
-        command,
+        af3_cmd_args,
         "--flash_attention_implementation",
         config.alphafold3.flash_attention_implementation,
     )
-    _append_option_eq(command, "--num_recycles", config.alphafold3.num_recycles)
+    _append_option_eq(af3_cmd_args, "--num_recycles", config.alphafold3.num_recycles)
     _append_option_eq(
-        command, "--num_diffusion_samples", config.alphafold3.num_diffusion_samples
+        af3_cmd_args, "--num_diffusion_samples", config.alphafold3.num_diffusion_samples
     )
-    _append_option_eq(command, "--num_seeds", config.alphafold3.num_seeds)
+    _append_option_eq(af3_cmd_args, "--num_seeds", config.alphafold3.num_seeds)
     if config.alphafold3.save_embeddings:
-        command.append("--save_embeddings=true")
+        af3_cmd_args.append("--save_embeddings=true")
     if config.alphafold3.save_distogram:
-        command.append("--save_distogram=true")
+        af3_cmd_args.append("--save_distogram=true")
     if config.alphafold3.force_output_dir:
-        command.append("--force_output_dir=true")
+        af3_cmd_args.append("--force_output_dir=true")
     if config.alphafold3.compress_large_output_files:
-        command.append("--compress_large_output_files=true")
-    command.extend(config.alphafold3.extra_args)
+        af3_cmd_args.append("--compress_large_output_files=true")
+    af3_cmd_args.extend(config.alphafold3.extra_args)
+
+    # Write a bash wrapper that sets LD_LIBRARY_PATH for JAX CUDA
+    import shlex as _shlex
+    af3_runner.write_text(
+        "#!/usr/bin/env bash\n"
+        "# Auto-generated AF3 runner with CUDA library paths for JAX\n"
+        f'for _nv_lib in {nv_lib_glob}; do export LD_LIBRARY_PATH="$_nv_lib:${{LD_LIBRARY_PATH:-}}"; done\n'
+        f"exec {' '.join(_shlex.quote(a) for a in af3_cmd_args)}\n"
+    )
+    af3_runner.chmod(0o755)
+
+    command = ["bash", str(af3_runner)]
     return PreparedModelRun("alphafold3", input_path, output_dir, command, notes)
 
 

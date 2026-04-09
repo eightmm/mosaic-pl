@@ -75,7 +75,9 @@ def test_prepare_run_generates_model_inputs(tmp_path: Path) -> None:
     assert "--devices" in manifest["models"][0]["command"]
     assert "2" in manifest["models"][0]["command"]
     assert "--cycle" in manifest["models"][1]["command"]
-    assert "--num_recycles=7" in manifest["models"][2]["command"]
+    af3_script = prepared.run_dir / "scripts" / "run_alphafold3.sh"
+    assert af3_script.exists()
+    assert "--num_recycles=7" in af3_script.read_text()
     assert (prepared.run_dir / "inputs" / "boltz_input.yaml").exists()
     assert (prepared.run_dir / "inputs" / "protenix_input.json").exists()
     assert (prepared.run_dir / "inputs" / "alphafold3_input.json").exists()
