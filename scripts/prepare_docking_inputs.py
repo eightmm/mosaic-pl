@@ -280,11 +280,12 @@ def run_swinsite(pdb_path: Path, output_dir: Path) -> tuple[list[float], list[fl
         return None
 
     swinsite_out = output_dir / "swinsite"
-    # SwinSite expects a directory of PDB files
+    # SwinSite expects input_dir/<sample_name>/protein.pdb
     input_dir = swinsite_out / "input"
-    input_dir.mkdir(parents=True, exist_ok=True)
+    sample_dir = input_dir / "receptor"
+    sample_dir.mkdir(parents=True, exist_ok=True)
     import shutil
-    shutil.copy2(str(pdb_path), str(input_dir / pdb_path.name))
+    shutil.copy2(str(pdb_path), str(sample_dir / "protein.pdb"))
 
     try:
         import subprocess as _sp
@@ -306,7 +307,7 @@ def run_swinsite(pdb_path: Path, output_dir: Path) -> tuple[list[float], list[fl
         return None
 
     # Parse pocket PDB files to find center
-    results_dir = swinsite_out / "results" / "input"
+    results_dir = swinsite_out / "results" / "input" / "receptor"
     if not results_dir.exists():
         print("  SwinSite produced no output.")
         return None
