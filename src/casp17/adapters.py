@@ -5,9 +5,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from casp17_pl_hub.configs import RunnerConfig
-from casp17_pl_hub.io_utils import dump_json, dump_yaml_file
-from casp17_pl_hub.models import CommonInput
+from casp17.configs import RunnerConfig
+from casp17.io_utils import dump_json, dump_yaml_file
+from casp17.models import CommonInput
 
 
 @dataclass(slots=True)

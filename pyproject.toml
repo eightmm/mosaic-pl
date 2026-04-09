@@ -3,7 +3,7 @@ requires = ["hatchling>=1.27.0"]
 build-backend = "hatchling.build"
 
 [project]
-name = "casp17-protein-ligand-hub"
+name = "casp17-pl"
 version = "0.1.0"
 description = "Unified uv-based workspace for CASP17 protein-ligand skill and MCP development."
 readme = "README.md"
@@ -25,11 +25,11 @@ dev = [
 ]
 
 [project.scripts]
-casp17-pl = "casp17_pl_hub.cli:main"
-casp17-pl-mcp = "casp17_pl_hub.mcp_server:main"
+casp17-pl = "casp17.cli:main"
+casp17-pl-mcp = "casp17.mcp_server:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/casp17_pl_hub"]
+packages = ["src/casp17"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

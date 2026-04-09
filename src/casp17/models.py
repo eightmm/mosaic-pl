@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from casp17_pl_hub.configs import RunnerConfig, _require_non_empty_string, _optional_string
-from casp17_pl_hub.io_utils import load_structured_file
+from casp17.configs import RunnerConfig, _require_non_empty_string, _optional_string
+from casp17.io_utils import load_structured_file
 
 
 def _sanitize_job_name(value: str) -> str:

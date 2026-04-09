@@ -53,10 +53,10 @@ def main() -> int:
             "The optional MCP dependency is not installed. Run `uv sync --dev --extra mcp` first."
         ) from exc
 
-    from casp17_pl_hub.configs import PRESET_NAMES, PRESET_OVERRIDES
-    from casp17_pl_hub.models import load_common_input, load_runner_config
-    from casp17_pl_hub.orchestrator import prepare_run
-    from casp17_pl_hub.validation import validate_run
+    from casp17.configs import PRESET_NAMES, PRESET_OVERRIDES
+    from casp17.models import load_common_input, load_runner_config
+    from casp17.orchestrator import prepare_run
+    from casp17.validation import validate_run
 
     server = FastMCP("casp17-protein-ligand")
 
@@ -136,7 +136,7 @@ def main() -> int:
             if template_p.suffix not in (".pdb", ".cif", ".mmcif"):
                 return {"error": f"Unsupported template format: {template_p.suffix}. Use .pdb or .cif"}
 
-            from casp17_pl_hub.io_utils import load_structured_file, dump_structured_file
+            from casp17.io_utils import load_structured_file, dump_structured_file
 
             data = load_structured_file(input_p)
             templates = data.get("templates", [])
@@ -180,7 +180,7 @@ def main() -> int:
             output_path: Where to write the YAML. Defaults to examples/<name>.yaml.
         """
         try:
-            from casp17_pl_hub.io_utils import dump_structured_file
+            from casp17.io_utils import dump_structured_file
 
             sequences: list[dict[str, Any]] = [
                 {"protein": {"id": chain_id, "sequence": sequence, "msa": "empty"}}

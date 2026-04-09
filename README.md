@@ -169,7 +169,7 @@ srun --partition=6000ada --gres=gpu:1 \
 **Post-filter**: `template_filter.py` queries `rcsb_index.db` to find hits with drug-like ligands
 
 ```python
-from casp17_pl_hub.template_filter import filter_hits_with_ligands
+from casp17.template_filter import filter_hits_with_ligands
 hits = filter_hits_with_ligands(hits_tsv, db_path)
 # → hits sorted by ligand presence + sequence identity
 ```
@@ -257,7 +257,7 @@ All tools auto-detect receptor/ligand from `docking_prep_summary.json` at runtim
 
 ### CCD Ligand Classification
 
-Built-in module (`src/casp17_pl_hub/ccd/`) classifies 48,965 CCD codes into 10 categories:
+Built-in module (`src/casp17/ccd/`) classifies 48,965 CCD codes into 10 categories:
 
 | Category | is_candidate | Examples |
 |----------|-------------|---------|
@@ -418,7 +418,7 @@ make lint       # ruff check src/
 ## Project Layout
 
 ```
-src/casp17_pl_hub/
+src/casp17/
 ├── models.py            # CommonInput parsing
 ├── configs.py           # RunnerConfig, presets, model configs
 ├── adapters.py          # Unified input → model-specific formats

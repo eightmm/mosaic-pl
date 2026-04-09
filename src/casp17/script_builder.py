@@ -5,8 +5,8 @@ from __future__ import annotations
 import shlex
 from pathlib import Path
 
-from casp17_pl_hub.adapters import PreparedModelRun
-from casp17_pl_hub.configs import RunnerConfig
+from casp17.adapters import PreparedModelRun
+from casp17.configs import RunnerConfig
 
 
 def build_shell_script(

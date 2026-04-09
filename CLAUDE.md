@@ -27,7 +27,7 @@ unified YAML → adapters.py → model-specific inputs → orchestrator.py → S
 template search → cofolding → structure search → docking prep → docking → post-analysis
 ```
 
-### Core Modules (`src/casp17_pl_hub/`)
+### Core Modules (`src/casp17/`)
 
 | Module | Role |
 |--------|------|

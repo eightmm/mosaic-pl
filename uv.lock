@@ -34,7 +34,7 @@ wheels = [
 ]
 
 [[package]]
-name = "casp17-protein-ligand-hub"
+name = "casp17-pl"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

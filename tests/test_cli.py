@@ -3,10 +3,10 @@ from pathlib import Path
 
 import yaml
 
-from casp17_pl_hub.cli import build_parser, cmd_status
-from casp17_pl_hub.configs import RunnerConfig
-from casp17_pl_hub.models import CommonInput
-from casp17_pl_hub.orchestrator import (
+from casp17.cli import build_parser, cmd_status
+from casp17.configs import RunnerConfig
+from casp17.models import CommonInput
+from casp17.orchestrator import (
     prepare_docking_run,
     prepare_protenix_dock_run,
     prepare_run,
@@ -16,7 +16,7 @@ from casp17_pl_hub.orchestrator import (
     prepare_vina_run,
     write_example_config,
 )
-from casp17_pl_hub.validation import validate_run
+from casp17.validation import validate_run
 
 
 def test_parser_has_status_command() -> None:

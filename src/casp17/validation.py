@@ -6,8 +6,8 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from casp17_pl_hub.configs import RunnerConfig
-from casp17_pl_hub.models import CommonInput
+from casp17.configs import RunnerConfig
+from casp17.models import CommonInput
 
 
 @dataclass(slots=True)

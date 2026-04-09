@@ -6,9 +6,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from casp17_pl_hub.configs import PRESET_NAMES
-from casp17_pl_hub.models import load_common_input, load_runner_config
-from casp17_pl_hub.orchestrator import (
+from casp17.configs import PRESET_NAMES
+from casp17.models import load_common_input, load_runner_config
+from casp17.orchestrator import (
     execute_prepared_run,
     prepare_protenix_dock_run,
     prepare_run,
@@ -19,7 +19,7 @@ from casp17_pl_hub.orchestrator import (
     write_example_config,
     write_example_input,
 )
-from casp17_pl_hub.validation import STAGE_NAMES, validate_run, validation_report_as_text
+from casp17.validation import STAGE_NAMES, validate_run, validation_report_as_text
 
 
 def build_parser() -> argparse.ArgumentParser:

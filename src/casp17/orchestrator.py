@@ -7,7 +7,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from casp17_pl_hub.adapters import (
+from casp17.adapters import (
     PreparedModelRun,
     prepare_alphafold3,
     prepare_autodock_gpu,
@@ -18,11 +18,11 @@ from casp17_pl_hub.adapters import (
     prepare_template_search_structure,
     prepare_vina,
 )
-from casp17_pl_hub.configs import RunnerConfig
-from casp17_pl_hub.io_utils import dump_json, dump_structured_file
-from casp17_pl_hub.models import CommonInput
-from casp17_pl_hub.script_builder import build_shell_script, build_wrapper_shell_script
-from casp17_pl_hub.validation import _model_is_enabled, _resolve_stages, _validate_stage_dependencies
+from casp17.configs import RunnerConfig
+from casp17.io_utils import dump_json, dump_structured_file
+from casp17.models import CommonInput
+from casp17.script_builder import build_shell_script, build_wrapper_shell_script
+from casp17.validation import _model_is_enabled, _resolve_stages, _validate_stage_dependencies
 
 
 @dataclass(slots=True)
