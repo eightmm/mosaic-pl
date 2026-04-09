@@ -23,6 +23,27 @@ import sys
 from pathlib import Path
 
 
+def _pdbqt_to_sdf(pdbqt_path: Path, sdf_path: Path) -> Path | None:
+    """Convert PDBQT/DLG to SDF using meeko mk_export.py CLI."""
+    mk_export = Path(sys.executable).parent / "mk_export.py"
+    if not mk_export.exists():
+        print(f"    mk_export.py not found at {mk_export}")
+        return None
+    try:
+        result = subprocess.run(
+            [str(mk_export), str(pdbqt_path), "-s", str(sdf_path)],
+            capture_output=True, text=True, timeout=60,
+        )
+        if sdf_path.exists() and sdf_path.stat().st_size > 0:
+            print(f"    Converted {pdbqt_path.name} → {sdf_path.name}")
+            return sdf_path
+        print(f"    mk_export produced empty output: {result.stderr[-200:]}")
+        return None
+    except Exception as e:
+        print(f"    mk_export failed: {e}")
+        return None
+
+
 def find_receptor_pdbs(run_dir: Path) -> dict[str, Path]:
     """Find receptor PDB files from cofolding outputs."""
     receptors: dict[str, Path] = {}
@@ -55,15 +76,25 @@ def find_ligand_files(run_dir: Path) -> dict[str, Path]:
         ligands["input_sdf"] = sdf
         break
 
-    # Vina docked poses
+    # Vina docked poses → convert PDBQT to SDF via meeko
     vina_pdbqt = run_dir / "outputs" / "vina" / "docked.pdbqt"
     if vina_pdbqt.exists():
-        ligands["vina"] = vina_pdbqt
+        vina_sdf = run_dir / "outputs" / "vina" / "docked.sdf"
+        if not vina_sdf.exists():
+            vina_sdf = _pdbqt_to_sdf(vina_pdbqt, vina_sdf)
+        if vina_sdf and vina_sdf.exists():
+            ligands["vina"] = vina_sdf
 
-    # AutoDock-GPU DLG
+    # AutoDock-GPU DLG → convert to SDF via meeko
     adg_dlg = run_dir / "outputs" / "autodock_gpu" / "docking.dlg"
     if adg_dlg.exists():
-        ligands["autodock_gpu"] = adg_dlg
+        adg_sdf = run_dir / "outputs" / "autodock_gpu" / "docking.sdf"
+        if not adg_sdf.exists():
+            adg_sdf = _pdbqt_to_sdf(adg_dlg, adg_sdf)
+        if adg_sdf and adg_sdf.exists():
+            ligands["autodock_gpu"] = adg_sdf
+        else:
+            ligands["autodock_gpu"] = adg_dlg
 
     # Protenix-Dock SDF results
     for sdf in (run_dir / "outputs" / "protenix_dock").rglob("*.sdf"):
