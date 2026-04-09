@@ -649,21 +649,37 @@ def prepare_vina(common: CommonInput, config: RunnerConfig, run_dir: Path) -> Pr
     log_path = output_dir / "vina.log"
     seed = config.vina.seed if config.vina.seed is not None else common.seed
 
+    summary_path = run_dir / "inputs" / "docking" / "docking_prep_summary.json"
     runner_script = run_dir / "scripts" / "run_vina.py"
     runner_script.parent.mkdir(parents=True, exist_ok=True)
     script_lines = [
+        "import json, os",
+        "from pathlib import Path",
         "from vina import Vina",
         "",
+        f"# Config defaults (overridden by docking_prep_summary.json at runtime)",
         f"receptor_pdbqt = {receptor_pdbqt!r}",
         f"ligand_pdbqt = {ligand_pdbqt!r}",
-        f"out_path = {str(out_path)!r}",
-        f"log_path = {str(log_path)!r}",
         f"center = [{center_x}, {center_y}, {center_z}]",
         f"size = [{size_x}, {size_y}, {size_z}]",
+        f"out_path = {str(out_path)!r}",
+        f"log_path = {str(log_path)!r}",
         f"exhaustiveness = {config.vina.exhaustiveness}",
         f"n_poses = {config.vina.num_modes}",
         f"energy_range = {config.vina.energy_range}",
         f"seed = {seed}",
+        "",
+        f"# Runtime auto-detect from docking prep bridge",
+        f"summary_path = Path({str(summary_path)!r})",
+        "if summary_path.exists():",
+        "    prep = json.loads(summary_path.read_text())",
+        "    receptor_pdbqt = receptor_pdbqt or prep['receptor_pdbqt']",
+        "    if prep.get('ligands'):",
+        "        ligand_pdbqt = ligand_pdbqt or prep['ligands'][0]['pdbqt']",
+        "    if center[0] is None:",
+        "        center = prep.get('box_center', [0, 0, 0])",
+        "    if size[0] is None:",
+        "        size = prep.get('box_size', [20, 20, 20])",
         "",
         'print(f"Vina: receptor={receptor_pdbqt}")',
         'print(f"Vina: ligand={ligand_pdbqt}")',
@@ -766,38 +782,83 @@ def prepare_autodock_gpu(
     gpf_path.write_text("\n".join(gpf_lines) + "\n")
 
     # Shell script that runs autogrid4 then autodock_gpu
-    runner_script = run_dir / "scripts" / "run_autodock_gpu.sh"
+    runner_script = run_dir / "scripts" / "run_autodock_gpu.py"
     runner_script.parent.mkdir(parents=True, exist_ok=True)
     seed = config.autodock_gpu.seed if config.autodock_gpu.seed is not None else common.seed
     autostop_flag = "1" if config.autodock_gpu.autostop else "0"
+    summary_path = run_dir / "inputs" / "docking" / "docking_prep_summary.json"
 
     script_lines = [
-        "#!/usr/bin/env bash",
-        "set -euo pipefail",
+        "import json, subprocess, os",
+        "from pathlib import Path",
         "",
-        f"cd {grid_dir}",
-        f"echo 'Running autogrid4 for grid maps...'",
-        f"autogrid4 -p {gpf_path.name} -l autogrid.log",
+        f"receptor_pdbqt = {receptor_pdbqt!r}",
+        f"ligand_pdbqt = {ligand_pdbqt!r}",
+        f"center = [{center_x}, {center_y}, {center_z}]",
+        f"size = [{size_x}, {size_y}, {size_z}]",
+        f"grid_dir = Path({str(grid_dir)!r})",
+        f"fld_path = grid_dir / 'receptor.maps.fld'",
+        f"output_dir = Path({str(output_dir)!r})",
+        f"binary = {config.autodock_gpu.binary!r}",
+        f"nrun = {config.autodock_gpu.nrun}",
+        f"nev = {config.autodock_gpu.nev}",
+        f"heuristics = {config.autodock_gpu.heuristics}",
+        f"autostop = {autostop_flag}",
+        f"seed = {seed}",
         "",
-        f"echo 'Running AutoDock-GPU...'",
-        f"{config.autodock_gpu.binary} \\",
-        f"  --ffile {fld_path} \\",
-        f"  --lfile {ligand_pdbqt} \\",
-        f"  --nrun {config.autodock_gpu.nrun} \\",
-        f"  --nev {config.autodock_gpu.nev} \\",
-        f"  --heuristics {config.autodock_gpu.heuristics} \\",
-        f"  --autostop {autostop_flag} \\",
-        f"  --seed {seed} \\",
-        f"  --resnam {output_dir / 'docking'} \\",
-        f"  {' '.join(config.autodock_gpu.extra_args)}",
+        f"# Runtime auto-detect from docking prep bridge",
+        f"summary_path = Path({str(summary_path)!r})",
+        "if summary_path.exists():",
+        "    prep = json.loads(summary_path.read_text())",
+        "    receptor_pdbqt = receptor_pdbqt or prep['receptor_pdbqt']",
+        "    if prep.get('ligands'):",
+        "        ligand_pdbqt = ligand_pdbqt or prep['ligands'][0]['pdbqt']",
+        "    if center[0] is None:",
+        "        center = prep.get('box_center', [0, 0, 0])",
+        "    if size[0] is None:",
+        "        size = prep.get('box_size', [20, 20, 20])",
         "",
-        f"echo 'AutoDock-GPU results in {output_dir}'",
+        "# Generate GPF",
+        "npts = [max(1, int(s / 0.375)) for s in size]",
+        "gpf = [",
+        "    f'npts {npts[0]} {npts[1]} {npts[2]}',",
+        "    f'gridfld receptor.maps.fld',",
+        "    f'spacing 0.375',",
+        "    f'receptor_types A C HD N NA OA SA',",
+        "    f'ligand_types A C HD N NA OA SA',",
+        "    f'receptor {receptor_pdbqt}',",
+        "    f'gridcenter {center[0]} {center[1]} {center[2]}',",
+        "    f'smooth 0.5',",
+        "    'map receptor.A.map', 'map receptor.C.map', 'map receptor.HD.map',",
+        "    'map receptor.N.map', 'map receptor.NA.map', 'map receptor.OA.map',",
+        "    'map receptor.SA.map', 'elecmap receptor.e.map', 'dsolvmap receptor.d.map',",
+        "    'dielectric -0.1465',",
+        "]",
+        "gpf_path = grid_dir / 'receptor.gpf'",
+        "gpf_path.write_text('\\n'.join(gpf) + '\\n')",
+        "",
+        "print(f'AutoDock-GPU: receptor={receptor_pdbqt}')",
+        "print(f'AutoDock-GPU: ligand={ligand_pdbqt}')",
+        "print(f'AutoDock-GPU: center={center}, size={size}')",
+        "",
+        "# Run autogrid4",
+        "os.chdir(str(grid_dir))",
+        "subprocess.run(['autogrid4', '-p', 'receptor.gpf', '-l', 'autogrid.log'], check=True)",
+        "",
+        "# Run AutoDock-GPU",
+        "subprocess.run([",
+        "    binary, '--ffile', str(fld_path), '--lfile', ligand_pdbqt,",
+        f"    '--nrun', str(nrun), '--nev', str(nev),",
+        f"    '--heuristics', str(heuristics), '--autostop', str(autostop),",
+        f"    '--seed', str(seed), '--resnam', str(output_dir / 'docking'),",
+        "], check=True)",
+        "",
+        "print(f'AutoDock-GPU: results in {output_dir}')",
     ]
     runner_script.write_text("\n".join(script_lines) + "\n")
-    runner_script.chmod(0o755)
 
-    input_path = gpf_path
-    command = ["bash", str(runner_script)]
+    input_path = runner_script
+    command = [".venvs/protenix-dock/bin/python", str(runner_script)]
     notes.append("AutoDock-GPU requires autogrid4 in PATH for grid map generation.")
     return PreparedModelRun("autodock-gpu", input_path, output_dir, command, notes)
 
@@ -847,9 +908,10 @@ def prepare_protenix_dock(
 
     result_path = output_dir / "docking_results.json"
     log_path = output_dir / "protenix_dock.log"
+    summary_path = run_dir / "inputs" / "docking" / "docking_prep_summary.json"
     script_lines = [
         "import json",
-        "import sys",
+        "from pathlib import Path",
         "",
         "from pxdock import ProtenixDock",
         "",
@@ -861,6 +923,18 @@ def prepare_protenix_dock(
         f"log_path = {str(log_path)!r}",
         f"cache_map_spacing = {config.protenix_dock.cache_map_spacing}",
         f"use_cache_maps = {config.protenix_dock.use_cache_maps}",
+        "",
+        f"# Runtime auto-detect from docking prep bridge",
+        f"summary_path = Path({str(summary_path)!r})",
+        "if summary_path.exists():",
+        "    prep = json.loads(summary_path.read_text())",
+        "    receptor_pdb = receptor_pdb or prep['receptor_pdb']",
+        "    if prep.get('ligands'):",
+        "        ligand_sdf = ligand_sdf or prep['ligands'][0]['sdf']",
+        "    if box_center[0] is None:",
+        "        box_center = prep.get('box_center', [0, 0, 0])",
+        "    if box_size[0] is None:",
+        "        box_size = prep.get('box_size', [20, 20, 20])",
         "",
         'print(f"Protenix-Dock: receptor={receptor_pdb}")',
         'print(f"Protenix-Dock: ligand={ligand_sdf}")',
