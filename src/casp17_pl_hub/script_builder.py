@@ -102,6 +102,11 @@ def build_wrapper_shell_script(
             "",
             "# Stage wrapper for the larger CASP17 protein-ligand workflow.",
             "# Stages are modular and can be combined per target.",
+            "module load cuda/12.8 2>/dev/null || true",
+            'export LD_LIBRARY_PATH="${CUDA_HOME:-/appl/cuda/12.8}/targets/x86_64-linux/lib:${CUDA_HOME:-/appl/cuda/12.8}/lib64:${LD_LIBRARY_PATH:-}"',
+            f'for _nv_lib in {shlex.quote(str(repo_root))}/.venvs/*/lib/python*/site-packages/nvidia/*/lib; do '
+            'export LD_LIBRARY_PATH="$_nv_lib:$LD_LIBRARY_PATH"; done',
+            f"export PATH={shlex.quote(str(repo_root / '.local' / 'bin'))}:$PATH",
             'echo "Starting CASP17 wrapper pipeline"',
         ]
     )
