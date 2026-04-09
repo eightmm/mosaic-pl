@@ -30,15 +30,31 @@ fail()   { echo "  ✗ $1" >&2; exit 1; }
 if [[ "${1:-}" == "--verify" ]]; then
   banner "Verifying installations"
 
-  .venvs/boltz/bin/python -c "import boltz; print('boltz-import-ok')" && ok "Boltz" || fail "Boltz"
-  .venvs/protenix/bin/python -c "import protenix; print('protenix-import-ok')" && ok "Protenix" || fail "Protenix"
-  .venvs/alphafold3/bin/python -c "import alphafold3; print('alphafold3-import-ok')" && ok "AlphaFold3" || fail "AlphaFold3"
-  .venvs/protenix-dock/bin/python -c "from pxdock import ProtenixDock; print('pxdock-ok')" && ok "Protenix-Dock" || fail "Protenix-Dock"
-  .venvs/protenix-dock/bin/python -c "import vina; print('vina-ok')" && ok "Vina (Python)" || fail "Vina"
-  .local/bin/mmseqs version 2>/dev/null && ok "MMseqs2" || fail "MMseqs2"
-  .local/bin/foldseek version 2>/dev/null && ok "Foldseek" || fail "Foldseek"
+  # Cofolding models
+  .venvs/boltz/bin/python -c "import boltz; print('ok')" && ok "Boltz" || fail "Boltz"
+  .venvs/protenix/bin/python -c "import protenix; print('ok')" && ok "Protenix" || fail "Protenix"
+  .venvs/alphafold3/bin/python -c "import alphafold3; print('ok')" && ok "AlphaFold3" || fail "AlphaFold3"
+
+  # Docking tools
+  .venvs/protenix-dock/bin/python -c "from pxdock import ProtenixDock; print('ok')" && ok "Protenix-Dock" || fail "Protenix-Dock"
+  .venvs/protenix-dock/bin/python -c "from vina import Vina; print('ok')" && ok "Vina (Python API)" || fail "Vina"
   .local/bin/autogrid4 --version 2>/dev/null | head -1 && ok "autogrid4" || fail "autogrid4"
   [ -f .local/bin/autodock_gpu_128wi ] && ok "AutoDock-GPU binary" || echo "  ⚠ AutoDock-GPU not built yet (run: srun ... bash scripts/build_autodock_gpu.sh)"
+
+  # Search tools
+  .local/bin/mmseqs version 2>/dev/null && ok "MMseqs2" || fail "MMseqs2"
+  .local/bin/foldseek version 2>/dev/null && ok "Foldseek" || fail "Foldseek"
+
+  # Binding site prediction
+  .local/bin/prank -version 2>/dev/null | head -1 && ok "P2Rank" || fail "P2Rank"
+
+  # Helper libraries (docking prep)
+  .venvs/protenix-dock/bin/python -c "import meeko, gemmi, pdb2pqr; from rdkit import Chem; print('ok')" \
+    && ok "Helper libs (meeko, gemmi, pdb2pqr, RDKit)" || fail "Helper libs"
+
+  # Model weights
+  [ -f external/alphafold3/models/af3.bin ] && ok "AF3 weights" || echo "  ⚠ AF3 weights not found"
+  [ -f external/Protenix/models/protenix_base_default_v1.0.0.pt ] && ok "Protenix weights" || echo "  ⚠ Protenix weights not in external/Protenix/models/"
 
   echo ""; echo "All verifications passed."; exit 0
 fi
@@ -177,6 +193,36 @@ autoreconf -i 2>/dev/null
 make -j8 >/dev/null 2>&1 && make install >/dev/null 2>&1
 popd >/dev/null
 ok "autogrid4 built: .local/bin/autogrid4"
+
+# JDK (required by P2Rank)
+if [ ! -f .local/jdk/bin/java ]; then
+  mkdir -p .local/jdk
+  curl -L "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.6%2B7/OpenJDK21U-jre_x64_linux_hotspot_21.0.6_7.tar.gz" \
+    | tar -xz -C .local/jdk --strip-components=1
+  ok "JDK 21 installed"
+else
+  ok "JDK already installed"
+fi
+
+# P2Rank (binding site prediction)
+if [ ! -d .local/p2rank_2.5 ]; then
+  curl -L "https://github.com/rdk/p2rank/releases/download/2.5/p2rank_2.5.tar.gz" \
+    | tar -xz -C .local/
+  ok "P2Rank 2.5 installed"
+else
+  ok "P2Rank already installed"
+fi
+# Create prank wrapper that sets JAVA_HOME
+cat > .local/bin/prank << 'PRANK_WRAPPER'
+#!/usr/bin/env bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export JAVA_HOME="$SCRIPT_DIR/jdk"
+export PATH="$JAVA_HOME/bin:$PATH"
+P2RANK_HOME="$SCRIPT_DIR/p2rank_2.5"
+exec java -Xmx2G -cp "$P2RANK_HOME/bin/p2rank.jar:$P2RANK_HOME/bin/lib/*" cz.siret.prank.program.Main "$@"
+PRANK_WRAPPER
+chmod +x .local/bin/prank
+ok "P2Rank wrapper created"
 
 echo ""
 echo "  NOTE: AutoDock-GPU requires CUDA and must be built on a GPU node:"
