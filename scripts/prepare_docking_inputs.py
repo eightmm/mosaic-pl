@@ -82,13 +82,9 @@ def cif_to_pdb(cif_path: Path, output_path: Path) -> Path:
     return output_path
 
 
-def pdb_to_pdbqt(pdb_path: Path, output_path: Path) -> Path:
-    """Convert PDB to PDBQT for receptor: pdb2pqr (protonation + charges) → PDBQT format."""
+def run_pdb2pqr(pdb_path: Path, pqr_path: Path) -> None:
+    """Run pdb2pqr to add hydrogens and assign AMBER charges."""
     import subprocess
-    import tempfile
-
-    # Step 1: pdb2pqr adds hydrogens and assigns charges
-    pqr_path = output_path.with_suffix(".pqr")
     try:
         subprocess.run(
             ["pdb2pqr", "--ff=AMBER", "--ffout=AMBER", "--keep-chain",
@@ -96,12 +92,37 @@ def pdb_to_pdbqt(pdb_path: Path, output_path: Path) -> Path:
             check=True, capture_output=True, text=True,
         )
     except (subprocess.CalledProcessError, FileNotFoundError):
-        # Fallback: try python module
         subprocess.run(
             [sys.executable, "-m", "pdb2pqr", "--ff=AMBER", "--ffout=AMBER", "--keep-chain",
              str(pdb_path), str(pqr_path)],
             check=True, capture_output=True, text=True,
         )
+
+
+def pqr_to_protonated_pdb(pqr_path: Path, output_path: Path) -> Path:
+    """Convert PQR back to PDB format (keeps protonation, HIS→HID/HIE/HIP)."""
+    lines = pqr_path.read_text().splitlines()
+    pdb_lines = []
+    for line in lines:
+        if line.startswith(("ATOM", "HETATM")):
+            # PQR → PDB: reconstruct standard PDB columns
+            parts = line.split()
+            # PQR has no occupancy/bfactor but has charge/radius at end
+            # Take first 54 chars (coordinates) and pad to PDB format
+            pdb_lines.append(f"{line[:54]:<54s}  1.00  0.00")
+        elif line.startswith(("TER", "END")):
+            pdb_lines.append(line)
+    output_path.write_text("\n".join(pdb_lines) + "\n")
+    print(f"  Receptor PDB (protonated): {output_path}")
+    return output_path
+
+
+def pdb_to_pdbqt(pdb_path: Path, output_path: Path) -> Path:
+    """Convert PDB to PDBQT for receptor: pdb2pqr (protonation + charges) → PDBQT format."""
+
+    # Step 1: pdb2pqr adds hydrogens and assigns charges
+    pqr_path = output_path.with_suffix(".pqr")
+    run_pdb2pqr(pdb_path, pqr_path)
 
     # Step 2: PQR → PDBQT (PQR has charges in the occupancy/bfactor columns)
     AD_TYPE_MAP = {
@@ -134,7 +155,6 @@ def pdb_to_pdbqt(pdb_path: Path, output_path: Path) -> Path:
         pdbqt_lines.append(f"{pdb_prefix}  0.00  0.00    {charge:+.3f} {ad_type:<2s}")
 
     output_path.write_text("\n".join(pdbqt_lines) + "\n")
-    pqr_path.unlink(missing_ok=True)
     print(f"  Receptor PDBQT: {output_path} (protonated, Gasteiger charges)")
     return output_path
 
@@ -380,6 +400,13 @@ def main() -> int:
 
     pdb_to_pdbqt(pdb_path, args.output_dir / "receptor.pdbqt")
 
+    # Also generate protonated PDB for Protenix-Dock (HIS→HID/HIE/HIP)
+    pqr_path = args.output_dir / "receptor.pqr"
+    if not pqr_path.exists():
+        run_pdb2pqr(pdb_path, pqr_path)
+    protonated_pdb = pqr_to_protonated_pdb(pqr_path, args.output_dir / "receptor_protonated.pdb")
+    pqr_path.unlink(missing_ok=True)
+
     # 4. Determine docking box: P2Rank > ligand coordinates fallback
     center, size = None, None
     box_method = "fallback"
@@ -399,7 +426,8 @@ def main() -> int:
 
     # 5. Write summary JSON
     summary = {
-        "receptor_pdb": str(args.output_dir / "receptor.pdb"),
+        "receptor_pdb": str(args.output_dir / "receptor_protonated.pdb"),
+        "receptor_pdb_raw": str(args.output_dir / "receptor.pdb"),
         "receptor_pdbqt": str(args.output_dir / "receptor.pdbqt"),
         "ligands": [
             {
