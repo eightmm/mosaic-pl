@@ -61,6 +61,10 @@ if [[ "${1:-}" == "--verify" ]]; then
   (cd "${ROOT_DIR}/external/swinsite" && "${ROOT_DIR}/.venvs/pred/bin/python" -c "from SwinUnet import SwinSite; print('ok')") \
     && ok "SwinSite" || fail "SwinSite"
 
+  # Template-guided docking
+  .venv/bin/python -c "from lig_align import run_pipeline; print('ok')" \
+    && ok "lig-align (MCS-guided)" || fail "lig-align"
+
   # Model weights
   [ -f external/alphafold3/models/af3.bin ] && ok "AF3 weights" || echo "  ⚠ AF3 weights not found"
   [ -f external/Protenix/models/protenix_base_default_v1.0.0.pt ] && ok "Protenix weights" || echo "  ⚠ Protenix weights not in external/Protenix/models/"
@@ -105,6 +109,7 @@ clone_if_missing "https://github.com/ccsb-scripps/AutoGrid.git"        "external
 clone_if_missing "https://github.com/eightmm/BA-Pred.git"             "external/BA-Pred"
 clone_if_missing "https://github.com/eightmm/RMSD-Pred.git"           "external/RMSD-Pred"
 clone_if_missing "https://github.com/ding-oh/swinsite.git"            "external/swinsite"
+clone_if_missing "https://github.com/eightmm/lig-mcs-align.git"      "external/lig-mcs-align"
 
 # ---------------------------------------------------------------------------
 # Create virtual environments
@@ -273,7 +278,8 @@ ok "BA-Pred + RMSD-Pred + SwinSite installed"
 banner "Installing casp17-pl-hub"
 
 uv sync --dev
-ok "casp17-pl-hub installed"
+uv pip install --python .venv/bin/python -e external/lig-mcs-align
+ok "casp17-pl-hub + lig-align installed"
 
 # ---------------------------------------------------------------------------
 # Done
