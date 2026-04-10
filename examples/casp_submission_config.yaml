@@ -1,0 +1,79 @@
+preset: balanced
+
+# Multi-seed ensemble: 5 seeds x 5 samples = 25 structures per cofolding model
+cofolding_seeds: [42, 101, 202, 303, 404]
+docking_seeds: [42, 101, 202, 303, 404]
+
+template_search_sequence:
+  enabled: true
+  binary: .local/bin/mmseqs
+  database_path: data/search_dbs/sequence/rcsb_seqDB
+  min_seq_identity: 0.3
+  min_coverage: 0.7
+  sensitivity: 7.5
+  max_hits: 200
+  threads: 8
+  # Multi-track docking + ion placement
+  rcsb_dir: ~/DB/RCSB/raw/mmCIF_data
+  rcsb_db_path: ~/DB/RCSB/processed/rcsb_index.db
+  mcs_threshold: 0.5
+
+template_search_structure:
+  enabled: false
+
+boltz:
+  enabled: true
+  binary: .venvs/boltz/bin/boltz
+  model: boltz2
+  accelerator: gpu
+  devices: 1
+  use_msa_server: true
+  override: true
+  no_kernels: false
+  use_potentials: true       # Boltz-2x mode for second run
+  diffusion_samples: 5        # 5 samples per seed
+  recycling_steps: 3
+  sampling_steps: 200
+  extra_args: []
+
+protenix:
+  enabled: true
+  binary: .venvs/protenix/bin/protenix
+  model_name: protenix_base_default_v1.0.0
+  dtype: bf16
+  trimul_kernel: cuequivariance
+  triatt_kernel: cuequivariance
+  use_tfg_guidance: false
+  sample: 5                    # 5 samples per seed
+  cycle: 10
+  step: 200
+  extra_args: []
+
+alphafold3:
+  enabled: true
+  python_bin: .venvs/alphafold3/bin/python
+  script: external/alphafold3/run_alphafold.py
+  model_dir: external/alphafold3/models
+  run_data_pipeline: false
+  run_inference: true
+  num_seeds: 5                 # AF3 native multi-seed
+  num_diffusion_samples: 5     # AF3 native multi-sample
+
+vina:
+  enabled: true
+  exhaustiveness: 32
+  num_modes: 10
+
+autodock_gpu:
+  enabled: true
+  nrun: 100
+
+protenix_dock:
+  enabled: true
+
+slurm:
+  partition: 6000ada
+  gpus: 1
+  mem: 96G
+  time: 12:00:00               # longer wall time for 5x multi-seed
+  extra_sbatch_args: []
