@@ -113,11 +113,13 @@ def build_wrapper_shell_script(
     prep_script = repo_root / "scripts" / "prepare_docking_inputs.py"
     filter_script = repo_root / "scripts" / "run_template_filter.py"
     multi_track_script = repo_root / "scripts" / "run_multi_track_docking.py"
+    ion_script = repo_root / "scripts" / "collect_template_ions.py"
     dock_python = repo_root / ".venvs" / "protenix-dock" / "bin" / "python"
     hub_python = repo_root / ".venv" / "bin" / "python"
     stage_names = [s for s, _ in stage_scripts]
     has_template_search = "template-search-sequence" in stage_names
     has_docking = "docking" in stage_names
+    has_cofolding = "cofolding" in stage_names
     prev_stage = None
     for stage_name, script_path in stage_scripts:
         # Insert docking prep bridge between cofolding and docking
@@ -181,6 +183,27 @@ def build_wrapper_shell_script(
             f"--rcsb-dir {shlex.quote(str(rcsb_dir))} "
             f"--rcsb-db {shlex.quote(str(rcsb_db))} "
             f"--mcs-threshold {ts_cfg.mcs_threshold}",
+            "",
+        ])
+
+    # Ion/metal placement: run after cofolding if template search is present
+    # Auto-skips if input YAML has no ion/metal CCD entities
+    if has_template_search and has_cofolding:
+        run_dir = stage_scripts[0][1].parent.parent
+        ts_cfg = config.template_search_sequence
+        rcsb_dir = Path(ts_cfg.rcsb_dir).expanduser()
+        rcsb_db = Path(ts_cfg.rcsb_db_path).expanduser()
+        lines.extend([
+            f'echo ""',
+            f'echo "================================================================"',
+            f'echo "  ION/METAL PLACEMENT (template alignment)"',
+            f'echo "================================================================"',
+            f"{shlex.quote(str(hub_python))} {shlex.quote(str(ion_script))} "
+            f"--run-dir {shlex.quote(str(run_dir))} "
+            f"--input-yaml {shlex.quote(str(run_dir / 'inputs' / 'boltz_input.yaml'))} "
+            f"--rcsb-dir {shlex.quote(str(rcsb_dir))} "
+            f"--rcsb-db {shlex.quote(str(rcsb_db))} "
+            f"|| echo '  (no ion entities or no templates found, skipping)'",
             "",
         ])
 

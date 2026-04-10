@@ -10,7 +10,7 @@ CASP17 Protein-Ligand Hub — unified pipeline for protein structure prediction 
 
 ```bash
 make sync          # uv sync --dev
-make test          # pytest (26 tests)
+make test          # pytest (32 tests)
 make lint          # ruff check src/
 uv run casp17-pl status                    # check CLI status
 uv run casp17-pl-mcp                       # start MCP server
@@ -29,6 +29,8 @@ template search → template filter (MCS) → cofolding → structure search
                                     docking prep → Track 1 docking (Vina/ADG/PxDock)
                                               ↓
                               (MCS ≥ 0.5?) → Track 2 template-based box docking + Track 3 lig-align
+                                              ↓
+                              (ion in input?) → ion placement (template alignment + clustering)
                                               ↓
                                         post-analysis (BA-Pred/RMSD-Pred)
 ```
@@ -68,6 +70,7 @@ template search → template filter (MCS) → cofolding → structure search
 - **Template Filter**: `scripts/run_template_filter.py` — filters mmseqs hits via rcsb_index.db + Tanimoto/MCS scoring
 - **Template Docking Prep**: `scripts/prepare_template_docking.py` — template CIF → receptor + ligand files + bound-pose SDF extraction
 - **Multi-track Docking**: `scripts/run_multi_track_docking.py` — orchestrates Track 2 (template-based box docking) + Track 3 (lig-align)
+- **Ion Placement**: `scripts/collect_template_ions.py` — aligns templates to cofolding model, collects ion positions, clusters by confidence
 
 ### Pipeline Stages
 
@@ -75,8 +78,9 @@ template search → template filter (MCS) → cofolding → structure search
 2. **cofolding** — Boltz2 + Boltz2x + Protenix + AF3 (affinity auto-enabled)
 3. **structure-search** — Foldseek on each cofolding output + cross-model consensus
 4. **docking** — Track 1: Vina + AutoDock-GPU + Protenix-Dock (all read docking_prep_summary.json at runtime)
-5. **multi-track docking** (auto, MCS ≥ threshold) — Track 2: template structure docking + Track 3: lig-align (MCS-guided)
-6. **post-analysis** — BA-Pred + RMSD-Pred via mk_export.py SDF conversion
+5. **multi-track docking** (auto, MCS ≥ threshold) — Track 2: template-based box docking + Track 3: lig-align (MCS-guided)
+6. **ion placement** (auto, if ion CCD in input) — template alignment → ion position clustering by confidence
+7. **post-analysis** — BA-Pred + RMSD-Pred via mk_export.py SDF conversion
 
 ### Key Design Decisions
 

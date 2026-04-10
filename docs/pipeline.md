@@ -390,6 +390,67 @@ flowchart TB
 
 ---
 
+## Stage 5.5: Ion/Metal Placement (conditional)
+
+Input YAML에 ion/metal CCD 엔티티 (ZN, MG, CA, FE 등)가 있으면 자동 실행. Cofolding은 metal 위치를 정확히 예측하기 어려우므로, template alignment 기반으로 가능한 위치를 수집.
+
+```mermaid
+flowchart TB
+    INPUT["Input YAML\n(ccd: ZN)"] --> DETECT["Ion 감지\n(known_ions set)"]
+    DETECT --> SEARCH["Template Search 결과\n(pident >= 30%)"]
+    SEARCH --> FILTER["rcsb_index.db\ntarget ion 보유\ntemplate 필터"]
+    FILTER --> ALIGN["gemmi superposition\n(CA atoms)\ntemplate → cofolding"]
+    ALIGN --> TRANSFORM["Ion 좌표 변환\n(cofolding frame)"]
+    TRANSFORM --> CLUSTER["Distance Clustering\n(threshold 2.0A)"]
+    CLUSTER --> REPORT["Confidence 그룹별 리포트"]
+
+    subgraph CONFIDENCE["Confidence Groups"]
+        direction LR
+        H["High\npident >= 70%"]
+        M["Medium\n50-70%"]
+        L["Low\n30-50%"]
+    end
+
+    REPORT --> CONFIDENCE
+
+    style DETECT fill:#ffd54f,color:#000
+    style CLUSTER fill:#66bb6a,color:#000
+```
+
+- **Script**: `scripts/collect_template_ions.py`
+- **Input**: cofolding best CIF + template search hits + target ion CCD codes
+- **Logic**:
+  1. Input YAML에서 ion CCD 코드 추출 (ZN, MG, CA, FE 등)
+  2. Template search hits 중 해당 ion을 보유한 PDB 필터링 (rcsb_index.db)
+  3. 각 template을 cofolding best model에 gemmi CA superposition
+  4. Rotation/translation을 ion 좌표에 적용 → cofolding 좌표계로 변환
+  5. 거리 기반 클러스터링 (default 2.0A)
+  6. Confidence 그룹별 (pident 70%+/50-70%/30-50%) 결과 리포트
+- **Output**: `outputs/ion_placement/ion_placement_summary.json`
+- **자동 skip**: input에 ion이 없으면 실행하지 않음
+
+**Output example:**
+```json
+{
+  "ions": {
+    "ZN": {
+      "total_positions": 12,
+      "total_templates": 10,
+      "clusters": [
+        {"centroid": [12.3, 45.6, 78.9], "num_templates": 8, "spread_angstrom": 0.8}
+      ],
+      "by_confidence": {
+        "high": {"pident_range": ">=70%", "num_templates": 3, "clusters": [...]},
+        "medium": {"pident_range": "50-70%", "num_templates": 5, "clusters": [...]},
+        "low": {"pident_range": "30-50%", "num_templates": 2, "clusters": [...]}
+      }
+    }
+  }
+}
+```
+
+---
+
 ## Stage 6: Post-analysis
 
 모든 docking 결과에 대해 binding affinity와 pose RMSD를 GNN으로 예측.
@@ -491,6 +552,7 @@ Wrapper pipeline에서 stage 사이에 자동 삽입되는 bridge step 목록.
 | Template Filter | template-search-sequence 직후 | `run_template_filter.py` | Tanimoto + MCS scoring |
 | Docking Prep | cofolding -> docking 사이 | `prepare_docking_inputs.py` | 자동 모델 선택 + binding site + 파일 변환 |
 | Multi-track Docking | docking 직후 (조건부) | `run_multi_track_docking.py` | Track 2 + Track 3 실행 |
+| Ion Placement | multi-track 직후 (조건부) | `collect_template_ions.py` | template alignment → ion 위치 수집 |
 
 ---
 
@@ -579,6 +641,8 @@ experiments/runs/<target>/
 │   │       ├── autodock_gpu/
 │   │       ├── protenix_dock/
 │   │       └── lig_align/
+│   ├── ion_placement/                      # Stage 5.5 (if ion in input)
+│   │   └── ion_placement_summary.json        # clustered positions by confidence
 │   └── analysis/                           # Stage 6
 │       ├── ba_pred_results.tsv
 │       ├── rmsd_pred_results.tsv

@@ -694,3 +694,117 @@ def test_check_mcs_hits_missing_file(tmp_path: Path) -> None:
 
     hits = check_mcs_hits(tmp_path / "nonexistent.tsv", 0.5)
     assert hits == []
+
+
+# --- Ion placement tests ---
+
+
+def test_extract_ion_ccd_codes(tmp_path: Path) -> None:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from collect_template_ions import extract_ion_ccd_codes
+
+    yaml_file = tmp_path / "input.yaml"
+    yaml_file.write_text(
+        "version: 1\n"
+        "sequences:\n"
+        "  - protein:\n"
+        "      id: A\n"
+        "      sequence: MAAA\n"
+        "  - ligand:\n"
+        "      id: L\n"
+        "      smiles: CCO\n"
+        "  - ligand:\n"
+        "      id: M\n"
+        "      ccd: ZN\n"
+        "  - ligand:\n"
+        "      id: N\n"
+        "      ccd: MG\n"
+    )
+    ions = extract_ion_ccd_codes(yaml_file)
+    assert ions == ["ZN", "MG"]
+
+
+def test_extract_ion_ccd_codes_no_ions(tmp_path: Path) -> None:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from collect_template_ions import extract_ion_ccd_codes
+
+    yaml_file = tmp_path / "input.yaml"
+    yaml_file.write_text(
+        "version: 1\n"
+        "sequences:\n"
+        "  - ligand:\n"
+        "      id: L\n"
+        "      smiles: CCO\n"
+    )
+    assert extract_ion_ccd_codes(yaml_file) == []
+
+
+def test_extract_ion_ccd_codes_non_ion_ccd(tmp_path: Path) -> None:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from collect_template_ions import extract_ion_ccd_codes
+
+    yaml_file = tmp_path / "input.yaml"
+    yaml_file.write_text(
+        "version: 1\n"
+        "sequences:\n"
+        "  - ligand:\n"
+        "      id: L\n"
+        "      ccd: ATP\n"
+    )
+    # ATP is not an ion
+    assert extract_ion_ccd_codes(yaml_file) == []
+
+
+def test_cluster_ion_positions() -> None:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from collect_template_ions import cluster_positions, IonPosition
+
+    positions = [
+        IonPosition("1abc", 80.0, "A", "ZN", 10.0, 20.0, 30.0, 1.0, 100),
+        IonPosition("2def", 75.0, "A", "ZN", 10.5, 20.3, 30.2, 1.2, 95),
+        IonPosition("3ghi", 60.0, "B", "ZN", 50.0, 60.0, 70.0, 1.5, 80),
+    ]
+    clusters = cluster_positions(positions, threshold=2.0)
+    assert len(clusters) == 2
+    # Largest cluster first
+    assert clusters[0]["num_templates"] == 2
+    assert clusters[1]["num_templates"] == 1
+    # Centroid of first cluster ~(10.25, 20.15, 30.1)
+    c = clusters[0]["centroid"]
+    assert 10.0 <= c[0] <= 11.0
+    assert 20.0 <= c[1] <= 21.0
+
+
+def test_wrapper_includes_ion_placement(tmp_path: Path) -> None:
+    from casp17.script_builder import build_wrapper_shell_script
+
+    config = RunnerConfig.from_dict(
+        {"template_search_sequence": {"enabled": True, "database_path": "/tmp/db"}}
+    )
+    stage_scripts = [
+        ("template-search-sequence", tmp_path / "scripts" / "run_tss.sh"),
+        ("cofolding", tmp_path / "scripts" / "run_structure.sh"),
+        ("docking", tmp_path / "scripts" / "run_docking.sh"),
+    ]
+    script = build_wrapper_shell_script("T0001", config, "local", stage_scripts)
+    assert "ION/METAL PLACEMENT" in script
+    assert "collect_template_ions.py" in script
+
+
+def test_wrapper_no_ion_placement_without_cofolding(tmp_path: Path) -> None:
+    from casp17.script_builder import build_wrapper_shell_script
+
+    config = RunnerConfig.from_dict(
+        {"template_search_sequence": {"enabled": True, "database_path": "/tmp/db"}}
+    )
+    stage_scripts = [
+        ("template-search-sequence", tmp_path / "scripts" / "run_tss.sh"),
+        ("docking", tmp_path / "scripts" / "run_docking.sh"),
+    ]
+    script = build_wrapper_shell_script("T0001", config, "local", stage_scripts)
+    # No ion placement without cofolding (need reference structure)
+    assert "ION/METAL PLACEMENT" not in script

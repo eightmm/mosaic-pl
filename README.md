@@ -389,6 +389,8 @@ experiments/runs/<target>/
 │   │       ├── autodock_gpu/            # Track 2: template-based box docking
 │   │       ├── protenix_dock/           # Track 2: template-based box docking
 │   │       └── lig_align/               # Track 3: MCS-guided poses
+│   ├── ion_placement/               # Ion positions (if ion CCD in input)
+│   │   └── ion_placement_summary.json # clustered by confidence (70%/50%/30%)
 │   └── analysis/                    # BA-Pred + RMSD-Pred TSVs
 ├── scripts/                         # generated runner scripts
 ├── run_manifest.json
@@ -457,7 +459,7 @@ Full pipeline test on RTX 6000 Ada (37 min total):
 
 ```bash
 make sync       # uv sync --dev
-make test       # pytest (26 tests)
+make test       # pytest (32 tests)
 make lint       # ruff check src/
 ```
 
@@ -490,6 +492,7 @@ scripts/
 ├── run_template_filter.py         # Template hit filtering (Tanimoto + MCS)
 ├── prepare_template_docking.py    # Template CIF → receptor/ligand + bound-pose SDF
 ├── run_multi_track_docking.py     # Multi-track orchestrator (Track 2 + Track 3)
+├── collect_template_ions.py      # Ion/metal placement via template alignment
 ├── run_structure_search.py        # Foldseek consensus across models
 └── run_post_analysis.py           # BA-Pred + RMSD-Pred
 ```
