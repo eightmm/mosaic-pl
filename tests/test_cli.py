@@ -578,3 +578,119 @@ def test_validate_run_catches_invalid_bond_chain_id(tmp_path: Path) -> None:
     report = validate_run(common, config, "slurm", repo_root=tmp_path, stages=["cofolding"])
     assert not report.ok
     assert any("unknown chain id" in e.lower() for e in report.errors)
+
+
+# --- Multi-track docking tests ---
+
+
+def test_template_search_config_has_multi_track_fields() -> None:
+    config = RunnerConfig.from_dict(
+        {
+            "template_search_sequence": {
+                "enabled": True,
+                "database_path": "/tmp/db",
+                "rcsb_dir": "/data/rcsb",
+                "rcsb_db_path": "/data/rcsb_index.db",
+                "mcs_threshold": 0.6,
+            }
+        }
+    )
+    assert config.template_search_sequence.rcsb_dir == "/data/rcsb"
+    assert config.template_search_sequence.rcsb_db_path == "/data/rcsb_index.db"
+    assert config.template_search_sequence.mcs_threshold == 0.6
+
+
+def test_template_search_config_multi_track_defaults() -> None:
+    config = RunnerConfig.from_dict({})
+    assert config.template_search_sequence.mcs_threshold == 0.5
+    assert "RCSB" in config.template_search_sequence.rcsb_dir
+
+
+def test_wrapper_includes_template_filter_bridge(tmp_path: Path) -> None:
+    from casp17.script_builder import build_wrapper_shell_script
+
+    config = RunnerConfig.from_dict(
+        {
+            "template_search_sequence": {
+                "enabled": True,
+                "database_path": "/tmp/db",
+            },
+        }
+    )
+    stage_scripts = [
+        ("template-search-sequence", tmp_path / "scripts" / "run_tss.sh"),
+        ("docking", tmp_path / "scripts" / "run_docking.sh"),
+    ]
+    script = build_wrapper_shell_script("T0001", config, "local", stage_scripts)
+
+    assert "run_template_filter.py" in script
+    assert "filtered_hits.tsv" in script
+    assert "BRIDGE: Filtering template hits" in script
+
+
+def test_wrapper_includes_multi_track_docking(tmp_path: Path) -> None:
+    from casp17.script_builder import build_wrapper_shell_script
+
+    config = RunnerConfig.from_dict(
+        {
+            "template_search_sequence": {
+                "enabled": True,
+                "database_path": "/tmp/db",
+                "mcs_threshold": 0.4,
+            },
+        }
+    )
+    stage_scripts = [
+        ("template-search-sequence", tmp_path / "scripts" / "run_tss.sh"),
+        ("docking", tmp_path / "scripts" / "run_docking.sh"),
+    ]
+    script = build_wrapper_shell_script("T0001", config, "local", stage_scripts)
+
+    assert "MULTI-TRACK DOCKING" in script
+    assert "run_multi_track_docking.py" in script
+    assert "--mcs-threshold 0.4" in script
+
+
+def test_wrapper_no_multi_track_without_template_search(tmp_path: Path) -> None:
+    from casp17.script_builder import build_wrapper_shell_script
+
+    config = RunnerConfig.from_dict({})
+    stage_scripts = [
+        ("docking", tmp_path / "scripts" / "run_docking.sh"),
+    ]
+    script = build_wrapper_shell_script("T0001", config, "local", stage_scripts)
+
+    assert "MULTI-TRACK" not in script
+    assert "run_multi_track_docking.py" not in script
+
+
+def test_check_mcs_hits_filters_by_threshold(tmp_path: Path) -> None:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from run_multi_track_docking import check_mcs_hits
+
+    tsv = tmp_path / "filtered_hits.tsv"
+    tsv.write_text(
+        "query\ttarget\tpdb_id\tchain_id\tpident\tevalue\tnum_ligands\t"
+        "best_tanimoto\tbest_mcs_coverage\tligand_codes\tligand_types\t"
+        "ligand_smiles\tligand_tanimotos\tligand_mcs_coverages\n"
+        "Q\t1abc_A\t1abc\tA\t85.0\t1e-50\t1\t0.8000\t0.7000\tATP\tsmall_molecule\tC\t0.8\t0.7\n"
+        "Q\t2def_B\t2def\tB\t60.0\t1e-20\t1\t0.3000\t0.2000\tNAD\tcofactor\tCC\t0.3\t0.2\n"
+        "Q\t3ghi_C\t3ghi\tC\t70.0\t1e-30\t0\t0.9000\t0.9000\t\t\t\t\t\n"
+    )
+
+    hits = check_mcs_hits(tsv, 0.5)
+    assert len(hits) == 1
+    assert hits[0]["pdb_id"] == "1abc"
+
+    hits_low = check_mcs_hits(tsv, 0.1)
+    assert len(hits_low) == 2  # 3ghi excluded (num_ligands=0)
+
+
+def test_check_mcs_hits_missing_file(tmp_path: Path) -> None:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from run_multi_track_docking import check_mcs_hits
+
+    hits = check_mcs_hits(tmp_path / "nonexistent.tsv", 0.5)
+    assert hits == []

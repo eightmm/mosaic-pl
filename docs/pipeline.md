@@ -37,11 +37,19 @@ flowchart TB
         E1 --> E2 --> E3 & E4
     end
 
-    subgraph S5["Stage 5: Docking"]
-        direction LR
-        F1["Vina<br/>~3s"]
-        F2["AutoDock-GPU<br/>~10s"]
-        F3["Protenix-Dock<br/>~5-30min"]
+    subgraph S5["Stage 5: Docking (Multi-track)"]
+        direction TB
+        subgraph T1["Track 1 (always)"]
+            direction LR
+            F1["Vina<br/>~3s"]
+            F2["AutoDock-GPU<br/>~10s"]
+            F3["Protenix-Dock<br/>~5-30min"]
+        end
+        subgraph T23["Track 2+3 (MCS ≥ 0.5)"]
+            direction LR
+            F4["Template Docking<br/>Vina+ADG+PxDock<br/>(template box)"]
+            F5["lig-align<br/>MCS-guided<br/>+ Vina scoring"]
+        end
     end
 
     subgraph S6["Stage 6: Post-analysis"]
@@ -55,9 +63,10 @@ flowchart TB
     end
 
     A --> S1 & S2
+    S1 -->|"MCS ≥ 0.5"| T23
     S2 --> S3
     S2 --> S4
-    S4 --> S5
+    S4 --> T1
     S5 --> S6
     S1 & S3 & S6 --> OUTPUT
 ```
@@ -72,9 +81,14 @@ flowchart LR
     B --> C["Hit List\n(PDB IDs)"]
     C --> D["rcsb_index.db\nSQLite Lookup"]
     D --> E["Filtered Hits\n+ ligand CCD\n+ SMILES\n+ category"]
+    E --> F["Tanimoto +\nMCS Coverage\nvs target SMILES"]
+    F --> G["filtered_hits.tsv\n(ranked by\nMCS → Tanimoto\n→ pident)"]
 
     style D fill:#f9f,stroke:#333
+    style G fill:#fff9c4,stroke:#333
 ```
+
+**Bridge script**: `scripts/run_template_filter.py` — auto-inserted after MMseqs2 in the wrapper
 
 **CCD Classification** (48,965 entries → 10 categories):
 
@@ -162,7 +176,9 @@ flowchart TB
     style PDBQT_L fill:#e1f5fe
 ```
 
-### Stage 5: Docking
+### Stage 5: Docking (Multi-track)
+
+#### Track 1: Cofolding-based Docking (always)
 
 ```mermaid
 flowchart LR
@@ -182,6 +198,48 @@ flowchart LR
     style ADG fill:#fff3e0
     style PXDOCK fill:#fce4ec
 ```
+
+Uses cofolding best model as receptor, SwinSite/P2Rank binding site for docking box.
+
+#### Track 2 + Track 3: Template-guided (MCS ≥ 0.5)
+
+Auto-activated when template search finds hits with MCS coverage ≥ threshold.
+
+```mermaid
+flowchart TB
+    HITS["filtered_hits.tsv\n(MCS ≥ 0.5)"] --> PREP["prepare_template_docking.py"]
+
+    PREP --> RCIF["Template CIF\n(RCSB)"]
+    RCIF --> RPDB["Template Receptor\nPDB/PDBQT"]
+    RCIF --> LSDF["Template Ligand SDF\n(bound pose)"]
+    RCIF --> BOX["Docking Box\n(template ligand\nposition)"]
+
+    subgraph TRACK2["Track 2: Template Docking"]
+        direction LR
+        TV["Vina"] --- TA["AutoDock-GPU"] --- TP["Protenix-Dock"]
+    end
+
+    subgraph TRACK3["Track 3: lig-align"]
+        direction LR
+        LA1["MCS Anchor\nAlignment"] --> LA2["1000 Conformers\nGeneration"] --> LA3["Vina Scoring\n+ Torsion Opt"]
+        LA3 --> LA4["Top-k Poses"]
+    end
+
+    RPDB & BOX --> TRACK2
+    RPDB & LSDF --> TRACK3
+
+    style TRACK2 fill:#e3f2fd
+    style TRACK3 fill:#f3e5f5
+    style HITS fill:#fff9c4
+```
+
+**Configuration**: `template_search_sequence.mcs_threshold` (default: 0.5)
+
+| Track | Receptor | Box Source | Tool |
+|-------|----------|-----------|------|
+| Track 1 | Cofolding best model | SwinSite > P2Rank | Vina + ADG + PxDock |
+| Track 2 | Template PDB (RCSB) | Template ligand position | Vina + ADG + PxDock |
+| Track 3 | Template PDB (RCSB) | MCS anchor from template ligand | lig-align |
 
 ### Stage 6: Post-analysis
 
@@ -210,42 +268,52 @@ gantt
 
     section Search
     MMseqs2 sequence search     :0, 3
+    Template filter (MCS)       :3, 5
 
     section Co-folding
-    Boltz-2 + affinity          :3, 146
-    Boltz-2x + affinity         :146, 234
-    Protenix v1                 :234, 367
-    Boltz MSA → AF3 bridge      :367, 368
-    AlphaFold3                  :368, 497
+    Boltz-2 + affinity          :5, 148
+    Boltz-2x + affinity         :148, 236
+    Protenix v1                 :236, 369
+    Boltz MSA → AF3 bridge      :369, 370
+    AlphaFold3                  :370, 499
 
     section Docking Prep
-    Auto-select + P2Rank + SwinSite :497, 507
+    Auto-select + P2Rank + SwinSite :499, 509
 
-    section Docking
-    Vina                        :507, 510
-    AutoDock-GPU                :510, 520
-    Protenix-Dock               :520, 2240
+    section Track 1 Docking
+    Vina                        :509, 512
+    AutoDock-GPU                :512, 522
+    Protenix-Dock               :522, 2262
+
+    section Track 2+3 (conditional)
+    Template docking prep       :2262, 2272
+    Template Vina               :2272, 2275
+    Template ADG                :2275, 2285
+    Template PxDock             :2285, 4025
+    lig-align (MCS-guided)      :4025, 4035
 
     section Post-analysis
-    BA-Pred + RMSD-Pred         :2240, 2250
+    BA-Pred + RMSD-Pred         :4035, 4045
 ```
 
-| Stage | Time | % of Total |
-|-------|-----:|:----------:|
-| MMseqs2 | 3s | <1% |
-| Boltz-2 + affinity | 143s | 6% |
-| Boltz-2x + affinity | 88s | 4% |
-| Protenix v1 | 133s | 6% |
-| AlphaFold3 | 129s | 6% |
-| Foldseek × 4 | ~30s | 1% |
-| Docking prep | ~10s | <1% |
-| Vina | 3s | <1% |
-| AutoDock-GPU | 10s | <1% |
-| **Protenix-Dock** | **~29min** | **77%** |
-| Post-analysis | ~10s | <1% |
-| **Total** | **~37min** | |
+| Stage | Time | Notes |
+|-------|-----:|-------|
+| MMseqs2 + template filter | ~5s | sequence search + Tanimoto/MCS scoring |
+| Boltz-2 + affinity | 143s | |
+| Boltz-2x + affinity | 88s | |
+| Protenix v1 | 133s | |
+| AlphaFold3 | 129s | |
+| Foldseek × 4 | ~30s | |
+| Docking prep | ~10s | auto-select + SwinSite/P2Rank |
+| **Track 1: Vina + ADG + PxDock** | **~29min** | cofolding-based |
+| **Track 2: Template docking** | **~29min** | conditional (MCS ≥ 0.5) |
+| **Track 3: lig-align** | **~10s** | conditional (MCS ≥ 0.5) |
+| Post-analysis | ~10s | BA-Pred + RMSD-Pred |
+| **Total (Track 1 only)** | **~37min** | |
+| **Total (all tracks)** | **~66min** | when template has MCS ≥ 0.5 |
 
-> Protenix-Dock is the bottleneck (77% of total time). All other stages complete in ~8 min.
+> Track 2+3 only run when template search finds hits with MCS coverage ≥ threshold (default 0.5).
+> Protenix-Dock remains the bottleneck in both Track 1 and Track 2.
 
 ## Tool Ecosystem
 

@@ -634,6 +634,10 @@ class TemplateSearchSequenceConfig:
     max_hits: int = 200
     threads: int = 8
     extra_args: list[str] = field(default_factory=list)
+    # Multi-track docking: template ligand filtering + template-guided docking
+    rcsb_dir: str = "~/DB/RCSB/raw/mmCIF_data"
+    rcsb_db_path: str = "~/DB/RCSB/processed/rcsb_index.db"
+    mcs_threshold: float = 0.5
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "TemplateSearchSequenceConfig":
@@ -651,6 +655,9 @@ class TemplateSearchSequenceConfig:
             max_hits=int(data.get("max_hits", 200)),
             threads=int(data.get("threads", 8)),
             extra_args=[str(arg) for arg in data.get("extra_args", [])],
+            rcsb_dir=str(data.get("rcsb_dir", "~/DB/RCSB/raw/mmCIF_data")),
+            rcsb_db_path=str(data.get("rcsb_db_path", "~/DB/RCSB/processed/rcsb_index.db")),
+            mcs_threshold=float(data.get("mcs_threshold", 0.5)),
         )
 
 

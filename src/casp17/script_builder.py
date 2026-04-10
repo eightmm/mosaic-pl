@@ -111,7 +111,13 @@ def build_wrapper_shell_script(
         ]
     )
     prep_script = repo_root / "scripts" / "prepare_docking_inputs.py"
+    filter_script = repo_root / "scripts" / "run_template_filter.py"
+    multi_track_script = repo_root / "scripts" / "run_multi_track_docking.py"
     dock_python = repo_root / ".venvs" / "protenix-dock" / "bin" / "python"
+    hub_python = repo_root / ".venv" / "bin" / "python"
+    stage_names = [s for s, _ in stage_scripts]
+    has_template_search = "template-search-sequence" in stage_names
+    has_docking = "docking" in stage_names
     prev_stage = None
     for stage_name, script_path in stage_scripts:
         # Insert docking prep bridge between cofolding and docking
@@ -136,7 +142,48 @@ def build_wrapper_shell_script(
                 "",
             ]
         )
+        # Insert template filter after template-search-sequence
+        if stage_name == "template-search-sequence":
+            run_dir = script_path.parent.parent
+            ts_cfg = config.template_search_sequence
+            rcsb_db = Path(ts_cfg.rcsb_db_path).expanduser()
+            mmseqs_tsv = run_dir / "outputs" / "template_search_sequence" / "mmseqs_hits.tsv"
+            filtered_tsv = run_dir / "outputs" / "template_search_sequence" / "filtered_hits.tsv"
+            input_yaml = run_dir / "inputs" / "boltz_input.yaml"
+            lines.extend([
+                f'echo ""',
+                f'echo "----------------------------------------------------------------"',
+                f'echo "  BRIDGE: Filtering template hits (ligand + MCS)"',
+                f'echo "----------------------------------------------------------------"',
+                f"{shlex.quote(str(hub_python))} {shlex.quote(str(filter_script))} "
+                f"--hits-tsv {shlex.quote(str(mmseqs_tsv))} "
+                f"--rcsb-db {shlex.quote(str(rcsb_db))} "
+                f"--input-yaml {shlex.quote(str(input_yaml))} "
+                f"--output-tsv {shlex.quote(str(filtered_tsv))}",
+                "",
+            ])
         prev_stage = stage_name
+
+    # Multi-track docking: run after all stages if template search + docking both present
+    if has_template_search and has_docking:
+        run_dir = stage_scripts[0][1].parent.parent
+        ts_cfg = config.template_search_sequence
+        rcsb_dir = Path(ts_cfg.rcsb_dir).expanduser()
+        rcsb_db = Path(ts_cfg.rcsb_db_path).expanduser()
+        lines.extend([
+            f'echo ""',
+            f'echo "================================================================"',
+            f'echo "  MULTI-TRACK DOCKING (Track 2 + Track 3)"',
+            f'echo "================================================================"',
+            f"{shlex.quote(str(dock_python))} {shlex.quote(str(multi_track_script))} "
+            f"--run-dir {shlex.quote(str(run_dir))} "
+            f"--input-yaml {shlex.quote(str(run_dir / 'inputs' / 'boltz_input.yaml'))} "
+            f"--rcsb-dir {shlex.quote(str(rcsb_dir))} "
+            f"--rcsb-db {shlex.quote(str(rcsb_db))} "
+            f"--mcs-threshold {ts_cfg.mcs_threshold}",
+            "",
+        ])
+
     return "\n".join(lines) + "\n"
 
 

@@ -10,7 +10,7 @@ CASP17 Protein-Ligand Hub — unified pipeline for protein structure prediction 
 
 ```bash
 make sync          # uv sync --dev
-make test          # pytest (19 tests)
+make test          # pytest (26 tests)
 make lint          # ruff check src/
 uv run casp17-pl status                    # check CLI status
 uv run casp17-pl-mcp                       # start MCP server
@@ -24,7 +24,13 @@ bash scripts/install_external_models.sh --verify  # verify all tools
 ```
 unified YAML → adapters.py → model-specific inputs → orchestrator.py → SLURM scripts
                                                                           ↓
-template search → cofolding → structure search → docking prep → docking → post-analysis
+template search → template filter (MCS) → cofolding → structure search
+                                              ↓
+                                    docking prep → Track 1 docking (Vina/ADG/PxDock)
+                                              ↓
+                              (MCS ≥ 0.5?) → Track 2 template docking + Track 3 lig-align
+                                              ↓
+                                        post-analysis (BA-Pred/RMSD-Pred)
 ```
 
 ### Core Modules (`src/casp17/`)
@@ -59,14 +65,18 @@ template search → cofolding → structure search → docking prep → docking 
 
 - **Boltz MSA → AF3**: `scripts/bridge_boltz_msa_to_af3.py` — CSV→A3M + patch AF3 JSON (pairedMsa="" + templates=[])
 - **Docking Prep**: `scripts/prepare_docking_inputs.py` — auto model select + SwinSite/P2Rank + SMILES→SDF/PDBQT + CIF→PDB→PDBQT
+- **Template Filter**: `scripts/run_template_filter.py` — filters mmseqs hits via rcsb_index.db + Tanimoto/MCS scoring
+- **Template Docking Prep**: `scripts/prepare_template_docking.py` — template CIF → receptor + ligand files + bound-pose SDF extraction
+- **Multi-track Docking**: `scripts/run_multi_track_docking.py` — orchestrates Track 2 (template docking) + Track 3 (lig-align)
 
 ### Pipeline Stages
 
-1. **template-search-sequence** — MMseqs2 (488k seqs, preindexed)
+1. **template-search-sequence** — MMseqs2 (488k seqs, preindexed) → template filter (ligand + MCS)
 2. **cofolding** — Boltz2 + Boltz2x + Protenix + AF3 (affinity auto-enabled)
 3. **structure-search** — Foldseek on each cofolding output + cross-model consensus
-4. **docking** — Vina + AutoDock-GPU + Protenix-Dock (all read docking_prep_summary.json at runtime)
-5. **post-analysis** — BA-Pred + RMSD-Pred via mk_export.py SDF conversion
+4. **docking** — Track 1: Vina + AutoDock-GPU + Protenix-Dock (all read docking_prep_summary.json at runtime)
+5. **multi-track docking** (auto, MCS ≥ threshold) — Track 2: template structure docking + Track 3: lig-align (MCS-guided)
+6. **post-analysis** — BA-Pred + RMSD-Pred via mk_export.py SDF conversion
 
 ### Key Design Decisions
 
@@ -78,6 +88,8 @@ template search → cofolding → structure search → docking prep → docking 
 - **Binding site priority**: SwinSite (ML) > P2Rank (surface) > ligand coords (fallback)
 - **Affinity auto-inject**: When ligand present, `properties.affinity` added to Boltz YAML
 - **RCSB ligand index**: External SQLite DB (mmcif-parser maintained), queried for template filtering
+- **Multi-track docking**: 3 tracks — Track 1 (always): cofolding→docking, Track 2 (MCS≥threshold): template→docking, Track 3 (MCS≥threshold): lig-align. Config: `template_search_sequence.mcs_threshold` (default 0.5)
+- **Template ligand SDF**: `prepare_template_docking.py` extracts bound-pose ligand from template CIF for lig-align reference
 
 ### Cluster Notes
 

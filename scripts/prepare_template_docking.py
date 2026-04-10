@@ -69,6 +69,76 @@ def extract_ligand_center(cif_path: Path, ligand_ccd: str) -> list[float] | None
     return arr.mean(axis=0).tolist()
 
 
+def extract_template_ligand_sdf(cif_path: Path, ligand_ccd: str, output_sdf: Path) -> Path | None:
+    """Extract template ligand from CIF as SDF with bound-state 3D coordinates.
+
+    Writes the first matching residue as a HETATM PDB block, then converts
+    to SDF via RDKit (or openbabel as fallback).  The resulting SDF preserves
+    the crystallographic pose, which is needed for lig-align reference.
+    """
+    import gemmi
+
+    structure = gemmi.read_structure(str(cif_path))
+    target_residue = None
+    target_chain = None
+    for model in structure:
+        for chain in model:
+            for residue in chain:
+                if residue.name == ligand_ccd:
+                    target_residue = residue
+                    target_chain = chain
+                    break
+            if target_residue:
+                break
+        if target_residue:
+            break
+
+    if target_residue is None:
+        return None
+
+    # Write ligand atoms as minimal PDB
+    ligand_pdb = output_sdf.with_suffix(".pdb")
+    with open(ligand_pdb, "w") as f:
+        for i, atom in enumerate(target_residue):
+            name = f" {atom.name:<3s}" if len(atom.name) < 4 else atom.name
+            f.write(
+                f"HETATM{i + 1:5d} {name:4s} {target_residue.name:>3s}"
+                f" {target_chain.name:>1s}{target_residue.seqid.num:4d}    "
+                f"{atom.pos.x:8.3f}{atom.pos.y:8.3f}{atom.pos.z:8.3f}"
+                f"  1.00  0.00          {atom.element.name:>2s}\n"
+            )
+        f.write("END\n")
+
+    # Convert PDB → SDF
+    try:
+        from rdkit import Chem
+        mol = Chem.MolFromPDBFile(str(ligand_pdb), sanitize=False, removeHs=False)
+        if mol is not None:
+            try:
+                Chem.SanitizeMol(mol)
+            except Exception:
+                pass  # keep unsanitized — coords are what matter
+            writer = Chem.SDWriter(str(output_sdf))
+            writer.write(mol)
+            writer.close()
+            return output_sdf
+    except Exception:
+        pass
+
+    # Fallback: try openbabel
+    try:
+        result = subprocess.run(
+            ["obabel", str(ligand_pdb), "-O", str(output_sdf)],
+            check=True, capture_output=True, text=True,
+        )
+        if output_sdf.exists():
+            return output_sdf
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+
+    return None
+
+
 def cif_to_receptor_pdb(cif_path: Path, output_pdb: Path) -> Path:
     """Extract protein chains from CIF to PDB."""
     import gemmi
@@ -264,6 +334,16 @@ def main() -> int:
         box_size = [args.box_size] * 3
         print(f"  Ligand {template_ligand_ccd} center: [{center[0]:.1f}, {center[1]:.1f}, {center[2]:.1f}]")
 
+        # Extract template ligand SDF (bound pose for lig-align)
+        template_ligand_sdf = None
+        template_lig_sdf_path = template_dir / f"template_ligand_{template_ligand_ccd}.sdf"
+        extracted = extract_template_ligand_sdf(cif, template_ligand_ccd, template_lig_sdf_path)
+        if extracted:
+            template_ligand_sdf = str(extracted)
+            print(f"  Template ligand SDF: {extracted.name}")
+        else:
+            print(f"  WARNING: Could not extract template ligand SDF for {template_ligand_ccd}")
+
         # Prepare receptor
         receptor_pdb = cif_to_receptor_pdb(cif, template_dir / "receptor.pdb")
         protonated_pdb, receptor_pdbqt = prepare_receptor_pdbqt(receptor_pdb, template_dir)
@@ -294,7 +374,10 @@ def main() -> int:
             "box_method": "template_ligand",
             "template_pdb_id": pdb_id,
             "template_ligand_ccd": template_ligand_ccd,
+            "template_ligand_sdf": template_ligand_sdf,
             "template_pident": float(hit.get("pident", 0)),
+            "best_mcs_coverage": float(hit.get("best_mcs_coverage", 0)),
+            "best_tanimoto": float(hit.get("best_tanimoto", 0)),
         }
         summary_path = template_dir / "docking_prep_summary.json"
         summary_path.write_text(json.dumps(summary, indent=2) + "\n")

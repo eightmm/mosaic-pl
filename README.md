@@ -43,32 +43,43 @@ Orchestrates external ML models (Boltz2/2x, Protenix v2, AlphaFold3), template s
     └──────────────────────┬──────────────────────┘
                            │
     ┌──────────────────────▼──────────────────────┐
-    │  Stage 5: Docking (3 tools)                 │
+    │  Stage 5: Docking (Multi-track)             │
+    │                                             │
+    │  Track 1 (always — cofolding receptor):     │
     │  ┌────────┐  ┌─────────────┐  ┌───────────┐│
     │  │  Vina  │  │ AutoDock-GPU│  │Protenix-  ││
     │  │(Py API)│  │  (CUDA)     │  │   Dock    ││
     │  │  ~3s   │  │   ~10s      │  │ ~5-30min  ││
-    │  └───┬────┘  └──────┬──────┘  └─────┬─────┘│
-    └──────┼──────────────┼───────────────┼──────-┘
-           │              │               │
-    ┌──────▼──────────────▼───────────────▼──────┐
-    │  Stage 6: Post-analysis                    │
-    │  • PDBQT/DLG → SDF (meeko mk_export.py)   │
-    │  • BA-Pred: binding affinity (GNN)         │
-    │  • RMSD-Pred: pose RMSD prediction (GNN)   │
-    └──────────────────────┬─────────────────────┘
+    │  └────────┘  └─────────────┘  └───────────┘│
+    │                                             │
+    │  Track 2+3 (MCS ≥ 0.5 — template receptor):│
+    │  ┌─────────────────┐  ┌───────────────────┐│
+    │  │ Template Docking │  │    lig-align      ││
+    │  │ Vina+ADG+PxDock  │  │ MCS anchor+Vina  ││
+    │  │ (template box)   │  │ scoring+torsion   ││
+    │  └─────────────────┘  └───────────────────┘│
+    └──────────────────────┬──────────────────────┘
+                           │
+    ┌──────▼──────────────────────────────────────┐
+    │  Stage 6: Post-analysis                     │
+    │  • PDBQT/DLG → SDF (meeko mk_export.py)    │
+    │  • BA-Pred: binding affinity (GNN)          │
+    │  • RMSD-Pred: pose RMSD prediction (GNN)    │
+    └──────────────────────┬──────────────────────┘
                            │
     ┌──────────────────────▼──────────────────────┐
     │  OUTPUT: experiments/runs/<target>/          │
-    │  ├── outputs/boltz2/     (CIF + affinity)   │
-    │  ├── outputs/boltz2x/    (CIF + affinity)   │
-    │  ├── outputs/protenix/   (CIF + confidence) │
-    │  ├── outputs/alphafold3/ (CIF + confidence) │
-    │  ├── outputs/vina/       (docked SDF/PDBQT) │
-    │  ├── outputs/autodock_gpu/ (DLG + SDF)      │
-    │  ├── outputs/protenix_dock/ (results JSON)  │
+    │  ├── outputs/boltz2/       (CIF + affinity) │
+    │  ├── outputs/boltz2x/      (CIF + affinity) │
+    │  ├── outputs/protenix/     (CIF+confidence) │
+    │  ├── outputs/alphafold3/   (CIF+confidence) │
+    │  ├── outputs/vina/         (docked PDBQT)   │
+    │  ├── outputs/autodock_gpu/ (DLG)            │
+    │  ├── outputs/protenix_dock/(results JSON)   │
+    │  ├── outputs/template_docking/ (Track 2+3)  │
+    │  │   └── <pdb_id>/vina/adg/pxdock/lig_align │
     │  ├── outputs/structure_search/ (consensus)  │
-    │  └── outputs/analysis/   (BA/RMSD TSVs)     │
+    │  └── outputs/analysis/     (BA/RMSD TSVs)   │
     └─────────────────────────────────────────────┘
 ```
 
@@ -166,13 +177,17 @@ srun --partition=6000ada --gres=gpu:1 \
 **Tool**: MMseqs2 (`easy-search` against preindexed RCSB sequence DB)
 **Input**: Protein sequence from unified YAML
 **Output**: `outputs/template_search_sequence/mmseqs_hits.tsv`
-**Post-filter**: `template_filter.py` queries `rcsb_index.db` to find hits with drug-like ligands
+**Post-filter**: `run_template_filter.py` → `template_filter.py` queries `rcsb_index.db`, computes Tanimoto + MCS vs target SMILES
 
 ```python
 from casp17.template_filter import filter_hits_with_ligands
-hits = filter_hits_with_ligands(hits_tsv, db_path)
-# → hits sorted by ligand presence + sequence identity
+hits = filter_hits_with_ligands(hits_tsv, db_path, target_smiles="CCO")
+# → hits sorted by MCS coverage → Tanimoto → pident
+# Each hit has: best_tanimoto, best_mcs_coverage, ligand_codes, ligand_smiles
 ```
+
+**Outputs**: `mmseqs_hits.tsv` (raw) → `filtered_hits.tsv` (scored + ranked)
+**MCS threshold**: Hits with `best_mcs_coverage ≥ 0.5` trigger Track 2+3 docking (configurable via `template_search_sequence.mcs_threshold`)
 
 ### Stage 2: Co-folding
 
@@ -233,9 +248,11 @@ Runs automatically between cofolding and docking in the wrapper pipeline.
 
 **Unified box**: 22.5Å × 22.5Å × 22.5Å, grid spacing 0.375Å
 
-### Stage 5: Docking
+### Stage 5: Docking (Multi-track)
 
-3 docking tools run sequentially:
+3 parallel docking tracks, where Track 2+3 activate conditionally:
+
+#### Track 1 (always): Cofolding-based docking
 
 | Tool | Type | Time | Output |
 |------|------|------|--------|
@@ -243,7 +260,32 @@ Runs automatically between cofolding and docking in the wrapper pipeline.
 | **AutoDock-GPU** | CUDA GPU | ~10s | `outputs/autodock_gpu/docking.dlg` |
 | **Protenix-Dock** | CPU force field | ~5-30min | `outputs/protenix_dock/docking_results.json` |
 
-All tools auto-detect receptor/ligand from `docking_prep_summary.json` at runtime.
+Receptor from cofolding best model, box from SwinSite/P2Rank. All tools auto-detect from `docking_prep_summary.json`.
+
+#### Track 2 (MCS ≥ 0.5): Template-based docking
+
+Same 3 docking tools, but using template structure as receptor and template ligand position for docking box.
+
+| Step | Script | Output |
+|------|--------|--------|
+| Template prep | `prepare_template_docking.py` | receptor PDB/PDBQT + ligand files + box from template ligand |
+| Docking | Vina + ADG + PxDock | `outputs/template_docking/<pdb_id>/vina/`, `autodock_gpu/`, `protenix_dock/` |
+
+#### Track 3 (MCS ≥ 0.5): lig-align (MCS-guided pose generation)
+
+Uses template ligand bound pose as anchor for MCS-guided conformer generation with Vina scoring.
+
+| Step | Description |
+|------|-------------|
+| MCS alignment | Align target molecule MCS atoms to template ligand bound pose |
+| Conformer generation | 1000 conformers with MCS-constrained torsion sampling |
+| Vina scoring | Score + rank poses using Vina energy function |
+| Torsion optimization | Gradient-based refinement (optional, default on) |
+| Output | Top-k poses as SDF → `outputs/template_docking/<pdb_id>/lig_align/` |
+
+**Orchestrator**: `scripts/run_multi_track_docking.py` — auto-inserted in wrapper after Track 1 docking.
+
+**Config**: `template_search_sequence.mcs_threshold` (default: `0.5`)
 
 ### Stage 6: Post-analysis
 
@@ -304,6 +346,13 @@ alphafold3:
   run_data_pipeline: false
   run_inference: true
 
+template_search_sequence:
+  enabled: true
+  database_path: data/search_dbs/sequence/rcsb_seqDB
+  rcsb_dir: ~/DB/RCSB/raw/mmCIF_data        # CIF files for template docking
+  rcsb_db_path: ~/DB/RCSB/processed/rcsb_index.db  # ligand index
+  mcs_threshold: 0.5                          # Track 2+3 activation threshold
+
 vina:
   enabled: true
 autodock_gpu:
@@ -323,28 +372,42 @@ slurm:
 ```
 experiments/runs/<target>/
 ├── inputs/
-│   ├── boltz_input.yaml           # Boltz unified YAML (+ affinity properties)
-│   ├── protenix_input.json        # Protenix JSON
-│   ├── alphafold3_input.json      # AF3 JSON (+ MSA from Boltz bridge)
-│   └── docking/
-│       ├── docking_prep_summary.json  # auto-generated paths + box
-│       ├── receptor.pdb / .pdbqt      # receptor (protonated, charged)
-│       ├── receptor_protonated.pdb    # for Protenix-Dock
-│       ├── ligand_L.sdf / .pdbqt      # ligand (3D from SMILES)
-│       ├── p2rank/                     # P2Rank pocket predictions
-│       └── swinsite/                   # SwinSite pocket predictions
+│   ├── boltz_input.yaml             # Boltz unified YAML (+ affinity properties)
+│   ├── protenix_input.json          # Protenix JSON
+│   ├── alphafold3_input.json        # AF3 JSON (+ MSA from Boltz bridge)
+│   ├── docking/                     # Track 1 docking inputs
+│   │   ├── docking_prep_summary.json  # auto-generated paths + box
+│   │   ├── receptor.pdb / .pdbqt      # receptor (protonated, charged)
+│   │   ├── receptor_protonated.pdb    # for Protenix-Dock
+│   │   ├── ligand_L.sdf / .pdbqt      # ligand (3D from SMILES)
+│   │   ├── p2rank/                     # P2Rank pocket predictions
+│   │   └── swinsite/                   # SwinSite pocket predictions
+│   └── template_docking/            # Track 2+3 docking inputs (if MCS ≥ 0.5)
+│       ├── template_docking_summary.json
+│       └── template_<pdb_id>/
+│           ├── receptor.pdb / .pdbqt
+│           ├── template_ligand_<CCD>.sdf  # bound-pose ligand (for lig-align)
+│           ├── ligand_L.sdf / .pdbqt       # target ligand (from SMILES)
+│           └── docking_prep_summary.json
 ├── outputs/
-│   ├── template_search_sequence/  # MMseqs2 hits
-│   ├── boltz2/                    # structure + confidence + affinity + MSA
-│   ├── boltz2x/                   # structure + confidence + affinity (potentials)
-│   ├── protenix/                  # structure + confidence
-│   ├── alphafold3/                # structure + confidence + ranking
-│   ├── structure_search/          # Foldseek consensus across models
-│   ├── vina/                      # docked.pdbqt + docked.sdf
-│   ├── autodock_gpu/              # docking.dlg + docking.sdf
-│   ├── protenix_dock/             # docking_results.json
-│   └── analysis/                  # BA-Pred + RMSD-Pred TSVs
-├── scripts/                       # generated runner scripts
+│   ├── template_search_sequence/    # MMseqs2 hits + filtered_hits.tsv
+│   ├── boltz2/                      # structure + confidence + affinity + MSA
+│   ├── boltz2x/                     # structure + confidence + affinity (potentials)
+│   ├── protenix/                    # structure + confidence
+│   ├── alphafold3/                  # structure + confidence + ranking
+│   ├── structure_search/            # Foldseek consensus across models
+│   ├── vina/                        # Track 1: docked.pdbqt
+│   ├── autodock_gpu/                # Track 1: docking.dlg
+│   ├── protenix_dock/               # Track 1: docking_results.json
+│   ├── template_docking/            # Track 2+3 results (if MCS ≥ 0.5)
+│   │   ├── multi_track_summary.json   # aggregated results across all templates
+│   │   └── <pdb_id>/
+│   │       ├── vina/                    # Track 2: template docking
+│   │       ├── autodock_gpu/            # Track 2: template docking
+│   │       ├── protenix_dock/           # Track 2: template docking
+│   │       └── lig_align/               # Track 3: MCS-guided poses
+│   └── analysis/                    # BA-Pred + RMSD-Pred TSVs
+├── scripts/                         # generated runner scripts
 ├── run_manifest.json
 └── wrapper_manifest.json
 ```
@@ -411,7 +474,7 @@ Full pipeline test on RTX 6000 Ada (37 min total):
 
 ```bash
 make sync       # uv sync --dev
-make test       # pytest (19 tests)
+make test       # pytest (26 tests)
 make lint       # ruff check src/
 ```
 
@@ -423,11 +486,11 @@ src/casp17/
 ├── configs.py           # RunnerConfig, presets, model configs
 ├── adapters.py          # Unified input → model-specific formats
 ├── orchestrator.py      # Pipeline preparation, script generation
-├── script_builder.py    # Shell scripts with banners/timing/env setup
+├── script_builder.py    # Shell scripts with banners/timing/env setup + multi-track
 ├── cli.py               # 15+ subcommands
 ├── mcp_server.py        # MCP server (6 tools)
 ├── validation.py        # Pre-flight checks
-├── template_filter.py   # Template hit → ligand filtering via SQLite
+├── template_filter.py   # Template hit → ligand + Tanimoto/MCS filtering via SQLite
 ├── ccd/                 # CCD classification (48,965 entries, 10 categories)
 │   ├── ccd_categories.py
 │   ├── ccd_lookup.py
@@ -440,7 +503,10 @@ scripts/
 ├── build_autodock_gpu.sh          # AutoDock-GPU CUDA build
 ├── build_search_dbs.sh            # MMseqs2 + Foldseek DB build
 ├── bridge_boltz_msa_to_af3.py     # Boltz MSA CSV → AF3 A3M
-├── prepare_docking_inputs.py      # Auto docking prep + binding site
+├── prepare_docking_inputs.py      # Auto docking prep + binding site (Track 1)
+├── run_template_filter.py         # Template hit filtering (Tanimoto + MCS)
+├── prepare_template_docking.py    # Template CIF → receptor/ligand + bound-pose SDF
+├── run_multi_track_docking.py     # Multi-track orchestrator (Track 2 + Track 3)
 ├── run_structure_search.py        # Foldseek consensus across models
 └── run_post_analysis.py           # BA-Pred + RMSD-Pred
 ```
