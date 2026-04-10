@@ -10,7 +10,7 @@ CASP17 Protein-Ligand Hub — unified pipeline for protein structure prediction 
 
 ```bash
 make sync          # uv sync --dev
-make test          # pytest (32 tests)
+make test          # pytest (42 tests)
 make lint          # ruff check src/
 uv run casp17-pl status                    # check CLI status
 uv run casp17-pl-mcp                       # start MCP server
@@ -24,15 +24,19 @@ bash scripts/install_external_models.sh --verify  # verify all tools
 ```
 unified YAML → adapters.py → model-specific inputs → orchestrator.py → SLURM scripts
                                                                           ↓
-template search → template filter (MCS) → cofolding → structure search
+template search → template filter (MCS) → cofolding (5 seeds × 5 samples = 25 structs/model)
                                               ↓
-                                    docking prep → Track 1 docking (Vina/ADG/PxDock)
+                                   structure search → docking prep
+                                              ↓
+                             Track 1 docking (Vina/ADG 5 seeds, PxDock 1x)
                                               ↓
                               (MCS ≥ 0.5?) → Track 2 template-based box docking + Track 3 lig-align
                                               ↓
                               (ion in input?) → ion placement (template alignment + clustering)
                                               ↓
-                                        post-analysis (BA-Pred/RMSD-Pred)
+                                        post-analysis (BA-Pred/RMSD-Pred per pose)
+                                              ↓
+                              CASP17 LG submission (ensemble LSCORE + AFFNTY)
 ```
 
 ### Core Modules (`src/casp17/`)
@@ -71,6 +75,8 @@ template search → template filter (MCS) → cofolding → structure search
 - **Template Docking Prep**: `scripts/prepare_template_docking.py` — template CIF → receptor + ligand files + bound-pose SDF extraction
 - **Multi-track Docking**: `scripts/run_multi_track_docking.py` — orchestrates Track 2 (template-based box docking) + Track 3 (lig-align)
 - **Ion Placement**: `scripts/collect_template_ions.py` — aligns templates to cofolding model, collects ion positions, clusters by confidence
+- **Submission Scoring**: `scripts/compute_submission_scores.py` — aggregates BA-Pred + RMSD-Pred + Boltz affinity, selects best pose, log-space ensemble Kd
+- **CASP Submission**: `scripts/make_casp_submission.py` — generates CASP17 LG-format file (protein PDB + ligand MDL + LSCORE + optional AFFNTY)
 
 ### Pipeline Stages
 
@@ -81,6 +87,7 @@ template search → template filter (MCS) → cofolding → structure search
 5. **multi-track docking** (auto, MCS ≥ threshold) — Track 2: template-based box docking + Track 3: lig-align (MCS-guided)
 6. **ion placement** (auto, if ion CCD in input) — template alignment → ion position clustering by confidence
 7. **post-analysis** — BA-Pred + RMSD-Pred via mk_export.py SDF conversion
+8. **CASP17 LG submission** — aggregate scores, pick best pose, log-space ensemble AFFNTY → .lg file
 
 ### Key Design Decisions
 
@@ -94,6 +101,9 @@ template search → template filter (MCS) → cofolding → structure search
 - **RCSB ligand index**: External SQLite DB (mmcif-parser maintained), queried for template filtering
 - **Multi-track docking**: 3 tracks — Track 1 (always): cofolding→docking, Track 2 (MCS≥threshold): template-based box docking, Track 3 (MCS≥threshold): lig-align. Config: `template_search_sequence.mcs_threshold` (default 0.5)
 - **Template ligand SDF**: `prepare_template_docking.py` extracts bound-pose ligand from template CIF for lig-align reference
+- **Multi-seed**: `cofolding_seeds` (default 5) × `diffusion_samples` (default 5) = 25 structures per cofolding model. `docking_seeds` (default 5) for Vina/ADG (PxDock single run). Config: `cofolding_seeds`, `docking_seeds` lists in RunnerConfig
+- **AF3 templates field**: Adapter always adds `templates=[]` to AF3 protein blocks (required by AF3 schema even when empty)
+- **Submission ensemble**: LSCORE from RMSD-Pred `1 - P(RMSD>2Å)`; AFFNTY from log-space average of BA-Pred pKd + Boltz affinity (filtered by binder_prob ≥ 0.5)
 
 ### Cluster Notes
 

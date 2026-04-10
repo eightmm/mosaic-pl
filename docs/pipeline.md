@@ -35,16 +35,29 @@ flowchart TB
         end
     end
 
+    subgraph S55["5.5 Ion Placement (conditional)"]
+        direction LR
+        I1["Template Align\n(gemmi)"] --> I2["Ion Cluster\nby Confidence"]
+    end
+
     subgraph S6["6. Post-analysis"]
         direction LR
         G1["BA-Pred"] --- G2["RMSD-Pred"]
+    end
+
+    subgraph S7["7. CASP17 LG Submission"]
+        direction LR
+        SS1["Ensemble Scores"] --> SS2["Best Pose\n+ LSCORE + AFFNTY"] --> SS3[".lg file"]
     end
 
     INPUT --> S1 & S2
     S1 -->|"MCS >= 0.5"| T23
     S2 --> S3
     S2 --> S4 --> T1
-    S5 --> S6
+    S1 -->|"ion in input"| S55
+    S2 --> S55
+    S5 --> S6 --> S7
+    S55 --> S7
 ```
 
 ---
@@ -97,6 +110,22 @@ flowchart LR
 ## Stage 2: Co-folding
 
 4개 모델이 순차 실행. 동일한 unified YAML 입력을 각 모델 포맷으로 변환 후 GPU 추론.
+**Multi-seed**: 각 모델을 5개 seed × 5 diffusion samples = **25개 구조/모델** 생성 (총 100개).
+
+### Multi-seed 전략
+
+```mermaid
+flowchart LR
+    YAML["Unified YAML"] --> LOOP["for seed in\n[42, 101, 202, 303, 404]"]
+    LOOP --> M["Model (Boltz/Protenix/AF3)\n--seed $seed\n--out_dir .../seed_$seed\ndiffusion_samples=5"]
+    M --> OUT["25 structures/model\n(5 seeds × 5 samples)"]
+    style OUT fill:#66bb6a,color:#000
+```
+
+- **Boltz-2/2x**: bash loop으로 `--seed` + `--out_dir` 변경하며 5회 반복
+- **Protenix**: 동일 방식 (`--seeds` 변경)
+- **AF3**: native `num_seeds=5` + `num_diffusion_samples=5` (loop 불필요)
+- **Config**: `cofolding_seeds: [42, 101, 202, 303, 404]`
 
 ### Step 2-1: Input Adaptation
 
@@ -269,6 +298,22 @@ flowchart TB
 ### Track 1: Cofolding-based Docking (항상 실행)
 
 Cofolding best model의 구조를 receptor로, SwinSite/P2Rank 예측 위치를 docking box로 사용.
+**Multi-seed**: Vina/ADG는 5개 seed 반복, PxDock은 비용 때문에 1회만 실행.
+
+```mermaid
+flowchart LR
+    PREP["docking_prep_summary.json"] --> LOOP["for seed in\n[42, 101, 202, 303, 404]"]
+    LOOP --> ENV["DOCK_SEED=$seed\nDOCK_OUT_DIR=.../seed_$seed\npython run_vina.py\npython run_autodock_gpu.py"]
+    PREP --> PXD["run_protenix_dock.py\n(single seed, no loop)"]
+    ENV --> OUT1["Vina: 5 × 10 poses = 50\nADG: 5 × 100 runs"]
+    PXD --> OUT2["PxDock: 1 run"]
+    style OUT1 fill:#66bb6a,color:#000
+    style OUT2 fill:#f48fb1,color:#000
+```
+
+- Runner scripts read `DOCK_SEED` / `DOCK_OUT_DIR` env vars (set by wrapper)
+- Each seed outputs to separate `seed_N/` subdirectory
+- **Config**: `docking_seeds: [42, 101, 202, 303, 404]`
 
 ```mermaid
 flowchart LR
@@ -479,9 +524,100 @@ flowchart TB
 - **Script**: `scripts/run_post_analysis.py` (GPU node에서 실행)
 - **venv**: `.venvs/pred` (torch 2.4 + dgl 2.4 + openbabel)
 - **Output**:
-  - `outputs/analysis/ba_pred_results.tsv` — 각 model x docking tool 조합별 pKd
-  - `outputs/analysis/rmsd_pred_results.tsv` — 각 model x docking tool 조합별 pRMSD
+  - `outputs/analysis/ba_pred_<tool>.tsv` — per-pose pKd per docking tool
+  - `outputs/analysis/rmsd_pred_<tool>.tsv` — per-pose pRMSD per docking tool
   - `outputs/analysis/summary.json` — 최적 조합 선택
+
+---
+
+## Stage 7: CASP17 LG Submission
+
+모든 파이프라인 출력을 aggregate해서 CASP17 LG-format 제출 파일 생성.
+
+### Step 7-1: Score Aggregation
+
+```mermaid
+flowchart TB
+    subgraph SOURCES["Score Sources"]
+        BP["BA-Pred TSVs\n(per pose pKd)"]
+        RP["RMSD-Pred TSVs\n(per pose pRMSD, P>2A)"]
+        BZ["Boltz affinity JSONs\n(affinity_pred_value,\nbinder_prob)"]
+    end
+
+    subgraph SCORES["Aggregate Scores"]
+        BP --> L1["log10(Kd nM) = 9 - pKd"]
+        RP --> L2["LSCORE = 1 - P(RMSD > 2A)"]
+        BZ --> L3["log10(Kd nM) = value + 3\nfilter binder_prob >= 0.5"]
+    end
+
+    subgraph ENSEMBLE["Ensemble"]
+        L1 --> M1["median BA-Pred"]
+        L3 --> M2["median Boltz\n(binders only)"]
+        M1 & M2 --> AVG["avg log10(Kd nM)"]
+        AVG --> KD["10^avg = Kd (nM)"]
+    end
+
+    L2 --> BEST["Best pose\n(highest LSCORE)"]
+
+    style BEST fill:#66bb6a,color:#000
+    style KD fill:#ffd54f,color:#000
+```
+
+- **Script**: `scripts/compute_submission_scores.py`
+- **LSCORE** (per pose): `1 - P(RMSD > 2Å)` from RMSD-Pred (higher = more confident)
+- **Best pose**: picked by highest LSCORE
+- **AFFNTY** (per complex): log-space ensemble of BA-Pred median + Boltz median (filtered by binder_prob ≥ 0.5)
+
+### Step 7-2: LG Format Assembly
+
+```mermaid
+flowchart TB
+    CIF["Best cofolding CIF\n(by pLDDT)"] --> PDB["gemmi: CIF → PDB\nB-factor = pLDDT"]
+    POSE["Best ligand pose\n(SDF/PDBQT/DLG)"] --> MDL["rdkit/meeko/obabel\n→ MDL V2000"]
+    SCORES["LSCORE + AFFNTY"]
+
+    PDB & MDL & SCORES --> BUILD["build_lg_submission()"]
+    BUILD --> LG[".lg file"]
+
+    style LG fill:#66bb6a,color:#000
+```
+
+- **Script**: `scripts/make_casp_submission.py`
+- **Format**:
+  ```
+  PFRMAT LG
+  TARGET L2001
+  AUTHOR <casp-code>
+  METHOD <description>
+  MODEL 1
+  PARENT <template_pdb_or_N/A>
+  ATOM ... (receptor, B-factor = pLDDT)
+  TER
+  LIGAND 001 <name>
+  LSCORE 0.850          # from RMSD-Pred (per-ligand)
+  <MDL V2000 block>
+  M  END
+  AFFNTY 12.345 aa      # optional, Kd in nM (per-complex)
+  END
+  ```
+
+### Usage
+
+```bash
+python scripts/make_casp_submission.py \
+    --run-dir experiments/runs/L2001_input \
+    --target-id L2001 \
+    --ligand-name 761 \
+    --author <casp-code> \
+    --method "Boltz-2x + Multi-track ensemble" \
+    --include-affinity \
+    --output experiments/submissions/L2001.lg
+```
+
+- `--pose-source auto` (default): best pose by LSCORE
+- `--pose-source vina/autodock_gpu/protenix_dock/template/lig_align`: force source
+- `--include-affinity`: auto-compute AFFNTY from ensemble (omit for P-only tasks)
+- `--lscore N`, `--affinity-nM N`: manual override
 
 ---
 
@@ -553,6 +689,8 @@ Wrapper pipeline에서 stage 사이에 자동 삽입되는 bridge step 목록.
 | Docking Prep | cofolding -> docking 사이 | `prepare_docking_inputs.py` | 자동 모델 선택 + binding site + 파일 변환 |
 | Multi-track Docking | docking 직후 (조건부) | `run_multi_track_docking.py` | Track 2 + Track 3 실행 |
 | Ion Placement | multi-track 직후 (조건부) | `collect_template_ions.py` | template alignment → ion 위치 수집 |
+| Score Aggregation | post-analysis 후 | `compute_submission_scores.py` | BA/RMSD/Boltz 집계, best pose + ensemble Kd |
+| CASP Submission | 최종 | `make_casp_submission.py` | LG format .lg 파일 생성 |
 
 ---
 
@@ -626,14 +764,19 @@ experiments/runs/<target>/
 │   ├── template_search_sequence/           # Stage 1
 │   │   ├── mmseqs_hits.tsv                   # raw hits
 │   │   └── filtered_hits.tsv                 # scored + ranked
-│   ├── boltz2/                             # Stage 2: CIF + confidence + affinity
-│   ├── boltz2x/                            # Stage 2: CIF + confidence + affinity
-│   ├── protenix/                           # Stage 2: CIF + confidence
-│   ├── alphafold3/                         # Stage 2: CIF + confidence + ranking
+│   ├── boltz2/                             # Stage 2: 5 seeds × 5 samples = 25 structures
+│   │   └── seed_42/ seed_101/ ...            # per-seed subdirectories
+│   ├── boltz2x/                            # Stage 2: 25 structures (with potentials)
+│   │   └── seed_42/ seed_101/ ...
+│   ├── protenix/                           # Stage 2: 25 structures
+│   │   └── seed_42/ seed_101/ ...
+│   ├── alphafold3/                         # Stage 2: native multi-seed output
 │   ├── structure_search/                   # Stage 3: Foldseek consensus
-│   ├── vina/                               # Stage 5 Track 1
-│   ├── autodock_gpu/                       # Stage 5 Track 1
-│   ├── protenix_dock/                      # Stage 5 Track 1
+│   ├── vina/                               # Stage 5 Track 1: 5 seeds
+│   │   └── seed_42/ seed_101/ ...
+│   ├── autodock_gpu/                       # Stage 5 Track 1: 5 seeds
+│   │   └── seed_42/ seed_101/ ...
+│   ├── protenix_dock/                      # Stage 5 Track 1: single seed
 │   ├── template_docking/                   # Stage 5 Track 2+3
 │   │   ├── multi_track_summary.json
 │   │   └── <pdb_id>/
@@ -643,11 +786,16 @@ experiments/runs/<target>/
 │   │       └── lig_align/
 │   ├── ion_placement/                      # Stage 5.5 (if ion in input)
 │   │   └── ion_placement_summary.json        # clustered positions by confidence
-│   └── analysis/                           # Stage 6
-│       ├── ba_pred_results.tsv
-│       ├── rmsd_pred_results.tsv
-│       └── summary.json
+│   ├── analysis/                           # Stage 6
+│   │   ├── ba_pred_<tool>.tsv                 # per-pose pKd
+│   │   ├── rmsd_pred_<tool>.tsv               # per-pose pRMSD, P(>2A)
+│   │   └── summary.json
+│   └── submission_scores.json              # Stage 7: aggregated scores + ensemble
 ├── scripts/                                # generated runner scripts
 ├── run_manifest.json
 └── wrapper_manifest.json
+
+experiments/submissions/                    # Stage 7 output (separate dir)
+├── L2001.lg                                 # CASP17 LG format
+└── L2002.lg
 ```

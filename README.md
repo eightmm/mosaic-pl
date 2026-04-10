@@ -17,14 +17,16 @@ Orchestrates external ML models (Boltz2/2x, Protenix v2, AlphaFold3), template s
     └─────────────┬─────────────┘
                   │
     ┌─────────────▼─────────────────────────────────────────┐
-    │  Stage 2: Co-folding (4 models parallel)              │
+    │  Stage 2: Co-folding (4 models × 5 seeds × 5 samples) │
     │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ │
     │  │ Boltz-2  │ │ Boltz-2x │ │ Protenix │ │   AF3    │ │
-    │  │(no pot.) │ │(potent.) │ │   v1/v2  │ │  (JAX)   │ │
+    │  │(no pot.) │ │(potent.) │ │   v2     │ │  (JAX)   │ │
     │  │+affinity │ │+affinity │ │          │ │          │ │
     │  └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘ │
     │       │             │            │             │       │
     │       └──── BRIDGE: Boltz MSA → AF3 ──────────┘       │
+    │                                                        │
+    │  → 25 structures/model × 4 models = 100 structures    │
     └──────────────────────┬────────────────────────────────-┘
                            │
     ┌──────────────────────▼──────────────────────┐
@@ -43,13 +45,13 @@ Orchestrates external ML models (Boltz2/2x, Protenix v2, AlphaFold3), template s
     └──────────────────────┬──────────────────────┘
                            │
     ┌──────────────────────▼──────────────────────┐
-    │  Stage 5: Docking (Multi-track)             │
+    │  Stage 5: Docking (Multi-track, Multi-seed) │
     │                                             │
     │  Track 1 (always — cofolding receptor):     │
     │  ┌────────┐  ┌─────────────┐  ┌───────────┐│
     │  │  Vina  │  │ AutoDock-GPU│  │Protenix-  ││
-    │  │(Py API)│  │  (CUDA)     │  │   Dock    ││
-    │  │  ~3s   │  │   ~10s      │  │ ~5-30min  ││
+    │  │ 5 seeds│  │  5 seeds    │  │ Dock 1x   ││
+    │  │  ~15s  │  │   ~50s      │  │ ~5-30min  ││
     │  └────────┘  └─────────────┘  └───────────┘│
     │                                             │
     │  Track 2+3 (MCS ≥ 0.5 — template receptor):│
@@ -61,25 +63,42 @@ Orchestrates external ML models (Boltz2/2x, Protenix v2, AlphaFold3), template s
     └──────────────────────┬──────────────────────┘
                            │
     ┌──────▼──────────────────────────────────────┐
+    │  Stage 5.5: Ion Placement (if ion in input) │
+    │  • gemmi CA superposition                   │
+    │  • Collect ion coords from aligned templates│
+    │  • Cluster by distance, group by confidence │
+    └──────────────────────┬──────────────────────┘
+                           │
+    ┌──────────────────────▼──────────────────────┐
     │  Stage 6: Post-analysis                     │
     │  • PDBQT/DLG → SDF (meeko mk_export.py)    │
-    │  • BA-Pred: binding affinity (GNN)          │
+    │  • BA-Pred: binding affinity (GNN, per pose)│
     │  • RMSD-Pred: pose RMSD prediction (GNN)    │
     └──────────────────────┬──────────────────────┘
                            │
     ┌──────────────────────▼──────────────────────┐
+    │  Stage 7: CASP17 Submission (LG format)     │
+    │  • Aggregate all scores (BA+RMSD+Boltz)    │
+    │  • Pick best pose (by LSCORE)               │
+    │  • Ensemble AFFNTY (log-space Kd average)   │
+    │  • Write .lg file (PDB + MDL + scores)      │
+    └──────────────────────┬──────────────────────┘
+                           │
+    ┌──────────────────────▼──────────────────────┐
     │  OUTPUT: experiments/runs/<target>/          │
-    │  ├── outputs/boltz2/       (CIF + affinity) │
-    │  ├── outputs/boltz2x/      (CIF + affinity) │
-    │  ├── outputs/protenix/     (CIF+confidence) │
-    │  ├── outputs/alphafold3/   (CIF+confidence) │
-    │  ├── outputs/vina/         (docked PDBQT)   │
-    │  ├── outputs/autodock_gpu/ (DLG)            │
-    │  ├── outputs/protenix_dock/(results JSON)   │
+    │  ├── outputs/boltz2/seed_*/    (25 structs) │
+    │  ├── outputs/boltz2x/seed_*/   (25 structs) │
+    │  ├── outputs/protenix/seed_*/  (25 structs) │
+    │  ├── outputs/alphafold3/       (num_seeds)  │
+    │  ├── outputs/vina/seed_*/      (5 × poses)  │
+    │  ├── outputs/autodock_gpu/seed_*/           │
+    │  ├── outputs/protenix_dock/    (single)     │
     │  ├── outputs/template_docking/ (Track 2+3)  │
     │  │   └── <pdb_id>/vina/adg/pxdock/lig_align │
+    │  ├── outputs/ion_placement/    (if ion)     │
     │  ├── outputs/structure_search/ (consensus)  │
-    │  └── outputs/analysis/     (BA/RMSD TSVs)   │
+    │  ├── outputs/analysis/         (BA/RMSD TSVs)│
+    │  └── outputs/submission_scores.json         │
     └─────────────────────────────────────────────┘
 ```
 
@@ -287,6 +306,37 @@ Uses template ligand bound pose as anchor for MCS-guided conformer generation wi
 
 **Config**: `template_search_sequence.mcs_threshold` (default: `0.5`)
 
+#### Multi-seed execution (all docking tools)
+
+Cofolding and Track 1 docking run with multiple seeds for pose diversity:
+
+| Stage | Multi-seed | Details |
+|-------|-----------|---------|
+| Boltz-2 / Boltz-2x | 5 seeds × 5 samples | 25 structures per model |
+| Protenix v2 | 5 seeds × 5 samples | 25 structures |
+| AlphaFold3 | native `num_seeds` × `num_diffusion_samples` | 25 structures |
+| Vina | 5 seeds | via `DOCK_SEED` env var |
+| AutoDock-GPU | 5 seeds | via `DOCK_SEED` env var |
+| Protenix-Dock | 1 (single) | too expensive for multi-seed |
+
+**Config**: `cofolding_seeds`, `docking_seeds` lists in `runner_config.yaml`
+
+### Stage 5.5: Ion/Metal Placement (conditional)
+
+Runs automatically when the input YAML contains an ion CCD (ZN, MG, CA, FE, etc.). Cofolding models position ions poorly; this stage collects positions from sequence-similar templates aligned to the cofolding best model.
+
+**Tool**: `scripts/collect_template_ions.py`
+
+```
+For each template with target ion:
+  1. gemmi CA superposition: template → cofolding best model
+  2. Apply transformation to template ion coordinates
+  3. Collect transformed positions in cofolding frame
+Cluster positions by distance (default threshold 2.0Å)
+Group by sequence identity: high (≥70%), medium (50-70%), low (30-50%)
+Output: outputs/ion_placement/ion_placement_summary.json
+```
+
 ### Stage 6: Post-analysis
 
 **Tool**: `scripts/run_post_analysis.py` (runs on GPU node with `.venvs/pred`)
@@ -296,6 +346,51 @@ Uses template ligand bound pose as anchor for MCS-guided conformer generation wi
 | PDBQT → SDF | meeko `mk_export.py` | Vina/ADG output | `docked.sdf`, `docking.sdf` |
 | Affinity prediction | BA-Pred (GNN) | receptor PDB + ligand SDF | `ba_pred_*.tsv` (pKd, kcal/mol) |
 | Pose RMSD prediction | RMSD-Pred (GNN) | receptor PDB + ligand SDF | `rmsd_pred_*.tsv` (pRMSD, >2Å prob) |
+
+### Stage 7: CASP17 LG Submission
+
+**Tools**: `scripts/compute_submission_scores.py` + `scripts/make_casp_submission.py`
+
+Aggregates scores from all sources and generates a valid CASP17 LG-format submission file:
+
+```bash
+python scripts/make_casp_submission.py \
+    --run-dir experiments/runs/L2001_input \
+    --target-id L2001 \
+    --ligand-name 761 \
+    --author <your-casp-code> \
+    --method "Boltz-2x + Multi-track ensemble" \
+    --include-affinity \
+    --output experiments/submissions/L2001.lg
+```
+
+**Ensemble scoring**:
+- **LSCORE** (per pose): `1 - P(RMSD > 2Å)` from RMSD-Pred
+- **AFFNTY** (per submission): log-space ensemble of BA-Pred pKd + Boltz affinity
+  - BA-Pred pKd → log10(Kd nM) = `9 - pKd`
+  - Boltz `affinity_pred_value` → log10(Kd nM) = `value + 3`
+  - Filter Boltz sources with `binder_prob < 0.5`
+  - Median across each source → equal-weight average → `10^avg` = Kd (nM)
+
+**Best pose selection**: Pick pose with highest LSCORE (lowest RMSD-Pred prob > 2Å).
+
+**LG format output**:
+```
+PFRMAT LG
+TARGET L2001
+AUTHOR <code>
+METHOD <description>
+MODEL 1
+PARENT <template_pdb_or_N/A>
+ATOM ... (protein receptor, B-factor = pLDDT 0-100)
+TER
+LIGAND 001 761
+LSCORE 0.850
+<MDL V2000 block>
+M  END
+AFFNTY 12.345 aa   # optional, Kd in nM
+END
+```
 
 ## Configuration
 
@@ -311,6 +406,10 @@ Uses template ligand bound pose as anchor for MCS-guided conformer generation wi
 
 ```yaml
 preset: fast
+
+# Multi-seed (default: 5 seeds each)
+cofolding_seeds: [42, 101, 202, 303, 404]   # 25 structures per model
+docking_seeds: [42, 101, 202, 303, 404]     # 5 seeds for Vina/ADG (PxDock: single)
 
 boltz:
   enabled: true
@@ -459,7 +558,7 @@ Full pipeline test on RTX 6000 Ada (37 min total):
 
 ```bash
 make sync       # uv sync --dev
-make test       # pytest (32 tests)
+make test       # pytest (42 tests)
 make lint       # ruff check src/
 ```
 
@@ -492,7 +591,9 @@ scripts/
 ├── run_template_filter.py         # Template hit filtering (Tanimoto + MCS)
 ├── prepare_template_docking.py    # Template CIF → receptor/ligand + bound-pose SDF
 ├── run_multi_track_docking.py     # Multi-track orchestrator (Track 2 + Track 3)
-├── collect_template_ions.py      # Ion/metal placement via template alignment
+├── collect_template_ions.py       # Ion/metal placement via template alignment
 ├── run_structure_search.py        # Foldseek consensus across models
-└── run_post_analysis.py           # BA-Pred + RMSD-Pred
+├── run_post_analysis.py           # BA-Pred + RMSD-Pred
+├── compute_submission_scores.py   # Aggregate scores, ensemble affinity, best pose
+└── make_casp_submission.py        # Generate CASP17 LG format submission file
 ```
