@@ -59,7 +59,7 @@ flowchart TB
 flowchart LR
     A["Protein FASTA"] --> B["MMseqs2\neasy-search"]
     B --> C["mmseqs_hits.tsv"]
-    style C fill:#e1f5fe
+    style C fill:#4fc3f7,color:#000
 ```
 
 - **Tool**: `mmseqs easy-search` (488k RCSB 서열 DB, preindexed)
@@ -76,8 +76,8 @@ flowchart LR
     C --> D["Tanimoto\n(Morgan FP)"]
     C --> E["MCS Coverage\n(rdFMCS)"]
     D & E --> F["filtered_hits.tsv"]
-    style B fill:#f9f,stroke:#333
-    style F fill:#fff9c4
+    style B fill:#ce93d8,stroke:#333,color:#000
+    style F fill:#ffd54f,color:#000
 ```
 
 - **Script**: `scripts/run_template_filter.py` (wrapper에서 자동 삽입)
@@ -142,10 +142,10 @@ flowchart TB
     PX --> O3["outputs/protenix/\nCIF + confidence"]
     AF3 --> O4["outputs/alphafold3/\nCIF + confidence + ranking"]
 
-    style O1 fill:#e1f5fe
-    style O2 fill:#e1f5fe
-    style O3 fill:#e1f5fe
-    style O4 fill:#e1f5fe
+    style O1 fill:#4fc3f7,color:#000
+    style O2 fill:#4fc3f7,color:#000
+    style O3 fill:#4fc3f7,color:#000
+    style O4 fill:#4fc3f7,color:#000
 ```
 
 | Model | venv | 소요 시간 | 특징 |
@@ -185,7 +185,7 @@ flowchart TB
     MERGE --> FILTER["Ligand Filter\n(rcsb_index.db)"]
     FILTER --> RESULT["Ranked PDBs\n- num_models found\n- avg TM-score\n- ligand info"]
 
-    style RESULT fill:#fff9c4
+    style RESULT fill:#ffd54f,color:#000
 ```
 
 - **Script**: `scripts/run_structure_search.py`
@@ -210,7 +210,7 @@ flowchart LR
     B2["boltz2\npLDDT=?"] & B2X["boltz2x\npLDDT=?"] & PX["protenix\npLDDT=?"] & AF3["af3\npLDDT=?"]
     B2 & B2X & PX & AF3 --> SELECT["pLDDT 비교\nBest 선택"]
     SELECT --> BEST["Best CIF"]
-    style BEST fill:#c8e6c9
+    style BEST fill:#66bb6a,color:#000
 ```
 
 - 각 모델의 confidence score (pLDDT) 비교 → 최고 점수 모델 자동 선택
@@ -226,8 +226,8 @@ flowchart LR
     PDB2PQR --> PROT["receptor_protonated.pdb\n(HIS->HID/HIE/HIP)"]
     PDB2PQR --> PDBQT["receptor.pdbqt\n(AD4 atom types + charges)"]
 
-    style PROT fill:#e1f5fe
-    style PDBQT fill:#e1f5fe
+    style PROT fill:#4fc3f7,color:#000
+    style PDBQT fill:#4fc3f7,color:#000
 ```
 
 | Step | Tool | Output | 용도 |
@@ -246,8 +246,8 @@ flowchart LR
     SDF --> MEEKO["meeko\nMoleculePreparation"]
     MEEKO --> PDBQT["ligand_L.pdbqt"]
 
-    style SDF fill:#e1f5fe
-    style PDBQT fill:#e1f5fe
+    style SDF fill:#4fc3f7,color:#000
+    style PDBQT fill:#4fc3f7,color:#000
 ```
 
 - SMILES -> 3D conformer: `AllChem.EmbedMolecule(mol, ETKDGv3())`
@@ -266,7 +266,7 @@ flowchart TB
     P2R -->|"priority 2"| BOX
     FALLBACK -->|"priority 3"| BOX
 
-    style BOX fill:#c8e6c9
+    style BOX fill:#66bb6a,color:#000
 ```
 
 - **우선순위**: SwinSite (ML) > P2Rank (surface) > Ligand coordinates (fallback)
@@ -298,9 +298,9 @@ flowchart LR
         P1["prepare_receptor\n(tleap: +H, solvation)"] --> P2["generate_cache_maps\n(grid caching)"] --> P3["run_docking"]
     end
 
-    style VINA fill:#e8f5e9
-    style ADG fill:#fff3e0
-    style PXDOCK fill:#fce4ec
+    style VINA fill:#66bb6a,color:#000
+    style ADG fill:#ffb74d,color:#000
+    style PXDOCK fill:#f48fb1,color:#000
 ```
 
 | Tool | Type | 소요 시간 | venv | Output |
@@ -333,8 +333,8 @@ flowchart TB
     RPDB & QLIG & BOX --> DOCK["Vina + ADG + PxDock\n(same tools as Track 1)"]
     DOCK --> OUT["outputs/template_docking/&lt;pdb_id&gt;/\nvina/ autodock_gpu/ protenix_dock/"]
 
-    style HITS fill:#fff9c4
-    style TLIG fill:#f3e5f5
+    style HITS fill:#ffd54f,color:#000
+    style TLIG fill:#ba68c8,color:#000
 ```
 
 - **Script**: `scripts/prepare_template_docking.py`
@@ -362,8 +362,8 @@ flowchart LR
     SCORE --> OPT["Torsion Optimization\n(Adam, 100 steps\nfreeze MCS atoms)"]
     OPT --> TOPK["Top-k Poses\n(SDF output)"]
 
-    style REF fill:#f3e5f5
-    style TOPK fill:#c8e6c9
+    style REF fill:#ba68c8,color:#000
+    style TOPK fill:#66bb6a,color:#000
 ```
 
 - **Library**: `lig_align.run_pipeline()` (hub venv에 설치됨)
@@ -389,7 +389,7 @@ flowchart TB
     PREP --> T3["Track 3: lig-align\n(MCS-guided)"]
     T2 & T3 --> SUMMARY["multi_track_summary.json"]
 
-    style CHECK fill:#fff9c4
+    style CHECK fill:#ffd54f,color:#000
 ```
 
 - **Orchestrator**: `scripts/run_multi_track_docking.py`
@@ -425,8 +425,8 @@ flowchart TB
     BA --> BA_OUT["pKd (kcal/mol)\nper model x per tool"]
     RMSD --> RMSD_OUT["pRMSD (>2A prob)\nper model x per tool"]
 
-    style BA_OUT fill:#fff9c4
-    style RMSD_OUT fill:#fff9c4
+    style BA_OUT fill:#ffd54f,color:#000
+    style RMSD_OUT fill:#ffd54f,color:#000
 ```
 
 - **Script**: `scripts/run_post_analysis.py` (GPU node에서 실행)
@@ -544,9 +544,9 @@ graph TB
     ADGPU --- DOCKING
     PRANK --- BINDING["Binding Site"]
 
-    style VENVS fill:#e3f2fd
-    style BINS fill:#f3e5f5
-    style DBS fill:#e8f5e9
+    style VENVS fill:#42a5f5,color:#000
+    style BINS fill:#ab47bc,color:#000
+    style DBS fill:#66bb6a,color:#000
 ```
 
 ---
