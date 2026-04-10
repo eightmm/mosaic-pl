@@ -54,9 +54,9 @@ Orchestrates external ML models (Boltz2/2x, Protenix v2, AlphaFold3), template s
     │                                             │
     │  Track 2+3 (MCS ≥ 0.5 — template receptor):│
     │  ┌─────────────────┐  ┌───────────────────┐│
-    │  │ Template Docking │  │    lig-align      ││
-    │  │ Vina+ADG+PxDock  │  │ MCS anchor+Vina  ││
-    │  │ (template box)   │  │ scoring+torsion   ││
+    │  │ Template-based   │  │    lig-align      ││
+    │  │ Box Docking      │  │ MCS anchor+Vina  ││
+    │  │ Vina+ADG+PxDock  │  │ scoring+torsion   ││
     │  └─────────────────┘  └───────────────────┘│
     └──────────────────────┬──────────────────────┘
                            │
@@ -262,7 +262,7 @@ Runs automatically between cofolding and docking in the wrapper pipeline.
 
 Receptor from cofolding best model, box from SwinSite/P2Rank. All tools auto-detect from `docking_prep_summary.json`.
 
-#### Track 2 (MCS ≥ 0.5): Template-based docking
+#### Track 2 (MCS ≥ 0.5): Template-based Box Docking
 
 Same 3 docking tools, but using template structure as receptor and template ligand position for docking box.
 
@@ -349,7 +349,7 @@ alphafold3:
 template_search_sequence:
   enabled: true
   database_path: data/search_dbs/sequence/rcsb_seqDB
-  rcsb_dir: ~/DB/RCSB/raw/mmCIF_data        # CIF files for template docking
+  rcsb_dir: ~/DB/RCSB/raw/mmCIF_data        # CIF files for template-based box docking
   rcsb_db_path: ~/DB/RCSB/processed/rcsb_index.db  # ligand index
   mcs_threshold: 0.5                          # Track 2+3 activation threshold
 
@@ -402,9 +402,9 @@ experiments/runs/<target>/
 │   ├── template_docking/            # Track 2+3 results (if MCS ≥ 0.5)
 │   │   ├── multi_track_summary.json   # aggregated results across all templates
 │   │   └── <pdb_id>/
-│   │       ├── vina/                    # Track 2: template docking
-│   │       ├── autodock_gpu/            # Track 2: template docking
-│   │       ├── protenix_dock/           # Track 2: template docking
+│   │       ├── vina/                    # Track 2: template-based box docking
+│   │       ├── autodock_gpu/            # Track 2: template-based box docking
+│   │       ├── protenix_dock/           # Track 2: template-based box docking
 │   │       └── lig_align/               # Track 3: MCS-guided poses
 │   └── analysis/                    # BA-Pred + RMSD-Pred TSVs
 ├── scripts/                         # generated runner scripts

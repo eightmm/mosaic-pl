@@ -28,7 +28,7 @@ template search → template filter (MCS) → cofolding → structure search
                                               ↓
                                     docking prep → Track 1 docking (Vina/ADG/PxDock)
                                               ↓
-                              (MCS ≥ 0.5?) → Track 2 template docking + Track 3 lig-align
+                              (MCS ≥ 0.5?) → Track 2 template-based box docking + Track 3 lig-align
                                               ↓
                                         post-analysis (BA-Pred/RMSD-Pred)
 ```
@@ -67,7 +67,7 @@ template search → template filter (MCS) → cofolding → structure search
 - **Docking Prep**: `scripts/prepare_docking_inputs.py` — auto model select + SwinSite/P2Rank + SMILES→SDF/PDBQT + CIF→PDB→PDBQT
 - **Template Filter**: `scripts/run_template_filter.py` — filters mmseqs hits via rcsb_index.db + Tanimoto/MCS scoring
 - **Template Docking Prep**: `scripts/prepare_template_docking.py` — template CIF → receptor + ligand files + bound-pose SDF extraction
-- **Multi-track Docking**: `scripts/run_multi_track_docking.py` — orchestrates Track 2 (template docking) + Track 3 (lig-align)
+- **Multi-track Docking**: `scripts/run_multi_track_docking.py` — orchestrates Track 2 (template-based box docking) + Track 3 (lig-align)
 
 ### Pipeline Stages
 
@@ -88,7 +88,7 @@ template search → template filter (MCS) → cofolding → structure search
 - **Binding site priority**: SwinSite (ML) > P2Rank (surface) > ligand coords (fallback)
 - **Affinity auto-inject**: When ligand present, `properties.affinity` added to Boltz YAML
 - **RCSB ligand index**: External SQLite DB (mmcif-parser maintained), queried for template filtering
-- **Multi-track docking**: 3 tracks — Track 1 (always): cofolding→docking, Track 2 (MCS≥threshold): template→docking, Track 3 (MCS≥threshold): lig-align. Config: `template_search_sequence.mcs_threshold` (default 0.5)
+- **Multi-track docking**: 3 tracks — Track 1 (always): cofolding→docking, Track 2 (MCS≥threshold): template-based box docking, Track 3 (MCS≥threshold): lig-align. Config: `template_search_sequence.mcs_threshold` (default 0.5)
 - **Template ligand SDF**: `prepare_template_docking.py` extracts bound-pose ligand from template CIF for lig-align reference
 
 ### Cluster Notes

@@ -1,197 +1,301 @@
 # CASP17 Protein-Ligand Pipeline
 
-## Pipeline Overview
+## Overview
 
 ```mermaid
 flowchart TB
-    subgraph INPUT["📥 Input"]
-        A["Protein Sequence + Ligand SMILES<br/>(unified YAML)"]
+    INPUT["Protein Sequence + Ligand SMILES\n(unified YAML)"]
+
+    subgraph S1["1. Template Search"]
+        B1["MMseqs2"] --> B2["Template Filter\n(Tanimoto + MCS)"]
     end
 
-    subgraph S1["Stage 1: Template Search"]
-        B1["MMseqs2<br/>488k seqs DB<br/>~3s"]
-        B2["rcsb_index.db<br/>Ligand Filter<br/>(CCD classify)"]
-        B1 --> B2
-    end
-
-    subgraph S2["Stage 2: Co-folding"]
+    subgraph S2["2. Co-folding"]
         direction LR
-        C1["Boltz-2<br/>+ affinity"]
-        C2["Boltz-2x<br/>+ affinity<br/>(potentials)"]
-        C3["Protenix<br/>v1/v2"]
-        C4["AlphaFold3<br/>(JAX)"]
-        C1 -.->|MSA bridge| C4
+        C1["Boltz-2"] --- C2["Boltz-2x"] --- C3["Protenix"] --- C4["AF3"]
     end
 
-    subgraph S3["Stage 3: Structure Search"]
-        D1["Foldseek × 4 models<br/>251k struct DB"]
-        D2["Cross-model Consensus<br/>+ Ligand Filter"]
-        D1 --> D2
+    subgraph S3["3. Structure Search"]
+        D1["Foldseek x4"] --> D2["Consensus"]
     end
 
-    subgraph S4["Stage 4: Docking Prep"]
-        E1["Auto-select Best Model<br/>(pLDDT score)"]
-        E2["Binding Site<br/>SwinSite > P2Rank"]
-        E3["Receptor Prep<br/>CIF→PDB→PDBQT"]
-        E4["Ligand Prep<br/>SMILES→SDF→PDBQT"]
-        E1 --> E2 --> E3 & E4
+    subgraph S4["4. Docking Prep"]
+        E1["Best Model\n+ Binding Site\n+ File Conversion"]
     end
 
-    subgraph S5["Stage 5: Docking (Multi-track)"]
+    subgraph S5["5. Docking"]
         direction TB
-        subgraph T1["Track 1 (always)"]
+        subgraph T1["Track 1: Cofolding-based"]
             direction LR
-            F1["Vina<br/>~3s"]
-            F2["AutoDock-GPU<br/>~10s"]
-            F3["Protenix-Dock<br/>~5-30min"]
+            F1["Vina"] --- F2["ADG"] --- F3["PxDock"]
         end
-        subgraph T23["Track 2+3 (MCS ≥ 0.5)"]
+        subgraph T23["Track 2+3: Template-guided"]
             direction LR
-            F4["Template Docking<br/>Vina+ADG+PxDock<br/>(template box)"]
-            F5["lig-align<br/>MCS-guided<br/>+ Vina scoring"]
+            F4["Template-based\nBox Docking"] --- F5["lig-align"]
         end
     end
 
-    subgraph S6["Stage 6: Post-analysis"]
+    subgraph S6["6. Post-analysis"]
         direction LR
-        G1["BA-Pred<br/>(pKd)"]
-        G2["RMSD-Pred<br/>(pRMSD)"]
+        G1["BA-Pred"] --- G2["RMSD-Pred"]
     end
 
-    subgraph OUTPUT["📦 Results"]
-        H["experiments/runs/&lt;target&gt;/<br/>structures + affinities + poses + scores"]
-    end
-
-    A --> S1 & S2
-    S1 -->|"MCS ≥ 0.5"| T23
+    INPUT --> S1 & S2
+    S1 -->|"MCS >= 0.5"| T23
     S2 --> S3
-    S2 --> S4
-    S4 --> T1
+    S2 --> S4 --> T1
     S5 --> S6
-    S1 & S3 & S6 --> OUTPUT
 ```
 
-## Stage Details
+---
 
-### Stage 1: Sequence-based Template Search
+## Stage 1: Template Search (Sequence)
+
+단백질 서열로 RCSB PDB에서 유사 구조를 찾고, 리간드 정보를 매칭한다.
+
+### Step 1-1: MMseqs2 Sequence Search
 
 ```mermaid
 flowchart LR
-    A["Protein\nSequence"] --> B["MMseqs2\neasy-search"]
-    B --> C["Hit List\n(PDB IDs)"]
-    C --> D["rcsb_index.db\nSQLite Lookup"]
-    D --> E["Filtered Hits\n+ ligand CCD\n+ SMILES\n+ category"]
-    E --> F["Tanimoto +\nMCS Coverage\nvs target SMILES"]
-    F --> G["filtered_hits.tsv\n(ranked by\nMCS → Tanimoto\n→ pident)"]
-
-    style D fill:#f9f,stroke:#333
-    style G fill:#fff9c4,stroke:#333
+    A["Protein FASTA"] --> B["MMseqs2\neasy-search"]
+    B --> C["mmseqs_hits.tsv"]
+    style C fill:#e1f5fe
 ```
 
-**Bridge script**: `scripts/run_template_filter.py` — auto-inserted after MMseqs2 in the wrapper
+- **Tool**: `mmseqs easy-search` (488k RCSB 서열 DB, preindexed)
+- **Parameter**: `min_seq_identity=0.3`, `min_coverage=0.7`, `sensitivity=7.5`, `max_hits=200`
+- **Output**: `outputs/template_search_sequence/mmseqs_hits.tsv`
+- **소요 시간**: ~3초
 
-**CCD Classification** (48,965 entries → 10 categories):
+### Step 1-2: Template Filter (Ligand + MCS)
+
+```mermaid
+flowchart LR
+    A["mmseqs_hits.tsv"] --> B["rcsb_index.db\nSQLite Lookup"]
+    B --> C["Ligand CCD Code\n+ SMILES\n+ Category"]
+    C --> D["Tanimoto\n(Morgan FP)"]
+    C --> E["MCS Coverage\n(rdFMCS)"]
+    D & E --> F["filtered_hits.tsv"]
+    style B fill:#f9f,stroke:#333
+    style F fill:#fff9c4
+```
+
+- **Script**: `scripts/run_template_filter.py` (wrapper에서 자동 삽입)
+- **Module**: `src/casp17/template_filter.py`
+- **Input**: mmseqs_hits.tsv + target ligand SMILES + rcsb_index.db
+- **Logic**:
+  1. 각 PDB hit에 대해 `rcsb_index.db`에서 리간드 조회 (candidate 리간드만: small_molecule, cofactor, metabolite 등)
+  2. Target SMILES와 template 리간드 간 **Tanimoto similarity** 계산 (Morgan FP, radius=2, 2048 bits)
+  3. **MCS coverage** 계산 (`rdFMCS.FindMCS`, timeout=5s, `MCS_atoms / min(target, template) heavy atoms`)
+  4. 결과를 `best_mcs_coverage → best_tanimoto → pident` 순으로 정렬
+- **Output**: `outputs/template_search_sequence/filtered_hits.tsv`
+- **핵심 결정**: `best_mcs_coverage >= 0.5`이면 Stage 5에서 Track 2+3 활성화
+
+**CCD 분류** (48,965 entries):
 
 | Category | Candidate | Examples |
 |----------|:---------:|---------|
-| `small_molecule` | ✅ | Drug-like inhibitors |
-| `cofactor` | ✅ | ATP, NAD, FAD, HEM |
-| `metabolite` | ✅ | Sterols, bile acids |
-| `peptide_like` | ✅ | Short peptide inhibitors |
-| `nucleotide_like` | ✅ | Nucleoside analogs |
-| `ion` | ❌ | ZN, MG, FE, CA |
-| `crystallization_aid` | ❌ | GOL, EDO, PEG, SO4 |
-| `glycan` | ❌ | NAG, MAN, GAL |
-| `membrane_lipid` | ❌ | Phospholipids, detergents |
-| `pigment` | ❌ | Carotenoids, chlorophylls |
+| `small_molecule` | O | Drug-like inhibitors |
+| `cofactor` | O | ATP, NAD, FAD, HEM |
+| `metabolite` | O | Sterols, bile acids |
+| `peptide_like` | O | Short peptide inhibitors |
+| `nucleotide_like` | O | Nucleoside analogs |
+| `ion` | X | ZN, MG, FE, CA |
+| `crystallization_aid` | X | GOL, EDO, PEG, SO4 |
+| `glycan` | X | NAG, MAN, GAL |
+| `membrane_lipid` | X | Phospholipids, detergents |
+| `pigment` | X | Carotenoids, chlorophylls |
 
-### Stage 2: Co-folding
+---
+
+## Stage 2: Co-folding
+
+4개 모델이 순차 실행. 동일한 unified YAML 입력을 각 모델 포맷으로 변환 후 GPU 추론.
+
+### Step 2-1: Input Adaptation
+
+```mermaid
+flowchart LR
+    YAML["Unified YAML\n(Boltz format)"] --> A1["adapters.py"]
+    A1 --> B1["boltz_input.yaml\n(Boltz-2 / 2x)"]
+    A1 --> B2["protenix_input.json"]
+    A1 --> B3["alphafold3_input.json"]
+```
+
+- **Module**: `src/casp17/adapters.py`
+- 리간드가 있으면 `properties.affinity` 자동 추가 (Boltz 전용)
+- Boltz-2: `use_potentials=false`, Boltz-2x: `use_potentials=true` (별도 run)
+- `prepare_boltz()` → `[boltz2, boltz2x]` 리스트 반환
+
+### Step 2-2: Model Inference
 
 ```mermaid
 flowchart TB
-    INPUT["Unified YAML\n+ MSA Server"] --> B2["Boltz-2\n(no potentials)"]
-    INPUT --> B2X["Boltz-2x\n(use_potentials)"]
-    INPUT --> PX["Protenix v1/v2"]
-    B2 -->|MSA CSV→A3M| AF3["AlphaFold3"]
-    INPUT --> AF3
+    B2["Boltz-2\n(no potentials)\n+ affinity"]
+    B2X["Boltz-2x\n(use_potentials)\n+ affinity"]
+    PX["Protenix v2"]
+    B2 -->|MSA CSV| BRIDGE["bridge_boltz_msa_to_af3.py\nCSV → A3M"]
+    BRIDGE --> AF3["AlphaFold3\n(JAX)"]
 
-    B2 --> OUT1["outputs/boltz2/\nCIF + confidence\n+ affinity JSON"]
-    B2X --> OUT2["outputs/boltz2x/\nCIF + confidence\n+ affinity JSON"]
-    PX --> OUT3["outputs/protenix/\nCIF + confidence"]
-    AF3 --> OUT4["outputs/alphafold3/\nCIF + confidence\n+ ranking"]
+    B2 --> O1["outputs/boltz2/\nCIF + confidence + affinity"]
+    B2X --> O2["outputs/boltz2x/\nCIF + confidence + affinity"]
+    PX --> O3["outputs/protenix/\nCIF + confidence"]
+    AF3 --> O4["outputs/alphafold3/\nCIF + confidence + ranking"]
 
-    style OUT1 fill:#e1f5fe
-    style OUT2 fill:#e1f5fe
-    style OUT3 fill:#e1f5fe
-    style OUT4 fill:#e1f5fe
+    style O1 fill:#e1f5fe
+    style O2 fill:#e1f5fe
+    style O3 fill:#e1f5fe
+    style O4 fill:#e1f5fe
 ```
+
+| Model | venv | 소요 시간 | 특징 |
+|-------|------|----------|------|
+| Boltz-2 | `.venvs/boltz` | ~50-140s | 구조 + confidence + MSA + affinity |
+| Boltz-2x | `.venvs/boltz` | ~50-140s | 위와 동일 + potentials (constraint) |
+| Protenix v2 | `.venvs/protenix` | ~80-190s | 구조 + confidence |
+| AlphaFold3 | `.venvs/alphafold3` | ~110-130s | 구조 + confidence + ranking (JAX) |
+
+**Bridge: Boltz MSA -> AF3**
+- Boltz가 생성한 MSA CSV를 AF3 A3M 포맷으로 변환
+- AF3 JSON에 `pairedMsa=""`, `templates=[]` 패치
+- Script: `scripts/bridge_boltz_msa_to_af3.py`
 
 **Boltz Affinity Output:**
 ```json
 {
-  "affinity_pred_value": 2.62,        // log10(IC50) μM — lower = stronger
+  "affinity_pred_value": 2.62,        // log10(IC50) uM — lower = stronger
   "affinity_probability_binary": 0.41  // binder probability [0-1]
 }
 ```
 
-### Stage 3: Structure Search (Foldseek Consensus)
+---
+
+## Stage 3: Structure Search (Foldseek Consensus)
+
+각 cofolding 모델의 출력 구조를 RCSB 구조 DB에서 검색하고, 교차 모델 합의로 순위 매김.
 
 ```mermaid
 flowchart TB
-    B2["Boltz-2\nCIF"] --> FS1["Foldseek"]
-    B2X["Boltz-2x\nCIF"] --> FS2["Foldseek"]
-    PX["Protenix\nCIF"] --> FS3["Foldseek"]
-    AF3["AF3\nCIF"] --> FS4["Foldseek"]
+    B2["Boltz-2 CIF"] --> FS1["Foldseek"]
+    B2X["Boltz-2x CIF"] --> FS2["Foldseek"]
+    PX["Protenix CIF"] --> FS3["Foldseek"]
+    AF3["AF3 CIF"] --> FS4["Foldseek"]
 
-    FS1 & FS2 & FS3 & FS4 --> MERGE["Merge &\nConsensus"]
+    FS1 & FS2 & FS3 & FS4 --> MERGE["Merge & Consensus"]
     MERGE --> FILTER["Ligand Filter\n(rcsb_index.db)"]
-    FILTER --> RESULT["Ranked PDBs\n• num_models found\n• avg TM-score\n• ligand info"]
+    FILTER --> RESULT["Ranked PDBs\n- num_models found\n- avg TM-score\n- ligand info"]
 
     style RESULT fill:#fff9c4
 ```
 
-### Stage 4: Docking Preparation
+- **Script**: `scripts/run_structure_search.py`
+- **Tool**: `foldseek easy-search` (251k RCSB 구조 DB)
+- **Logic**:
+  1. 4개 모델 각각에서 best CIF 추출
+  2. Foldseek으로 RCSB 구조 DB 검색
+  3. 교차 모델 합의: 여러 모델에서 공통 발견된 PDB 우선 순위
+  4. `rcsb_index.db`로 리간드 보유 여부 필터링
+- **Output**: `outputs/structure_search/consensus_summary.json`
+
+---
+
+## Stage 4: Docking Preparation
+
+Cofolding 출력에서 docking 입력 파일을 자동 생성. Wrapper pipeline에서 cofolding → docking 사이에 자동 삽입.
+
+### Step 4-1: Best Model Selection
+
+```mermaid
+flowchart LR
+    B2["boltz2\npLDDT=?"] & B2X["boltz2x\npLDDT=?"] & PX["protenix\npLDDT=?"] & AF3["af3\npLDDT=?"]
+    B2 & B2X & PX & AF3 --> SELECT["pLDDT 비교\nBest 선택"]
+    SELECT --> BEST["Best CIF"]
+    style BEST fill:#c8e6c9
+```
+
+- 각 모델의 confidence score (pLDDT) 비교 → 최고 점수 모델 자동 선택
+- Function: `select_best_model()` in `prepare_docking_inputs.py`
+
+### Step 4-2: Receptor Preparation
+
+```mermaid
+flowchart LR
+    CIF["Best CIF"] --> GEMMI["gemmi\nremove_ligands_and_waters"]
+    GEMMI --> PDB["receptor.pdb"]
+    PDB --> PDB2PQR["pdb2pqr\n--ff=AMBER"]
+    PDB2PQR --> PROT["receptor_protonated.pdb\n(HIS->HID/HIE/HIP)"]
+    PDB2PQR --> PDBQT["receptor.pdbqt\n(AD4 atom types + charges)"]
+
+    style PROT fill:#e1f5fe
+    style PDBQT fill:#e1f5fe
+```
+
+| Step | Tool | Output | 용도 |
+|------|------|--------|------|
+| CIF -> PDB | gemmi | `receptor.pdb` | 기본 구조 |
+| PDB -> PQR | pdb2pqr (AMBER) | 중간 파일 | 수소 추가 + 전하 |
+| PQR -> protonated PDB | 자체 변환 | `receptor_protonated.pdb` | Protenix-Dock |
+| PQR -> PDBQT | AD4 type mapping | `receptor.pdbqt` | Vina + AutoDock-GPU |
+
+### Step 4-3: Ligand Preparation
+
+```mermaid
+flowchart LR
+    SMILES["Ligand SMILES"] --> RDKIT["RDKit\nETKDGv3 + MMFF"]
+    RDKIT --> SDF["ligand_L.sdf"]
+    SDF --> MEEKO["meeko\nMoleculePreparation"]
+    MEEKO --> PDBQT["ligand_L.pdbqt"]
+
+    style SDF fill:#e1f5fe
+    style PDBQT fill:#e1f5fe
+```
+
+- SMILES -> 3D conformer: `AllChem.EmbedMolecule(mol, ETKDGv3())`
+- Force field optimization: `MMFFOptimizeMolecule(mol, maxIters=500)`
+- SDF -> PDBQT: meeko `MoleculePreparation`
+
+### Step 4-4: Binding Site Prediction
 
 ```mermaid
 flowchart TB
-    MODELS["4 Model\nOutputs"] --> SELECT["Auto-select\nBest (pLDDT)"]
-    SELECT --> CIF["Best CIF"]
+    PDB["receptor.pdb"] --> SWIN["SwinSite\n(Swin-Unet ML)"]
+    PDB --> P2R["P2Rank\n(surface-based)"]
+    SDF["ligand.sdf"] --> FALLBACK["Ligand 3D\ncoordinates"]
 
-    CIF --> GEMMI["gemmi\nCIF→PDB"]
-    GEMMI --> PDB2PQR["pdb2pqr\n+H, charges\nHIS→HID/HIE"]
-    PDB2PQR --> PDBQT_R["receptor.pdbqt\n(AD4 types)"]
-    PDB2PQR --> PDB_P["receptor_protonated.pdb\n(for Protenix-Dock)"]
-
-    SMILES["Ligand\nSMILES"] --> RDKIT["RDKit\nETKDG+MMFF"]
-    RDKIT --> SDF["ligand.sdf"]
-    SDF --> MEEKO["meeko"]
-    MEEKO --> PDBQT_L["ligand.pdbqt"]
-
-    CIF --> SWIN["SwinSite\n(Swin-Unet)"]
-    CIF --> P2R["P2Rank\n(surface)"]
-    SWIN & P2R --> BOX["Docking Box\n22.5Å × 22.5Å × 22.5Å\nspacing 0.375Å"]
+    SWIN -->|"priority 1"| BOX["Docking Box\n22.5A x 22.5A x 22.5A\nspacing 0.375A"]
+    P2R -->|"priority 2"| BOX
+    FALLBACK -->|"priority 3"| BOX
 
     style BOX fill:#c8e6c9
-    style PDBQT_R fill:#e1f5fe
-    style PDBQT_L fill:#e1f5fe
 ```
 
-### Stage 5: Docking (Multi-track)
+- **우선순위**: SwinSite (ML) > P2Rank (surface) > Ligand coordinates (fallback)
+- **Unified box**: 22.5A x 22.5A x 22.5A, grid spacing 0.375A (모든 docking tool 공통)
+- **Script**: `scripts/prepare_docking_inputs.py`
+- **Output**: `inputs/docking/docking_prep_summary.json` (모든 docking tool이 runtime에 읽음)
 
-#### Track 1: Cofolding-based Docking (always)
+---
+
+## Stage 5: Docking (Multi-track)
+
+3개 트랙으로 구성. Track 1은 항상 실행, Track 2+3은 MCS >= threshold일 때 자동 활성화.
+
+### Track 1: Cofolding-based Docking (항상 실행)
+
+Cofolding best model의 구조를 receptor로, SwinSite/P2Rank 예측 위치를 docking box로 사용.
 
 ```mermaid
 flowchart LR
     subgraph VINA["Vina (Python API)"]
-        V1["compute_vina_maps"] --> V2["dock()"] --> V3["write_poses()"]
+        V1["set_receptor\nset_ligand"] --> V2["compute_vina_maps"] --> V3["dock()"] --> V4["write_poses()"]
     end
 
-    subgraph ADG["AutoDock-GPU"]
-        A1["autogrid4\n(grid maps)"] --> A2["autodock_gpu\n(CUDA, 100 runs)"]
+    subgraph ADG["AutoDock-GPU (CUDA)"]
+        A1["autogrid4\nGPF -> grid maps"] --> A2["autodock_gpu_128wi\n--nrun 100\n--heuristics 1"]
     end
 
     subgraph PXDOCK["Protenix-Dock"]
-        P1["prepare_receptor\n(tleap)"] --> P2["generate_cache_maps"] --> P3["run_docking"]
+        P1["prepare_receptor\n(tleap: +H, solvation)"] --> P2["generate_cache_maps\n(grid caching)"] --> P3["run_docking"]
     end
 
     style VINA fill:#e8f5e9
@@ -199,64 +303,140 @@ flowchart LR
     style PXDOCK fill:#fce4ec
 ```
 
-Uses cofolding best model as receptor, SwinSite/P2Rank binding site for docking box.
+| Tool | Type | 소요 시간 | venv | Output |
+|------|------|----------|------|--------|
+| Vina | Python API | ~3s | `.venvs/protenix-dock` | `outputs/vina/docked.pdbqt` |
+| AutoDock-GPU | CUDA binary | ~10s | `.local/bin/` | `outputs/autodock_gpu/docked.dlg` |
+| Protenix-Dock | CPU force field | ~5-30min | `.venvs/protenix-dock` | `outputs/protenix_dock/` |
 
-#### Track 2 + Track 3: Template-guided (MCS ≥ 0.5)
+- 모든 tool은 `docking_prep_summary.json`에서 receptor/ligand/box를 runtime에 읽음
+- Protenix-Dock이 전체 시간의 ~77% 차지 (병목)
 
-Auto-activated when template search finds hits with MCS coverage ≥ threshold.
+### Track 2: Template-based Box Docking (MCS >= 0.5)
+
+Template search에서 MCS coverage가 높은 hit의 실험 구조를 receptor로, template 리간드 위치를 docking box로 사용.
 
 ```mermaid
 flowchart TB
-    HITS["filtered_hits.tsv\n(MCS ≥ 0.5)"] --> PREP["prepare_template_docking.py"]
+    HITS["filtered_hits.tsv\n(MCS >= 0.5)"] --> PREP["prepare_template_docking.py"]
 
-    PREP --> RCIF["Template CIF\n(RCSB)"]
-    RCIF --> RPDB["Template Receptor\nPDB/PDBQT"]
-    RCIF --> LSDF["Template Ligand SDF\n(bound pose)"]
-    RCIF --> BOX["Docking Box\n(template ligand\nposition)"]
-
-    subgraph TRACK2["Track 2: Template Docking"]
-        direction LR
-        TV["Vina"] --- TA["AutoDock-GPU"] --- TP["Protenix-Dock"]
+    subgraph TEMPLATE_PREP["Template Input Preparation"]
+        RCIF["Template CIF\n(RCSB mmCIF)"]
+        RCIF --> RPDB["Template Receptor\nPDB / PDBQT"]
+        RCIF --> TLIG["Template Ligand SDF\n(bound-pose extraction)"]
+        RCIF --> QLIG["Target Ligand\nSDF / PDBQT\n(from SMILES)"]
+        TLIG --> BOX["Docking Box\n(template ligand\ncentroid)"]
     end
 
-    subgraph TRACK3["Track 3: lig-align"]
-        direction LR
-        LA1["MCS Anchor\nAlignment"] --> LA2["1000 Conformers\nGeneration"] --> LA3["Vina Scoring\n+ Torsion Opt"]
-        LA3 --> LA4["Top-k Poses"]
-    end
+    PREP --> TEMPLATE_PREP
 
-    RPDB & BOX --> TRACK2
-    RPDB & LSDF --> TRACK3
+    RPDB & QLIG & BOX --> DOCK["Vina + ADG + PxDock\n(same tools as Track 1)"]
+    DOCK --> OUT["outputs/template_docking/&lt;pdb_id&gt;/\nvina/ autodock_gpu/ protenix_dock/"]
 
-    style TRACK2 fill:#e3f2fd
-    style TRACK3 fill:#f3e5f5
     style HITS fill:#fff9c4
+    style TLIG fill:#f3e5f5
 ```
 
-**Configuration**: `template_search_sequence.mcs_threshold` (default: 0.5)
+- **Script**: `scripts/prepare_template_docking.py`
+- **Logic**:
+  1. `filtered_hits.tsv`에서 MCS >= threshold인 상위 3개 template 선택
+  2. RCSB CIF 파일에서 receptor PDB/PDBQT 생성 (`gemmi` + `pdb2pqr`)
+  3. Template 리간드의 **bound-pose SDF 추출** (`extract_template_ligand_sdf()`)
+  4. Template 리간드 좌표 centroid -> docking box center
+  5. Target SMILES -> SDF/PDBQT (RDKit + meeko)
+  6. 각 template에 대해 Vina + ADG + PxDock 실행
+- **장점**: 실험적으로 검증된 리간드 결합 위치를 docking box로 사용 -> 정확도 향상
 
-| Track | Receptor | Box Source | Tool |
-|-------|----------|-----------|------|
-| Track 1 | Cofolding best model | SwinSite > P2Rank | Vina + ADG + PxDock |
-| Track 2 | Template PDB (RCSB) | Template ligand position | Vina + ADG + PxDock |
-| Track 3 | Template PDB (RCSB) | MCS anchor from template ligand | lig-align |
+### Track 3: lig-align (MCS-guided Pose Generation, MCS >= 0.5)
 
-### Stage 6: Post-analysis
+Template 리간드의 결합 포즈를 MCS anchor로 활용해, target 리간드의 3D 포즈를 직접 생성.
 
 ```mermaid
 flowchart LR
-    VINA_OUT["Vina\ndocked.pdbqt"] --> MK["mk_export.py\n→ SDF"]
-    ADG_OUT["ADG\ndocking.dlg"] --> MK
-    MK --> BA["BA-Pred\n(GNN)"]
-    MK --> RMSD["RMSD-Pred\n(GNN)"]
-    SDF_IN["Input\nligand.sdf"] --> BA & RMSD
+    REF["Template Ligand SDF\n(bound pose)"] --> MCS["MCS Detection\n(rdFMCS)"]
+    QUERY["Target SMILES"] --> MCS
+    MCS --> ANCHOR["MCS Atom\nAlignment"]
+    ANCHOR --> CONF["Conformer Generation\n(1000 conformers\nMCS-constrained)"]
+    CONF --> CLUSTER["RMSD Clustering\n(threshold 1.0A)"]
+    CLUSTER --> SCORE["Vina Scoring\n(weight_preset=vina)"]
+    SCORE --> OPT["Torsion Optimization\n(Adam, 100 steps\nfreeze MCS atoms)"]
+    OPT --> TOPK["Top-k Poses\n(SDF output)"]
 
-    BA --> BA_OUT["pKd\nkcal/mol"]
-    RMSD --> RMSD_OUT["pRMSD\n>2Å prob"]
+    style REF fill:#f3e5f5
+    style TOPK fill:#c8e6c9
+```
+
+- **Library**: `lig_align.run_pipeline()` (hub venv에 설치됨)
+- **Parameters**:
+  - `num_confs=1000`: MCS-constrained conformer 수
+  - `mcs_mode="auto"`: single/multi/cross MCS 자동 선택
+  - `optimize=True`: gradient-based torsion optimization
+  - `weight_preset="vina"`: Vina scoring function weights
+  - `top_k=10`: 최종 출력 포즈 수
+- **Input**: template receptor PDB + template ligand SDF (bound pose) + target SMILES
+- **Output**: `outputs/template_docking/<pdb_id>/lig_align/` (ranked SDF poses)
+- **장점**: Docking과 달리 scoring function만 사용, MCS anchor 덕분에 정확한 초기 배치
+
+### Multi-track Decision Logic
+
+```mermaid
+flowchart TB
+    START["filtered_hits.tsv 확인"]
+    START --> CHECK{"best_mcs_coverage\n>= threshold?"}
+    CHECK -->|"Yes (>= 0.5)"| PREP["Template-based Box Docking Prep\n(max 3 templates)"]
+    CHECK -->|"No"| SKIP["Track 2+3 Skip\n(Track 1 결과만 사용)"]
+    PREP --> T2["Track 2: Template-based\nBox Docking\n(Vina + ADG + PxDock)"]
+    PREP --> T3["Track 3: lig-align\n(MCS-guided)"]
+    T2 & T3 --> SUMMARY["multi_track_summary.json"]
+
+    style CHECK fill:#fff9c4
+```
+
+- **Orchestrator**: `scripts/run_multi_track_docking.py`
+- **Config**: `template_search_sequence.mcs_threshold` (default: `0.5`)
+- Wrapper script에서 Track 1 docking 이후 자동 실행
+
+| Track | Receptor | Box Source | Method | 조건 |
+|-------|----------|-----------|--------|------|
+| Track 1 | Cofolding best model | SwinSite > P2Rank | Vina + ADG + PxDock | 항상 |
+| Track 2 | Template PDB (RCSB) | Template ligand centroid | Vina + ADG + PxDock | MCS >= 0.5 |
+| Track 3 | Template PDB (RCSB) | MCS anchor alignment | lig-align | MCS >= 0.5 |
+
+---
+
+## Stage 6: Post-analysis
+
+모든 docking 결과에 대해 binding affinity와 pose RMSD를 GNN으로 예측.
+
+```mermaid
+flowchart TB
+    subgraph CONVERT["Format Conversion"]
+        VINA_OUT["Vina docked.pdbqt"] --> MK["mk_export.py\n(meeko)"]
+        ADG_OUT["ADG docked.dlg"] --> MK
+        MK --> SDF_OUT["docked.sdf"]
+    end
+
+    subgraph PREDICT["GNN Prediction"]
+        SDF_OUT --> BA["BA-Pred\n(Binding Affinity)"]
+        SDF_OUT --> RMSD["RMSD-Pred\n(Pose Quality)"]
+        REC["receptor.pdb"] --> BA & RMSD
+    end
+
+    BA --> BA_OUT["pKd (kcal/mol)\nper model x per tool"]
+    RMSD --> RMSD_OUT["pRMSD (>2A prob)\nper model x per tool"]
 
     style BA_OUT fill:#fff9c4
     style RMSD_OUT fill:#fff9c4
 ```
+
+- **Script**: `scripts/run_post_analysis.py` (GPU node에서 실행)
+- **venv**: `.venvs/pred` (torch 2.4 + dgl 2.4 + openbabel)
+- **Output**:
+  - `outputs/analysis/ba_pred_results.tsv` — 각 model x docking tool 조합별 pKd
+  - `outputs/analysis/rmsd_pred_results.tsv` — 각 model x docking tool 조합별 pRMSD
+  - `outputs/analysis/summary.json` — 최적 조합 선택
+
+---
 
 ## Timing (RTX 6000 Ada)
 
@@ -273,24 +453,23 @@ gantt
     section Co-folding
     Boltz-2 + affinity          :5, 148
     Boltz-2x + affinity         :148, 236
-    Protenix v1                 :236, 369
-    Boltz MSA → AF3 bridge      :369, 370
+    Protenix v2                 :236, 369
+    Boltz MSA -> AF3 bridge     :369, 370
     AlphaFold3                  :370, 499
 
     section Docking Prep
-    Auto-select + P2Rank + SwinSite :499, 509
+    Auto-select + SwinSite + P2Rank :499, 509
 
-    section Track 1 Docking
+    section Track 1
     Vina                        :509, 512
     AutoDock-GPU                :512, 522
     Protenix-Dock               :522, 2262
 
     section Track 2+3 (conditional)
-    Template docking prep       :2262, 2272
-    Template Vina               :2272, 2275
-    Template ADG                :2275, 2285
+    Template box docking prep   :2262, 2272
+    Template Vina + ADG         :2272, 2285
     Template PxDock             :2285, 4025
-    lig-align (MCS-guided)      :4025, 4035
+    lig-align                   :4025, 4035
 
     section Post-analysis
     BA-Pred + RMSD-Pred         :4035, 4045
@@ -299,32 +478,46 @@ gantt
 | Stage | Time | Notes |
 |-------|-----:|-------|
 | MMseqs2 + template filter | ~5s | sequence search + Tanimoto/MCS scoring |
-| Boltz-2 + affinity | 143s | |
-| Boltz-2x + affinity | 88s | |
-| Protenix v1 | 133s | |
-| AlphaFold3 | 129s | |
-| Foldseek × 4 | ~30s | |
+| Boltz-2 + affinity | ~143s | |
+| Boltz-2x + affinity | ~88s | |
+| Protenix v2 | ~133s | |
+| AlphaFold3 | ~129s | |
+| Foldseek x 4 | ~30s | structure search + consensus |
 | Docking prep | ~10s | auto-select + SwinSite/P2Rank |
-| **Track 1: Vina + ADG + PxDock** | **~29min** | cofolding-based |
-| **Track 2: Template docking** | **~29min** | conditional (MCS ≥ 0.5) |
-| **Track 3: lig-align** | **~10s** | conditional (MCS ≥ 0.5) |
+| **Track 1** | **~29min** | cofolding-based (Vina + ADG + PxDock) |
+| **Track 2** | **~29min** | template-based box docking (conditional, MCS >= 0.5) |
+| **Track 3** | **~10s** | lig-align (conditional, MCS >= 0.5) |
 | Post-analysis | ~10s | BA-Pred + RMSD-Pred |
 | **Total (Track 1 only)** | **~37min** | |
-| **Total (all tracks)** | **~66min** | when template has MCS ≥ 0.5 |
+| **Total (all tracks)** | **~66min** | when template has MCS >= 0.5 |
 
-> Track 2+3 only run when template search finds hits with MCS coverage ≥ threshold (default 0.5).
-> Protenix-Dock remains the bottleneck in both Track 1 and Track 2.
+> Protenix-Dock이 Track 1과 Track 2 모두에서 병목 (~77%).
+
+---
+
+## Bridge Scripts
+
+Wrapper pipeline에서 stage 사이에 자동 삽입되는 bridge step 목록.
+
+| Bridge | 삽입 위치 | Script | 역할 |
+|--------|----------|--------|------|
+| Boltz MSA -> AF3 | Boltz -> AF3 (cofolding 내부) | `bridge_boltz_msa_to_af3.py` | MSA CSV -> A3M + AF3 JSON 패치 |
+| Template Filter | template-search-sequence 직후 | `run_template_filter.py` | Tanimoto + MCS scoring |
+| Docking Prep | cofolding -> docking 사이 | `prepare_docking_inputs.py` | 자동 모델 선택 + binding site + 파일 변환 |
+| Multi-track Docking | docking 직후 (조건부) | `run_multi_track_docking.py` | Track 2 + Track 3 실행 |
+
+---
 
 ## Tool Ecosystem
 
 ```mermaid
 graph TB
     subgraph VENVS[".venvs/ (isolated environments)"]
-        BOLTZ["boltz<br/>Py3.12 + torch 2.11<br/>CUDA 13.0"]
-        PROTENIX["protenix<br/>Py3.12 + torch 2.7<br/>CUDA 12.6"]
-        AF3["alphafold3<br/>Py3.12 + JAX"]
-        PXDOCK["protenix-dock<br/>micromamba<br/>ambertools + tleap"]
-        PRED["pred<br/>Py3.12 + torch 2.4<br/>dgl 2.4 + openbabel"]
+        BOLTZ["boltz\nPy3.12, torch 2.11\nCUDA 13.0"]
+        PROTENIX["protenix\nPy3.12, torch 2.7\nCUDA 12.6"]
+        AF3["alphafold3\nPy3.12, JAX"]
+        PXDOCK["protenix-dock\nmicromamba, Py3.11\nambertools + tleap"]
+        PRED["pred\nPy3.12, torch 2.4\ndgl 2.4 + openbabel"]
     end
 
     subgraph BINS[".local/bin/"]
@@ -336,16 +529,16 @@ graph TB
     end
 
     subgraph DBS["Search Databases"]
-        SEQDB["sequence/rcsb_seqDB<br/>488k seqs, 2.0GB"]
-        STRUCTDB["structure/rcsb_structDB<br/>251k structs, 7.7GB"]
-        RCSBDB["rcsb_index.db<br/>251k PDBs, 2.5M ligands"]
+        SEQDB["sequence/rcsb_seqDB\n488k seqs, 2.0GB"]
+        STRUCTDB["structure/rcsb_structDB\n251k structs, 7.7GB"]
+        RCSBDB["rcsb_index.db\n251k PDBs, 2.5M ligands"]
     end
 
-    BOLTZ --- |"Boltz-2/2x"| COFOLDING["Co-folding"]
+    BOLTZ ---|"Boltz-2/2x"| COFOLDING["Co-folding"]
     PROTENIX --- COFOLDING
     AF3 --- COFOLDING
-    PXDOCK --- |"Protenix-Dock + Vina"| DOCKING["Docking"]
-    PRED --- |"BA-Pred + RMSD-Pred + SwinSite"| ANALYSIS["Analysis"]
+    PXDOCK ---|"PxDock + Vina"| DOCKING["Docking"]
+    PRED ---|"BA-Pred + RMSD-Pred + SwinSite"| ANALYSIS["Analysis"]
     MMSEQS --- SEARCH["Search"]
     FOLDSEEK --- SEARCH
     ADGPU --- DOCKING
@@ -354,4 +547,57 @@ graph TB
     style VENVS fill:#e3f2fd
     style BINS fill:#f3e5f5
     style DBS fill:#e8f5e9
+```
+
+---
+
+## Output Structure
+
+```
+experiments/runs/<target>/
+├── inputs/
+│   ├── boltz_input.yaml                    # Boltz unified YAML (+ affinity)
+│   ├── protenix_input.json                 # Protenix JSON
+│   ├── alphafold3_input.json               # AF3 JSON (+ MSA from Boltz bridge)
+│   ├── docking/                            # Track 1 docking inputs
+│   │   ├── docking_prep_summary.json         # receptor/ligand/box paths
+│   │   ├── receptor.pdb / .pdbqt
+│   │   ├── receptor_protonated.pdb
+│   │   ├── ligand_L.sdf / .pdbqt
+│   │   ├── p2rank/                           # P2Rank pocket predictions
+│   │   └── swinsite/                         # SwinSite pocket predictions
+│   └── template_docking/                   # Track 2+3 inputs (if MCS >= 0.5)
+│       ├── template_docking_summary.json
+│       └── template_<pdb_id>/
+│           ├── <pdb_id>.cif                  # extracted template CIF
+│           ├── receptor.pdb / .pdbqt         # template receptor
+│           ├── template_ligand_<CCD>.sdf     # bound-pose ligand (for lig-align)
+│           ├── ligand_L.sdf / .pdbqt         # target ligand (from SMILES)
+│           └── docking_prep_summary.json
+├── outputs/
+│   ├── template_search_sequence/           # Stage 1
+│   │   ├── mmseqs_hits.tsv                   # raw hits
+│   │   └── filtered_hits.tsv                 # scored + ranked
+│   ├── boltz2/                             # Stage 2: CIF + confidence + affinity
+│   ├── boltz2x/                            # Stage 2: CIF + confidence + affinity
+│   ├── protenix/                           # Stage 2: CIF + confidence
+│   ├── alphafold3/                         # Stage 2: CIF + confidence + ranking
+│   ├── structure_search/                   # Stage 3: Foldseek consensus
+│   ├── vina/                               # Stage 5 Track 1
+│   ├── autodock_gpu/                       # Stage 5 Track 1
+│   ├── protenix_dock/                      # Stage 5 Track 1
+│   ├── template_docking/                   # Stage 5 Track 2+3
+│   │   ├── multi_track_summary.json
+│   │   └── <pdb_id>/
+│   │       ├── vina/
+│   │       ├── autodock_gpu/
+│   │       ├── protenix_dock/
+│   │       └── lig_align/
+│   └── analysis/                           # Stage 6
+│       ├── ba_pred_results.tsv
+│       ├── rmsd_pred_results.tsv
+│       └── summary.json
+├── scripts/                                # generated runner scripts
+├── run_manifest.json
+└── wrapper_manifest.json
 ```
