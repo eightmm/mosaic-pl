@@ -90,21 +90,7 @@ flowchart LR
   4. 결과를 `best_mcs_coverage → best_tanimoto → pident` 순으로 정렬
 - **Output**: `outputs/template_search_sequence/filtered_hits.tsv`
 - **핵심 결정**: `best_mcs_coverage >= 0.5`이면 Stage 5에서 Track 2+3 활성화
-
-**CCD 분류** (48,965 entries):
-
-| Category | Candidate | Examples |
-|----------|:---------:|---------|
-| `small_molecule` | O | Drug-like inhibitors |
-| `cofactor` | O | ATP, NAD, FAD, HEM |
-| `metabolite` | O | Sterols, bile acids |
-| `peptide_like` | O | Short peptide inhibitors |
-| `nucleotide_like` | O | Nucleoside analogs |
-| `ion` | X | ZN, MG, FE, CA |
-| `crystallization_aid` | X | GOL, EDO, PEG, SO4 |
-| `glycan` | X | NAG, MAN, GAL |
-| `membrane_lipid` | X | Phospholipids, detergents |
-| `pigment` | X | Carotenoids, chlorophylls |
+- CCD 분류 기반으로 drug-like 리간드만 필터링 (ion, 결정화 보조제, 당류 등 제외)
 
 ---
 

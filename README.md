@@ -297,23 +297,6 @@ Uses template ligand bound pose as anchor for MCS-guided conformer generation wi
 | Affinity prediction | BA-Pred (GNN) | receptor PDB + ligand SDF | `ba_pred_*.tsv` (pKd, kcal/mol) |
 | Pose RMSD prediction | RMSD-Pred (GNN) | receptor PDB + ligand SDF | `rmsd_pred_*.tsv` (pRMSD, >2Å prob) |
 
-### CCD Ligand Classification
-
-Built-in module (`src/casp17/ccd/`) classifies 48,965 CCD codes into 10 categories:
-
-| Category | is_candidate | Examples |
-|----------|-------------|---------|
-| small_molecule | ✓ | STI (imatinib), drug-like |
-| cofactor | ✓ | ATP, NAD, FAD, HEM |
-| metabolite | ✓ | cholesterol, bile acids |
-| peptide_like | ✓ | short peptide inhibitors |
-| nucleotide_like | ✓ | nucleoside analogs |
-| ion | ✗ | ZN, MG, FE, CA |
-| crystallization_aid | ✗ | GOL, EDO, PEG, SO4 |
-| glycan | ✗ | NAG, MAN, GAL |
-| membrane_lipid | ✗ | phospholipids, detergents |
-| pigment | ✗ | carotenoids, chlorophylls |
-
 ## Configuration
 
 ### Hyperparameter Presets
