@@ -322,6 +322,44 @@ def build_lg_submission(
     return "\n".join(lines) + "\n"
 
 
+def build_lg_submission_with_affinity(
+    target_id: str,
+    author: str,
+    method: str,
+    protein_pdb_lines: list[str],
+    ligand_mdl: str,
+    ligand_number: int,
+    ligand_name: str,
+    lscore: float | None = None,
+    affinity_nM: float | None = None,
+    parent: str = "N/A",
+    remark: str = "",
+) -> str:
+    """Assemble LG submission with optional AFFNTY record."""
+    result = build_lg_submission(
+        target_id=target_id,
+        author=author,
+        method=method,
+        protein_pdb_lines=protein_pdb_lines,
+        ligand_mdl=ligand_mdl,
+        ligand_number=ligand_number,
+        ligand_name=ligand_name,
+        lscore=lscore,
+        parent=parent,
+        remark=remark,
+    )
+    if affinity_nM is None:
+        return result
+    # Insert AFFNTY before the final END
+    lines = result.rstrip().splitlines()
+    if lines[-1] == "END":
+        lines.insert(-1, f"AFFNTY {affinity_nM:.3f} aa")
+    else:
+        lines.append(f"AFFNTY {affinity_nM:.3f} aa")
+        lines.append("END")
+    return "\n".join(lines) + "\n"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate CASP17 LG-format submission.")
     parser.add_argument("--run-dir", type=Path, required=True,
@@ -345,9 +383,13 @@ def main() -> int:
     parser.add_argument("--pose-source", type=str, default="auto",
                         choices=["auto", "vina", "autodock_gpu", "protenix_dock",
                                  "template", "lig_align"],
-                        help="Ligand pose source (default: auto = best BA-Pred)")
+                        help="Ligand pose source (default: auto = from scores)")
     parser.add_argument("--lscore", type=float, default=None,
-                        help="Ligand reliability score [0-1]")
+                        help="Manual LSCORE override [0-1]")
+    parser.add_argument("--affinity-nM", type=float, default=None,
+                        help="Manual AFFNTY override (Kd in nM)")
+    parser.add_argument("--include-affinity", action="store_true",
+                        help="Include AFFNTY record (auto-computed from scores)")
     parser.add_argument("--output", type=Path, required=True,
                         help="Output LG file path")
     args = parser.parse_args()
@@ -357,8 +399,18 @@ def main() -> int:
     workdir = args.output.parent / f".{args.target_id}_workdir"
     workdir.mkdir(exist_ok=True)
 
-    # 1. Select best protein cofolding output
-    print(f"Selecting protein structure for {args.target_id}...")
+    # 1. Aggregate scores first — used for pose selection and LSCORE/AFFNTY
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from compute_submission_scores import aggregate
+
+    print(f"Aggregating scores from {run_dir}...")
+    scores = aggregate(run_dir)
+    print(f"  Pose scores collected: {len(scores.pose_scores)}")
+    print(f"  Boltz affinities collected: {len(scores.boltz_affinities)}")
+
+    # 2. Select best protein cofolding output
+    print(f"\nSelecting protein structure for {args.target_id}...")
     protein_model, cif_path = find_best_cofolding_cif(run_dir, preferred=args.protein_model)
     print(f"  Protein source: {protein_model}")
     print(f"  CIF: {cif_path}")
@@ -368,22 +420,40 @@ def main() -> int:
     protein_lines = extract_pdb_atom_lines(protein_pdb)
     print(f"  Protein atoms: {len(protein_lines)}")
 
-    # 2. Select best ligand pose
+    # 3. Select best ligand pose
     print(f"\nSelecting ligand pose (source={args.pose_source})...")
-    pose_source, pose_path = find_best_ligand_pose(run_dir, source=args.pose_source)
-    print(f"  Pose source: {pose_source}")
-    print(f"  Pose file: {pose_path}")
+    lscore = args.lscore
+
+    if args.pose_source == "auto" and scores.best_pose and scores.best_pose.pose_file.exists():
+        pose_source = scores.best_pose.source
+        pose_path = scores.best_pose.pose_file
+        if lscore is None and scores.best_pose.lscore is not None:
+            lscore = scores.best_pose.lscore
+        print(f"  Best pose (auto): {pose_source}/{scores.best_pose.pose_name}")
+        print(f"    pKd={scores.best_pose.ba_pred_pkd}, "
+              f"pRMSD={scores.best_pose.rmsd_pred}, LSCORE={lscore}")
+    else:
+        pose_source, pose_path = find_best_ligand_pose(run_dir, source=args.pose_source)
+        print(f"  Pose source: {pose_source}")
+        print(f"  Pose file: {pose_path}")
 
     ligand_mdl_file = workdir / "ligand.mol"
     pose_to_mdl(pose_path, ligand_mdl_file)
     ligand_mdl = ligand_mdl_file.read_text()
     print(f"  MDL block: {len(ligand_mdl.splitlines())} lines")
 
-    # 3. Assemble LG submission
+    # 4. Affinity
+    affinity_nM = args.affinity_nM
+    if args.include_affinity and affinity_nM is None and scores.ensemble_affinity_nM is not None:
+        affinity_nM = scores.ensemble_affinity_nM
+        print(f"\nAFFNTY (ensemble): {affinity_nM:.3g} nM "
+              f"(log10={scores.ensemble_log_kd_nM:.3f})")
+
+    # 5. Assemble LG submission
     method_full = f"{args.method} [protein={protein_model}, pose={pose_source}]"
     remark = args.remark or f"{protein_model} + {pose_source}"
 
-    submission = build_lg_submission(
+    submission = build_lg_submission_with_affinity(
         target_id=args.target_id,
         author=args.author,
         method=method_full,
@@ -391,7 +461,8 @@ def main() -> int:
         ligand_mdl=ligand_mdl,
         ligand_number=args.ligand_number,
         ligand_name=args.ligand_name,
-        lscore=args.lscore,
+        lscore=lscore,
+        affinity_nM=affinity_nM,
         parent=args.parent,
         remark=remark,
     )
@@ -401,6 +472,10 @@ def main() -> int:
     print(f"  LG submission written: {args.output}")
     print(f"  Size: {len(submission):,} bytes")
     print(f"  Lines: {len(submission.splitlines()):,}")
+    if lscore is not None:
+        print(f"  LSCORE: {lscore:.3f}")
+    if affinity_nM is not None:
+        print(f"  AFFNTY: {affinity_nM:.3g} nM")
     print(f"{'='*60}")
 
     return 0

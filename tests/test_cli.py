@@ -886,3 +886,125 @@ def test_build_lg_submission_auto_appends_ter() -> None:
     )
     # Should have added TER
     assert "\nTER\n" in result
+
+
+def test_build_lg_submission_with_affinity() -> None:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from make_casp_submission import build_lg_submission_with_affinity
+
+    result = build_lg_submission_with_affinity(
+        target_id="L2001",
+        author="0000-0000-0000",
+        method="test",
+        protein_pdb_lines=["ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 50.00", "TER"],
+        ligand_mdl="test\n\n 0  0  0  0  0  0  0  0  0  0999 V2000\nM  END",
+        ligand_number=1,
+        ligand_name="761",
+        lscore=0.85,
+        affinity_nM=12.5,
+    )
+    assert "LSCORE 0.850" in result
+    assert "AFFNTY 12.500 aa" in result
+    # AFFNTY must appear before END
+    lines = result.strip().splitlines()
+    end_idx = lines.index("END")
+    affnty_idx = next(i for i, l in enumerate(lines) if l.startswith("AFFNTY"))
+    assert affnty_idx < end_idx
+
+
+def test_build_lg_submission_without_affinity_still_works() -> None:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from make_casp_submission import build_lg_submission_with_affinity
+
+    result = build_lg_submission_with_affinity(
+        target_id="L2001",
+        author="0000-0000-0000",
+        method="test",
+        protein_pdb_lines=["ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 50.00", "TER"],
+        ligand_mdl="test\n\n 0  0  0  0  0  0  0  0  0  0999 V2000\nM  END",
+        ligand_number=1,
+        ligand_name="761",
+        lscore=0.85,
+        affinity_nM=None,  # Pose-only task
+    )
+    assert "LSCORE 0.850" in result
+    assert "AFFNTY" not in result
+    assert result.strip().endswith("END")
+
+
+# --- Ensemble affinity tests ---
+
+
+def test_pose_score_log_kd_conversion() -> None:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from compute_submission_scores import PoseScore
+    from pathlib import Path as P
+
+    # pKd = 7 → Kd = 100 nM → log10(Kd nM) = 2
+    p = PoseScore(source="vina", pose_file=P(""), pose_name="t", ba_pred_pkd=7.0)
+    assert abs(p.log_kd_nM - 2.0) < 1e-6
+
+    # pKd = 9 → Kd = 1 nM → log10(Kd nM) = 0
+    p = PoseScore(source="vina", pose_file=P(""), pose_name="t", ba_pred_pkd=9.0)
+    assert abs(p.log_kd_nM - 0.0) < 1e-6
+
+
+def test_pose_score_lscore_from_rmsd_prob() -> None:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from compute_submission_scores import PoseScore
+    from pathlib import Path as P
+
+    # Prob(RMSD > 2A) = 0.2 → LSCORE = 0.8 (good pose)
+    p = PoseScore(source="vina", pose_file=P(""), pose_name="t", rmsd_gt_2a_prob=0.2)
+    assert abs(p.lscore - 0.8) < 1e-6
+
+    # Prob = 0.95 → LSCORE = 0.05 (bad pose)
+    p = PoseScore(source="vina", pose_file=P(""), pose_name="t", rmsd_gt_2a_prob=0.95)
+    assert abs(p.lscore - 0.05) < 1e-6
+
+
+def test_boltz_affinity_log_kd_conversion() -> None:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from compute_submission_scores import BoltzAffinity
+
+    # log10(IC50 uM) = 2.62 → log10(Kd nM) = 5.62 (≈ 417 uM binding)
+    b = BoltzAffinity(source="boltz2", affinity_value=2.62, binder_prob=0.5)
+    assert abs(b.log_kd_nM - 5.62) < 1e-6
+
+
+def test_ensemble_affinity_combines_sources() -> None:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from compute_submission_scores import ensemble_affinity, PoseScore, BoltzAffinity
+    from pathlib import Path as P
+
+    poses = [
+        PoseScore(source="vina", pose_file=P(""), pose_name="p1", ba_pred_pkd=7.0),  # log=2
+        PoseScore(source="vina", pose_file=P(""), pose_name="p2", ba_pred_pkd=7.5),  # log=1.5
+    ]
+    boltz = [
+        BoltzAffinity(source="b1", affinity_value=0.0, binder_prob=0.8),  # log=3
+        BoltzAffinity(source="b2", affinity_value=1.0, binder_prob=0.3),  # filtered out
+    ]
+    log_kd, details = ensemble_affinity(poses, boltz)
+    # BA median = 1.75, Boltz median = 3 (b2 filtered), avg = 2.375
+    assert log_kd is not None
+    assert abs(log_kd - 2.375) < 1e-6
+    assert len(details["boltz_filtered_out"]) == 1
+
+
+def test_ensemble_affinity_ba_only() -> None:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from compute_submission_scores import ensemble_affinity, PoseScore
+    from pathlib import Path as P
+
+    poses = [PoseScore(source="v", pose_file=P(""), pose_name="p", ba_pred_pkd=8.0)]
+    log_kd, details = ensemble_affinity(poses, [])
+    # BA = log(Kd nM) = 1, no boltz → ensemble = 1
+    assert log_kd == 1.0
