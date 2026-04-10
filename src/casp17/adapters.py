@@ -347,6 +347,8 @@ def prepare_alphafold3(
                     notes.append(
                         f"AlphaFold3 adapter ignores non-A3M protein MSA path for chain(s) {ids}: {msa_value}"
                     )
+            # AF3 requires 'templates' field even when empty
+            protein_block["templates"] = []
             sequences.append({"protein": protein_block})
             if entity.get("cyclic"):
                 notes.append("AlphaFold3 adapter currently ignores the Boltz cyclic flag.")

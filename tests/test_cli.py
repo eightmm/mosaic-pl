@@ -808,3 +808,81 @@ def test_wrapper_no_ion_placement_without_cofolding(tmp_path: Path) -> None:
     script = build_wrapper_shell_script("T0001", config, "local", stage_scripts)
     # No ion placement without cofolding (need reference structure)
     assert "ION/METAL PLACEMENT" not in script
+
+
+# --- CASP17 LG submission tests ---
+
+
+def test_build_lg_submission_basic() -> None:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from make_casp_submission import build_lg_submission
+
+    protein_lines = [
+        "ATOM      1  N   ILE A  21      16.852   8.985  28.369  1.00 85.00           N",
+        "TER",
+    ]
+    mdl = (
+        "     RDKit          3D\n\n"
+        " 1  0  0  0  0  0  0  0  0  0999 V2000\n"
+        "   12.345   23.456   34.567 C   0  0  0  0  0  0  0  0  0  0  0  0\n"
+        "M  END"
+    )
+    result = build_lg_submission(
+        target_id="L2001",
+        author="0123-4567-8901",
+        method="test method",
+        protein_pdb_lines=protein_lines,
+        ligand_mdl=mdl,
+        ligand_number=1,
+        ligand_name="761",
+        lscore=0.82,
+        parent="1CGH",
+    )
+
+    assert result.startswith("PFRMAT LG\n")
+    assert "TARGET L2001" in result
+    assert "AUTHOR 0123-4567-8901" in result
+    assert "MODEL 1" in result
+    assert "PARENT 1CGH" in result
+    assert "LIGAND 001 761" in result
+    assert "LSCORE 0.820" in result
+    assert "M  END" in result
+    assert result.strip().endswith("END")
+
+
+def test_build_lg_submission_no_lscore() -> None:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from make_casp_submission import build_lg_submission
+
+    result = build_lg_submission(
+        target_id="L2002",
+        author="0000-0000-0000",
+        method="test",
+        protein_pdb_lines=["ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 50.00", "TER"],
+        ligand_mdl="test\n\n 0  0  0  0  0  0  0  0  0  0999 V2000\nM  END",
+        ligand_number=2,
+        ligand_name="380",
+    )
+    assert "LIGAND 002 380" in result
+    assert "LSCORE" not in result
+
+
+def test_build_lg_submission_auto_appends_ter() -> None:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from make_casp_submission import build_lg_submission
+
+    # No TER in protein lines
+    result = build_lg_submission(
+        target_id="T1",
+        author="A",
+        method="M",
+        protein_pdb_lines=["ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 50.00"],
+        ligand_mdl="     RDKit          3D\n\n 0  0  0  0  0  0  0  0  0  0999 V2000\nM  END",
+        ligand_number=1,
+        ligand_name="X",
+    )
+    # Should have added TER
+    assert "\nTER\n" in result
