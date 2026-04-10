@@ -2,11 +2,50 @@
 
 from __future__ import annotations
 
+import re
 import shlex
 from pathlib import Path
 
 from casp17.adapters import PreparedModelRun
 from casp17.configs import RunnerConfig
+
+
+# Models that support multi-seed via command-line arg replacement
+_COFOLDING_SEED_ARG = {
+    "boltz2": "--seed",
+    "boltz2x": "--seed",
+    "protenix": "--seeds",
+}
+
+# Docking models that support multi-seed (PxDock excluded — too expensive)
+_DOCKING_MULTI_SEED = {"vina", "autodock-gpu"}
+
+
+def _multi_seed_cofolding_commands(
+    model_run: PreparedModelRun,
+    seeds: list[int],
+) -> list[tuple[int, str, str]]:
+    """Generate (seed, command_str, output_dir) for each cofolding seed.
+
+    Replaces --seed/--seeds and --out_dir in the rendered command.
+    """
+    seed_arg = _COFOLDING_SEED_ARG.get(model_run.model_name)
+    if not seed_arg or len(seeds) <= 1:
+        return [(seeds[0] if seeds else 42, _render_command(model_run.command), str(model_run.output_dir))]
+
+    base_cmd = _render_command(model_run.command)
+    base_out = str(model_run.output_dir)
+    results = []
+    for seed in seeds:
+        cmd = re.sub(
+            rf"({re.escape(seed_arg)})\s+\d+",
+            rf"\1 {seed}",
+            base_cmd,
+        )
+        seed_out = f"{base_out}/seed_{seed}"
+        cmd = cmd.replace(shlex.quote(base_out), shlex.quote(seed_out))
+        results.append((seed, cmd, seed_out))
+    return results
 
 
 def build_shell_script(
@@ -44,6 +83,9 @@ def build_shell_script(
     boltz_output_dir = ""
     bridge_script = repo_root / "scripts" / "bridge_boltz_msa_to_af3.py"
 
+    cofolding_seeds = config.cofolding_seeds if hasattr(config, "cofolding_seeds") else [42]
+    docking_seeds = config.docking_seeds if hasattr(config, "docking_seeds") else [42]
+
     for idx, model_run in enumerate(model_runs, 1):
         name_upper = model_run.model_name.upper()
         var_name = model_run.model_name.replace("-", "_")
@@ -62,19 +104,69 @@ def build_shell_script(
                 "",
             ])
 
-        lines.extend([
-            f'echo ""',
-            f'echo "================================================================"',
-            f'echo "  [{idx}/{total}] {name_upper}"',
-            f'echo "================================================================"',
-            f"export PATH={shlex.quote(str(venv_bin))}:$PATH",
-            f"_start_{var_name}=$SECONDS",
-            _render_command(model_run.command),
-            f'_elapsed_{var_name}=$(( SECONDS - _start_{var_name} ))',
-            f'echo "  [{idx}/{total}] {name_upper} done in ${{_elapsed_{var_name}}}s"',
-            f'echo "================================================================"',
-            "",
-        ])
+        lines.append(f"export PATH={shlex.quote(str(venv_bin))}:$PATH")
+
+        # Determine if this model uses multi-seed
+        is_cofolding_multi = model_run.model_name in _COFOLDING_SEED_ARG and len(cofolding_seeds) > 1
+        is_docking_multi = model_run.model_name in _DOCKING_MULTI_SEED and len(docking_seeds) > 1
+
+        if is_cofolding_multi:
+            seed_runs = _multi_seed_cofolding_commands(model_run, cofolding_seeds)
+            lines.extend([
+                f'echo ""',
+                f'echo "================================================================"',
+                f'echo "  [{idx}/{total}] {name_upper} ({len(seed_runs)} seeds)"',
+                f'echo "================================================================"',
+                f"_start_{var_name}=$SECONDS",
+            ])
+            for si, (seed, cmd, out_dir) in enumerate(seed_runs, 1):
+                lines.extend([
+                    f'echo "  seed {seed} ({si}/{len(seed_runs)})"',
+                    f"mkdir -p {shlex.quote(out_dir)}",
+                    cmd,
+                ])
+            lines.extend([
+                f'_elapsed_{var_name}=$(( SECONDS - _start_{var_name} ))',
+                f'echo "  [{idx}/{total}] {name_upper} ({len(seed_runs)} seeds) done in ${{_elapsed_{var_name}}}s"',
+                f'echo "================================================================"',
+                "",
+            ])
+        elif is_docking_multi:
+            base_cmd = _render_command(model_run.command)
+            base_out = str(model_run.output_dir)
+            lines.extend([
+                f'echo ""',
+                f'echo "================================================================"',
+                f'echo "  [{idx}/{total}] {name_upper} ({len(docking_seeds)} seeds)"',
+                f'echo "================================================================"',
+                f"_start_{var_name}=$SECONDS",
+            ])
+            for si, seed in enumerate(docking_seeds, 1):
+                seed_out = f"{base_out}/seed_{seed}"
+                lines.extend([
+                    f'echo "  seed {seed} ({si}/{len(docking_seeds)})"',
+                    f"mkdir -p {shlex.quote(seed_out)}",
+                    f"DOCK_SEED={seed} DOCK_OUT_DIR={shlex.quote(seed_out)} {base_cmd}",
+                ])
+            lines.extend([
+                f'_elapsed_{var_name}=$(( SECONDS - _start_{var_name} ))',
+                f'echo "  [{idx}/{total}] {name_upper} ({len(docking_seeds)} seeds) done in ${{_elapsed_{var_name}}}s"',
+                f'echo "================================================================"',
+                "",
+            ])
+        else:
+            lines.extend([
+                f'echo ""',
+                f'echo "================================================================"',
+                f'echo "  [{idx}/{total}] {name_upper}"',
+                f'echo "================================================================"',
+                f"_start_{var_name}=$SECONDS",
+                _render_command(model_run.command),
+                f'_elapsed_{var_name}=$(( SECONDS - _start_{var_name} ))',
+                f'echo "  [{idx}/{total}] {name_upper} done in ${{_elapsed_{var_name}}}s"',
+                f'echo "================================================================"',
+                "",
+            ])
 
         if model_run.model_name.startswith("boltz") and not boltz_output_dir:
             boltz_output_dir = str(model_run.output_dir)

@@ -719,6 +719,9 @@ class RunnerConfig:
         default_factory=TemplateSearchStructureConfig
     )
     slurm: SlurmConfig = field(default_factory=SlurmConfig)
+    # Multi-seed: run cofolding/docking with multiple seeds for diversity
+    cofolding_seeds: list[int] = field(default_factory=lambda: [42, 101, 202, 303, 404])
+    docking_seeds: list[int] = field(default_factory=lambda: [42, 101, 202, 303, 404])
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "RunnerConfig":
@@ -746,6 +749,8 @@ class RunnerConfig:
                 data.get("template_search_structure")
             ),
             slurm=SlurmConfig.from_dict(data.get("slurm")),
+            cofolding_seeds=[int(s) for s in data.get("cofolding_seeds", [42, 101, 202, 303, 404])],
+            docking_seeds=[int(s) for s in data.get("docking_seeds", [42, 101, 202, 303, 404])],
         )
 
     def validate(self, pipeline: str = "all") -> None:
