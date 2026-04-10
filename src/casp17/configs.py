@@ -704,6 +704,44 @@ class TemplateSearchStructureConfig:
 
 
 @dataclass(slots=True)
+class PostAnalysisConfig:
+    enabled: bool = True
+    device: str = "cuda"
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "PostAnalysisConfig":
+        if data is None:
+            return cls()
+        return cls(
+            enabled=_to_bool(data.get("enabled"), True),
+            device=str(data.get("device", "cuda")),
+        )
+
+
+@dataclass(slots=True)
+class SubmissionConfig:
+    enabled: bool = False
+    author: str = "0000-0000-0000"
+    method: str = "CASP17 protein-ligand pipeline ensemble"
+    include_affinity: bool = False
+    parent: str = "N/A"
+    ligand_number: int = 1
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "SubmissionConfig":
+        if data is None:
+            return cls()
+        return cls(
+            enabled=_to_bool(data.get("enabled"), False),
+            author=str(data.get("author", "0000-0000-0000")),
+            method=str(data.get("method", "CASP17 protein-ligand pipeline ensemble")),
+            include_affinity=_to_bool(data.get("include_affinity"), False),
+            parent=str(data.get("parent", "N/A")),
+            ligand_number=int(data.get("ligand_number", 1)),
+        )
+
+
+@dataclass(slots=True)
 class RunnerConfig:
     preset: str = "balanced"
     boltz: BoltzConfig = field(default_factory=BoltzConfig)
@@ -719,6 +757,8 @@ class RunnerConfig:
         default_factory=TemplateSearchStructureConfig
     )
     slurm: SlurmConfig = field(default_factory=SlurmConfig)
+    post_analysis: PostAnalysisConfig = field(default_factory=PostAnalysisConfig)
+    submission: SubmissionConfig = field(default_factory=SubmissionConfig)
     # Multi-seed: run cofolding/docking with multiple seeds for diversity
     cofolding_seeds: list[int] = field(default_factory=lambda: [42, 101, 202, 303, 404])
     docking_seeds: list[int] = field(default_factory=lambda: [42, 101, 202, 303, 404])
@@ -749,6 +789,8 @@ class RunnerConfig:
                 data.get("template_search_structure")
             ),
             slurm=SlurmConfig.from_dict(data.get("slurm")),
+            post_analysis=PostAnalysisConfig.from_dict(data.get("post_analysis")),
+            submission=SubmissionConfig.from_dict(data.get("submission")),
             cofolding_seeds=[int(s) for s in data.get("cofolding_seeds", [42, 101, 202, 303, 404])],
             docking_seeds=[int(s) for s in data.get("docking_seeds", [42, 101, 202, 303, 404])],
         )

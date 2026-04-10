@@ -1008,3 +1008,81 @@ def test_ensemble_affinity_ba_only() -> None:
     log_kd, details = ensemble_affinity(poses, [])
     # BA = log(Kd nM) = 1, no boltz → ensemble = 1
     assert log_kd == 1.0
+
+
+# --- Wrapper post-analysis + submission tests ---
+
+
+def test_wrapper_includes_post_analysis_by_default(tmp_path: Path) -> None:
+    from casp17.script_builder import build_wrapper_shell_script
+
+    config = RunnerConfig.from_dict({"template_search_sequence": {"enabled": True}})
+    stage_scripts = [
+        ("cofolding", tmp_path / "scripts" / "run_structure.sh"),
+        ("docking", tmp_path / "scripts" / "run_docking.sh"),
+    ]
+    script = build_wrapper_shell_script("T0001", config, "local", stage_scripts)
+    assert "POST-ANALYSIS" in script
+    assert "run_post_analysis.py" in script
+
+
+def test_wrapper_post_analysis_can_be_disabled(tmp_path: Path) -> None:
+    from casp17.script_builder import build_wrapper_shell_script
+
+    config = RunnerConfig.from_dict({
+        "post_analysis": {"enabled": False},
+    })
+    stage_scripts = [
+        ("cofolding", tmp_path / "scripts" / "run_structure.sh"),
+        ("docking", tmp_path / "scripts" / "run_docking.sh"),
+    ]
+    script = build_wrapper_shell_script("T0001", config, "local", stage_scripts)
+    assert "POST-ANALYSIS" not in script
+
+
+def test_wrapper_includes_submission_when_enabled(tmp_path: Path) -> None:
+    from casp17.script_builder import build_wrapper_shell_script
+
+    config = RunnerConfig.from_dict({
+        "submission": {
+            "enabled": True,
+            "author": "1234-5678-9012",
+            "method": "Test ensemble",
+            "include_affinity": True,
+        },
+    })
+    stage_scripts = [
+        ("cofolding", tmp_path / "scripts" / "run_structure.sh"),
+        ("docking", tmp_path / "scripts" / "run_docking.sh"),
+    ]
+    script = build_wrapper_shell_script("L2001", config, "local", stage_scripts)
+    assert "CASP17 LG SUBMISSION" in script
+    assert "make_casp_submission.py" in script
+    assert "1234-5678-9012" in script
+    assert "--include-affinity" in script
+
+
+def test_wrapper_no_submission_by_default(tmp_path: Path) -> None:
+    from casp17.script_builder import build_wrapper_shell_script
+
+    config = RunnerConfig.from_dict({})
+    stage_scripts = [
+        ("cofolding", tmp_path / "scripts" / "run_structure.sh"),
+        ("docking", tmp_path / "scripts" / "run_docking.sh"),
+    ]
+    script = build_wrapper_shell_script("T0001", config, "local", stage_scripts)
+    # Submission disabled by default
+    assert "CASP17 LG SUBMISSION" not in script
+
+
+def test_post_analysis_config_defaults() -> None:
+    config = RunnerConfig.from_dict({})
+    assert config.post_analysis.enabled is True
+    assert config.post_analysis.device == "cuda"
+
+
+def test_submission_config_defaults() -> None:
+    config = RunnerConfig.from_dict({})
+    assert config.submission.enabled is False
+    assert config.submission.author == "0000-0000-0000"
+    assert config.submission.include_affinity is False

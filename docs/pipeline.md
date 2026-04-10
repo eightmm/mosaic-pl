@@ -619,6 +619,41 @@ python scripts/make_casp_submission.py \
 - `--include-affinity`: auto-compute AFFNTY from ensemble (omit for P-only tasks)
 - `--lscore N`, `--affinity-nM N`: manual override
 
+### Wrapper Integration
+
+Post-analysis and CASP submission are fully integrated into the wrapper script, so running `prepare-wrapper` + `sbatch` auto-executes **all 8 stages** end-to-end.
+
+Config knobs:
+```yaml
+post_analysis:
+  enabled: true              # default on
+  device: cuda
+
+submission:
+  enabled: true              # default off; set true to auto-generate .lg files
+  author: "XXXX-XXXX-XXXX"   # CASP registration code
+  method: "Boltz-2x + ensemble ..."
+  include_affinity: false    # true for A/PA tasks
+  parent: "N/A"              # template PDB ID or N/A
+  ligand_number: 1
+```
+
+**Wrapper execution order**:
+
+```
+template-search-sequence
+  → BRIDGE: template filter (Tanimoto + MCS)
+cofolding (5 seeds × 5 samples)
+  → BRIDGE: docking prep (auto-select + binding site + file conversion)
+docking (Track 1: Vina/ADG 5 seeds, PxDock 1x)
+  → MULTI-TRACK DOCKING (Track 2+3 if MCS ≥ 0.5)
+  → ION/METAL PLACEMENT (if ion in input)
+  → POST-ANALYSIS (BA-Pred + RMSD-Pred)
+  → CASP17 LG SUBMISSION (if submission.enabled)
+```
+
+Output: `experiments/submissions/<target>.lg`
+
 ---
 
 ## Timing (RTX 6000 Ada)

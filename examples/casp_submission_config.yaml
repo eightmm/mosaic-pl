@@ -71,6 +71,18 @@ autodock_gpu:
 protenix_dock:
   enabled: true
 
+post_analysis:
+  enabled: true
+  device: cuda
+
+submission:
+  enabled: true
+  author: "0000-0000-0000"          # replace with real CASP registration code
+  method: "Boltz-2x + Multi-track ensemble + lig-align (5 seeds x 5 samples)"
+  include_affinity: false            # L2000 is pose-only (P task)
+  parent: "N/A"
+  ligand_number: 1
+
 slurm:
   partition: 6000ada
   gpus: 1

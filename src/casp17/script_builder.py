@@ -206,7 +206,10 @@ def build_wrapper_shell_script(
     filter_script = repo_root / "scripts" / "run_template_filter.py"
     multi_track_script = repo_root / "scripts" / "run_multi_track_docking.py"
     ion_script = repo_root / "scripts" / "collect_template_ions.py"
+    post_analysis_script = repo_root / "scripts" / "run_post_analysis.py"
+    submission_script = repo_root / "scripts" / "make_casp_submission.py"
     dock_python = repo_root / ".venvs" / "protenix-dock" / "bin" / "python"
+    pred_python = repo_root / ".venvs" / "pred" / "bin" / "python"
     hub_python = repo_root / ".venv" / "bin" / "python"
     stage_names = [s for s, _ in stage_scripts]
     has_template_search = "template-search-sequence" in stage_names
@@ -296,6 +299,53 @@ def build_wrapper_shell_script(
             f"--rcsb-dir {shlex.quote(str(rcsb_dir))} "
             f"--rcsb-db {shlex.quote(str(rcsb_db))} "
             f"|| echo '  (no ion entities or no templates found, skipping)'",
+            "",
+        ])
+
+    # Post-analysis: BA-Pred + RMSD-Pred on all docking results
+    if has_docking and getattr(config, "post_analysis", None) and config.post_analysis.enabled:
+        run_dir = stage_scripts[0][1].parent.parent
+        lines.extend([
+            f'echo ""',
+            f'echo "================================================================"',
+            f'echo "  POST-ANALYSIS (BA-Pred + RMSD-Pred)"',
+            f'echo "================================================================"',
+            f"{shlex.quote(str(pred_python))} {shlex.quote(str(post_analysis_script))} "
+            f"--run-dir {shlex.quote(str(run_dir))} "
+            f"--device {shlex.quote(config.post_analysis.device)} "
+            f"|| echo '  (post-analysis failed, continuing)'",
+            "",
+        ])
+
+    # CASP17 LG submission: generate .lg file from aggregated scores
+    if (
+        has_docking
+        and getattr(config, "submission", None)
+        and config.submission.enabled
+    ):
+        run_dir = stage_scripts[0][1].parent.parent
+        sub_cfg = config.submission
+        submission_output = run_dir.parent.parent / "submissions" / f"{job_name}.lg"
+        cmd = (
+            f"{shlex.quote(str(hub_python))} {shlex.quote(str(submission_script))} "
+            f"--run-dir {shlex.quote(str(run_dir))} "
+            f"--target-id {shlex.quote(job_name)} "
+            f"--ligand-name {shlex.quote(job_name)} "  # fallback to target id
+            f"--ligand-number {sub_cfg.ligand_number} "
+            f"--author {shlex.quote(sub_cfg.author)} "
+            f"--method {shlex.quote(sub_cfg.method)} "
+            f"--parent {shlex.quote(sub_cfg.parent)} "
+            f"--output {shlex.quote(str(submission_output))}"
+        )
+        if sub_cfg.include_affinity:
+            cmd += " --include-affinity"
+        lines.extend([
+            f'echo ""',
+            f'echo "================================================================"',
+            f'echo "  CASP17 LG SUBMISSION"',
+            f'echo "================================================================"',
+            f"mkdir -p {shlex.quote(str(submission_output.parent))}",
+            f"{cmd} || echo '  (submission generation failed)'",
             "",
         ])
 
