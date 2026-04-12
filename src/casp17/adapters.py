@@ -757,69 +757,31 @@ def prepare_autodock_gpu(
     grid_dir.mkdir(parents=True, exist_ok=True)
     notes: list[str] = []
 
-    # Auto-detect from docking prep bridge output
-    prep = _load_docking_prep_summary(run_dir)
+    # Pass explicit user config through to the runtime wrapper. None values
+    # mean "auto-detect from docking_prep_summary.json at runtime". Any value
+    # set here by the user overrides the prep summary at runtime.
     receptor_pdbqt = config.autodock_gpu.receptor_pdbqt
     ligand_pdbqt = config.autodock_gpu.ligand_pdbqt
-    center_x, center_y, center_z = config.autodock_gpu.center_x, config.autodock_gpu.center_y, config.autodock_gpu.center_z
-    size_x, size_y, size_z = config.autodock_gpu.size_x, config.autodock_gpu.size_y, config.autodock_gpu.size_z
+    center_x, center_y, center_z = (
+        config.autodock_gpu.center_x,
+        config.autodock_gpu.center_y,
+        config.autodock_gpu.center_z,
+    )
+    size_x, size_y, size_z = (
+        config.autodock_gpu.size_x,
+        config.autodock_gpu.size_y,
+        config.autodock_gpu.size_z,
+    )
+    notes.append(
+        "AutoDock-GPU resolves receptor/ligand/box from docking_prep_summary.json "
+        "at runtime (after the docking prep bridge runs). Explicit runner_config "
+        "values override the prep summary."
+    )
 
-    if prep:
-        receptor_pdbqt = receptor_pdbqt or prep["receptor_pdbqt"]
-        if prep["ligands"]:
-            ligand_pdbqt = ligand_pdbqt or prep["ligands"][0]["pdbqt"]
-        bc = prep.get("box_center", [0, 0, 0])
-        bs = prep.get("box_size", [20, 20, 20])
-        center_x = center_x if center_x is not None else bc[0]
-        center_y = center_y if center_y is not None else bc[1]
-        center_z = center_z if center_z is not None else bc[2]
-        size_x = size_x if size_x is not None else bs[0]
-        size_y = size_y if size_y is not None else bs[1]
-        size_z = size_z if size_z is not None else bs[2]
-        notes.append("AutoDock-GPU inputs auto-detected from docking prep bridge output.")
-    else:
-        notes.append(
-            "AutoDock-GPU consumes receptor_pdbqt and ligand_pdbqt from runner_config. "
-            "Use the wrapper pipeline with cofolding+docking stages for auto-preparation."
-        )
-
-    # Default box if not yet determined (bridge will override at runtime)
-    center_x = center_x if center_x is not None else 0.0
-    center_y = center_y if center_y is not None else 0.0
-    center_z = center_z if center_z is not None else 0.0
-    size_x = size_x if size_x is not None else 22.5
-    size_y = size_y if size_y is not None else 22.5
-    size_z = size_z if size_z is not None else 22.5
-
-    # Generate autogrid4 GPF (Grid Parameter File) and run script
-    npts_x = max(1, int(size_x / 0.375))
-    npts_y = max(1, int(size_y / 0.375))
-    npts_z = max(1, int(size_z / 0.375))
-
-    # Write GPF for autogrid4 (will be run inline in the shell script)
-    gpf_path = grid_dir / "receptor.gpf"
-    fld_path = grid_dir / "receptor.maps.fld"
-    gpf_lines = [
-        f"npts {npts_x} {npts_y} {npts_z}",
-        f"gridfld {fld_path.name}",
-        f"spacing 0.375",
-        f"receptor_types A C HD N NA OA SA",
-        f"ligand_types A C HD N NA OA SA",
-        f"receptor {receptor_pdbqt}",
-        f"gridcenter {center_x} {center_y} {center_z}",
-        f"smooth 0.5",
-        "map receptor.A.map",
-        "map receptor.C.map",
-        "map receptor.HD.map",
-        "map receptor.N.map",
-        "map receptor.NA.map",
-        "map receptor.OA.map",
-        "map receptor.SA.map",
-        "elecmap receptor.e.map",
-        "dsolvmap receptor.d.map",
-        "dielectric -0.1465",
-    ]
-    gpf_path.write_text("\n".join(gpf_lines) + "\n")
+    # GPF is generated at runtime inside the wrapper script (per-seed, with
+    # actual ligand atom types parsed from ligand pdbqt and box center loaded
+    # from the docking prep summary). No adapter-time GPF is written because
+    # the docking prep bridge has not run yet at this point.
 
     # Shell script that runs autogrid4 then autodock_gpu
     runner_script = run_dir / "scripts" / "run_autodock_gpu.py"
@@ -834,8 +796,10 @@ def prepare_autodock_gpu(
         "",
         f"receptor_pdbqt = {receptor_pdbqt!r}",
         f"ligand_pdbqt = {ligand_pdbqt!r}",
-        f"center = [{center_x}, {center_y}, {center_z}]",
-        f"size = [{size_x}, {size_y}, {size_z}]",
+        f"user_center = [{center_x!r}, {center_y!r}, {center_z!r}]",
+        f"user_size = [{size_x!r}, {size_y!r}, {size_z!r}]",
+        f"center = [0.0, 0.0, 0.0]",
+        f"size = [22.5, 22.5, 22.5]",
         f"grid_dir = Path({str(grid_dir)!r})",
         f"fld_path = grid_dir / 'receptor.maps.fld'",
         f"output_dir = Path({str(output_dir)!r})",
@@ -855,17 +819,44 @@ def prepare_autodock_gpu(
         "    grid_dir.mkdir(parents=True, exist_ok=True)",
         "    fld_path = grid_dir / 'receptor.maps.fld'",
         "",
-        f"# Runtime auto-detect from docking prep bridge",
+        f"# Runtime auto-detect from docking prep bridge. Prefer runtime prep",
+        f"# summary over compile-time config because adapter runs before the",
+        f"# docking prep bridge creates the summary file.",
         f"summary_path = Path({str(summary_path)!r})",
         "if summary_path.exists():",
         "    prep = json.loads(summary_path.read_text())",
         "    receptor_pdbqt = receptor_pdbqt or prep['receptor_pdbqt']",
         "    if prep.get('ligands'):",
         "        ligand_pdbqt = ligand_pdbqt or prep['ligands'][0]['pdbqt']",
-        "    if center[0] is None:",
-        "        center = prep.get('box_center', [0, 0, 0])",
-        "    if size[0] is None:",
-        "        size = prep.get('box_size', [20, 20, 20])",
+        "    center = list(prep.get('box_center', center))",
+        "    size = list(prep.get('box_size', size))",
+        "# Explicit user config takes precedence over prep summary",
+        "for i, v in enumerate(user_center):",
+        "    if v is not None:",
+        "        center[i] = v",
+        "for i, v in enumerate(user_size):",
+        "    if v is not None:",
+        "        size[i] = v",
+        "",
+        "# Dynamically derive ligand atom types from ligand pdbqt (last token of ATOM/HETATM lines)",
+        "def _parse_lig_types(path):",
+        "    types = []",
+        "    seen = set()",
+        "    with open(path) as fh:",
+        "        for line in fh:",
+        "            if line.startswith(('ATOM', 'HETATM')):",
+        "                tok = line[77:79].strip() if len(line) >= 79 else line.split()[-1].strip()",
+        "                if tok and tok not in seen:",
+        "                    seen.add(tok)",
+        "                    types.append(tok)",
+        "    return types",
+        "",
+        "lig_types = _parse_lig_types(ligand_pdbqt)",
+        "if not lig_types:",
+        "    lig_types = ['A', 'C', 'HD', 'N', 'NA', 'OA', 'SA']",
+        "# Receptor needs the standard protein type set so autogrid can build all interaction maps",
+        "_rec_base = ['A', 'C', 'HD', 'N', 'NA', 'OA', 'SA']",
+        "rec_types = list(dict.fromkeys(_rec_base + lig_types))",
         "",
         "# Generate GPF",
         "npts = [max(1, int(s / 0.375)) for s in size]",
@@ -873,16 +864,18 @@ def prepare_autodock_gpu(
         "    f'npts {npts[0]} {npts[1]} {npts[2]}',",
         "    f'gridfld receptor.maps.fld',",
         "    f'spacing 0.375',",
-        "    f'receptor_types A C HD N NA OA SA',",
-        "    f'ligand_types A C HD N NA OA SA',",
+        "    f'receptor_types {chr(32).join(rec_types)}',",
+        "    f'ligand_types {chr(32).join(lig_types)}',",
         "    f'receptor {receptor_pdbqt}',",
         "    f'gridcenter {center[0]} {center[1]} {center[2]}',",
         "    f'smooth 0.5',",
-        "    'map receptor.A.map', 'map receptor.C.map', 'map receptor.HD.map',",
-        "    'map receptor.N.map', 'map receptor.NA.map', 'map receptor.OA.map',",
-        "    'map receptor.SA.map', 'elecmap receptor.e.map', 'dsolvmap receptor.d.map',",
-        "    'dielectric -0.1465',",
         "]",
+        "for t in lig_types:",
+        "    gpf.append(f'map receptor.{t}.map')",
+        "gpf.extend([",
+        "    'elecmap receptor.e.map', 'dsolvmap receptor.d.map',",
+        "    'dielectric -0.1465',",
+        "])",
         "gpf_path = grid_dir / 'receptor.gpf'",
         "gpf_path.write_text('\\n'.join(gpf) + '\\n')",
         "",

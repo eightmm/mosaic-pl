@@ -163,12 +163,14 @@ flowchart TB
     style O4 fill:#4fc3f7,color:#000
 ```
 
-| Model | venv | 소요 시간 | 특징 |
+| Model | venv | 소요 시간 (5 seeds × 5 samples = 25 structs) | 특징 |
 |-------|------|----------|------|
-| Boltz-2 | `.venvs/boltz` | ~50-140s | 구조 + confidence + MSA + affinity |
-| Boltz-2x | `.venvs/boltz` | ~50-140s | 위와 동일 + potentials (constraint) |
-| Protenix v2 | `.venvs/protenix` | ~80-190s | 구조 + confidence |
-| AlphaFold3 | `.venvs/alphafold3` | ~110-130s | 구조 + confidence + ranking (JAX) |
+| Boltz-2 | `.venvs/boltz` | ~10 min (600-620s) | 구조 + confidence + MSA + affinity |
+| Boltz-2x | `.venvs/boltz` | ~12 min (680-740s) | 위와 동일 + potentials (constraint) |
+| Protenix v2 | `.venvs/protenix` | ~8 min (484-492s) | 구조 + confidence |
+| AlphaFold3 | `.venvs/alphafold3` | ~6 min (353-393s) | 구조 + confidence + ranking (JAX) |
+
+> RTX 6000 Ada 단일 GPU, CASP16 L2001/L2002 기준. `cofolding_seeds=[42,101,202,303,404]`, `diffusion_samples=5`.
 
 **Bridge: Boltz MSA -> AF3**
 - Boltz가 생성한 MSA CSV를 AF3 A3M 포맷으로 변환
@@ -334,13 +336,14 @@ flowchart LR
     style PXDOCK fill:#f48fb1,color:#000
 ```
 
-| Tool | Type | 소요 시간 | venv | Output |
+| Tool | Type | 소요 시간 | venv | Output (per docking seed) |
 |------|------|----------|------|--------|
-| Vina | Python API | ~3s | `.venvs/protenix-dock` | `outputs/vina/docked.pdbqt` |
-| AutoDock-GPU | CUDA binary | ~10s | `.local/bin/` | `outputs/autodock_gpu/docked.dlg` |
-| Protenix-Dock | CPU force field | ~5-30min | `.venvs/protenix-dock` | `outputs/protenix_dock/` |
+| Vina | Python API | ~3s | `.venvs/protenix-dock` | `outputs/vina/seed_<seed>/docked.pdbqt` |
+| AutoDock-GPU | CUDA binary | ~10s | `.local/bin/` | `outputs/autodock_gpu/seed_<seed>/docking.dlg` |
+| Protenix-Dock | CPU force field | ~5-30min | `.venvs/protenix-dock` | `outputs/protenix_dock/*_out.json` (single run, no seed loop) |
 
 - 모든 tool은 `docking_prep_summary.json`에서 receptor/ligand/box를 runtime에 읽음
+- AutoDock-GPU 래퍼는 추가로 **런타임에 ligand pdbqt를 파싱**해서 `ligand_types`와 grid map을 동적으로 구성 — F/Cl/Br/P/I/Si 등 비표준 원자 타입도 자동 대응 (adapter 시점에는 하드코딩된 기본값을 쓰지 않음)
 - Protenix-Dock이 전체 시간의 ~77% 차지 (병목)
 
 ### Track 2: Template-based Box Docking (MCS >= 0.5)
@@ -502,28 +505,41 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    subgraph CONVERT["Format Conversion"]
-        VINA_OUT["Vina docked.pdbqt"] --> MK["mk_export.py\n(meeko)"]
-        ADG_OUT["ADG docked.dlg"] --> MK
-        MK --> SDF_OUT["docked.sdf"]
+    subgraph STAGE["Pose Staging (unique stems)"]
+        VINA_OUT["outputs/vina/seed_*/docked.pdbqt"] --> SGE["analysis/poses/vina_seed_N.{pdbqt,sdf}"]
+        ADG_OUT["outputs/autodock_gpu/seed_*/docking.dlg"] --> SGE2["analysis/poses/autodock_gpu_seed_N.{dlg,sdf}"]
+        PXD_OUT["outputs/protenix_dock/*_out.json"] --> PXSDF["outputs/protenix_dock/poses.sdf\n(multi-record, built by\n_pxdock_json_to_sdf)"]
+    end
+
+    subgraph LIST["Per-tool pose lists"]
+        SGE --> VLIST["analysis/vina_poses.txt"]
+        SGE2 --> ALIST["analysis/autodock_gpu_poses.txt"]
     end
 
     subgraph PREDICT["GNN Prediction"]
-        SDF_OUT --> BA["BA-Pred\n(Binding Affinity)"]
-        SDF_OUT --> RMSD["RMSD-Pred\n(Pose Quality)"]
+        VLIST & ALIST & PXSDF --> BA["BA-Pred"]
+        VLIST & ALIST & PXSDF --> RMSD["RMSD-Pred"]
         REC["receptor.pdb"] --> BA & RMSD
     end
 
-    BA --> BA_OUT["pKd (kcal/mol)\nper model x per tool"]
-    RMSD --> RMSD_OUT["pRMSD (>2A prob)\nper model x per tool"]
+    BA --> BA_OUT["ba_pred_<tool>.tsv\n(Name, pKd, kcal/mol)"]
+    RMSD --> RMSD_OUT["rmsd_pred_<tool>.tsv\n(Name, pRMSD, P>2A)"]
 
     style BA_OUT fill:#ffd54f,color:#000
     style RMSD_OUT fill:#ffd54f,color:#000
 ```
 
 - **Script**: `scripts/run_post_analysis.py` (GPU node에서 실행)
-- **venv**: `.venvs/pred` (torch 2.4 + dgl 2.4 + openbabel)
+- **venv**: `.venvs/pred` (torch 2.4 + dgl 2.4 + openbabel + rdkit)
+- **Pose 수집 규칙**:
+  - multi-seed docking 결과(`vina`, `autodock_gpu`)는 각 seed 파일을 `outputs/analysis/poses/{tool}_seed_{N}.{ext}`로 유니크 stem으로 복사. BA-Pred/RMSD-Pred의 `{basename}_{idx}` pose 명명 규칙 때문에 stem이 유니크해야 TSV row가 seed별로 분리됨
+  - 각 staged 파일에 대해 meeko `mk_export.py`로 `.sdf` 복제본도 생성 → downstream `make_casp_submission.py`가 pose를 레코드 인덱스로 정확히 꺼낼 수 있음
+  - **Protenix-Dock**은 포즈를 `.sdf`로 내보내지 않고 `*_out.json`(atom-mapped SMILES + `ligand.xyz`)에만 담음 → `_pxdock_json_to_sdf`로 RDKit 멀티레코드 SDF 생성 후 BA/RMSD-Pred에 전달
+  - **입력 ligand SDF (`inputs/docking/ligand_*.sdf`)는 post-analysis에서 제외**. RDKit embedding 좌표는 receptor와 정렬되지 않아 BA-Pred의 "8 Å 이내 단백질 원자만 추출" 로직이 빈 `MolFromPDBBlock` → `None`을 반환하고 `mol_to_graph` 단계에서 `AttributeError: 'NoneType' object has no attribute 'GetNumAtoms'`로 죽음. Docking 결과 pose만 대상으로 함
 - **Output**:
+  - `outputs/analysis/poses/` — staged pose 파일들 (pdbqt/dlg + sdf 쌍)
+  - `outputs/analysis/{vina,autodock_gpu}_poses.txt` — BA/RMSD-Pred 입력용 리스트 파일
+  - `outputs/protenix_dock/poses.sdf` — PxDock json에서 변환된 멀티포즈 SDF
   - `outputs/analysis/ba_pred_<tool>.tsv` — per-pose pKd per docking tool
   - `outputs/analysis/rmsd_pred_<tool>.tsv` — per-pose pRMSD per docking tool
   - `outputs/analysis/summary.json` — 최적 조합 선택
@@ -565,7 +581,7 @@ flowchart TB
 
 - **Script**: `scripts/compute_submission_scores.py`
 - **LSCORE** (per pose): `1 - P(RMSD > 2Å)` from RMSD-Pred (higher = more confident)
-- **Best pose**: picked by highest LSCORE
+- **Best pose**: picked by highest LSCORE. Pose는 `pose_name`(`{stem}_{record_idx}`)에서 역산해 `outputs/analysis/poses/{stem}.sdf`의 정확한 레코드로 해상(`_resolve_pose_file` + `_split_pose_name`). Protenix-Dock best pose는 `outputs/protenix_dock/poses.sdf` 내부의 record index로 해상됨
 - **AFFNTY** (per complex): log-space ensemble of BA-Pred median + Boltz median (filtered by binder_prob ≥ 0.5)
 
 ### Step 7-2: LG Format Assembly
@@ -573,7 +589,10 @@ flowchart TB
 ```mermaid
 flowchart TB
     CIF["Best cofolding CIF\n(by pLDDT)"] --> PDB["gemmi: CIF → PDB\nB-factor = pLDDT"]
-    POSE["Best ligand pose\n(SDF/PDBQT/DLG)"] --> MDL["rdkit/meeko/obabel\n→ MDL V2000"]
+    NAME["best_pose.pose_name\n(e.g. vina_seed_42_3)"] --> SPLIT["_split_pose_name()"]
+    SPLIT --> STEM["stem = vina_seed_42\nidx = 3"]
+    STEM --> POSE["analysis/poses/\nvina_seed_42.sdf"]
+    POSE --> MDL["pose_to_mdl(path,\n  pose_index=idx)\n→ rdkit / meeko / obabel\n→ MDL V2000"]
     SCORES["LSCORE + AFFNTY"]
 
     PDB & MDL & SCORES --> BUILD["build_lg_submission()"]
@@ -656,60 +675,70 @@ Output: `experiments/submissions/<target>.lg`
 
 ---
 
-## Timing (RTX 6000 Ada)
+## Timing (RTX 6000 Ada, single GPU)
+
+CASP16 L2001/L2002 실측 (job 23941, 23942, partition `6000ada`, `casp_submission` config — 5 cofolding seeds × 5 samples + 5 docking seeds). 아래 gantt는 L2001 기준 시작 0초부터의 누적 시각입니다.
 
 ```mermaid
 gantt
-    title Pipeline Execution Timeline
+    title Pipeline Execution Timeline (L2001, 53:26 total)
     dateFormat X
-    axisFormat %s
+    axisFormat %Mm
 
     section Search
-    MMseqs2 sequence search     :0, 3
-    Template filter (MCS)       :3, 5
+    MMseqs2 + template filter    :0, 13
 
     section Co-folding
-    Boltz-2 + affinity          :5, 148
-    Boltz-2x + affinity         :148, 236
-    Protenix v2                 :236, 369
-    Boltz MSA -> AF3 bridge     :369, 370
-    AlphaFold3                  :370, 499
+    Boltz-2 (5×5)                 :13, 635
+    Boltz-2x (5×5)                :635, 1375
+    Protenix v2 (5×5)             :1375, 1867
+    Boltz MSA -> AF3 bridge       :1867, 1870
+    AlphaFold3 (25 structs)       :1870, 2223
 
     section Docking Prep
-    Auto-select + SwinSite + P2Rank :499, 509
+    docking_prep_summary.json     :2223, 2228
 
-    section Track 1
-    Vina                        :509, 512
-    AutoDock-GPU                :512, 522
-    Protenix-Dock               :522, 2262
+    section Track 1 Docking
+    Vina (5 seeds)                :2228, 2482
+    AutoDock-GPU (5 seeds)        :2482, 2524
+    Protenix-Dock (1 run)         :2524, 2983
 
-    section Track 2+3 (conditional)
-    Template box docking prep   :2262, 2272
-    Template Vina + ADG         :2272, 2285
-    Template PxDock             :2285, 4025
-    lig-align                   :4025, 4035
+    section Track 2+3 (skipped)
+    Multi-track docking           :2983, 2985
 
-    section Post-analysis
-    BA-Pred + RMSD-Pred         :4035, 4045
+    section Ion placement (skipped)
+    collect_template_ions         :2985, 2987
+
+    section Post-analysis + submit
+    BA-Pred + RMSD-Pred           :2987, 3150
+    compute_submission_scores     :3150, 3155
+    make_casp_submission          :3155, 3206
 ```
 
-| Stage | Time | Notes |
-|-------|-----:|-------|
-| MMseqs2 + template filter | ~5s | sequence search + Tanimoto/MCS scoring |
-| Boltz-2 + affinity | ~143s | |
-| Boltz-2x + affinity | ~88s | |
-| Protenix v2 | ~133s | |
-| AlphaFold3 | ~129s | |
-| Foldseek x 4 | ~30s | structure search + consensus |
-| Docking prep | ~10s | auto-select + SwinSite/P2Rank |
-| **Track 1** | **~29min** | cofolding-based (Vina + ADG + PxDock) |
-| **Track 2** | **~29min** | template-based box docking (conditional, MCS >= 0.5) |
-| **Track 3** | **~10s** | lig-align (conditional, MCS >= 0.5) |
-| Post-analysis | ~10s | BA-Pred + RMSD-Pred |
-| **Total (Track 1 only)** | **~37min** | |
-| **Total (all tracks)** | **~66min** | when template has MCS >= 0.5 |
+| Stage | L2001 | L2002 | 비고 |
+|-------|------:|------:|------|
+| Template search (MMseqs2 + ligand filter) | 13s | 3s | sequence search + Tanimoto/MCS scoring |
+| Boltz-2 (5 seeds × 5 samples, 25 structs) | 622s | 600s | + Boltz affinity |
+| Boltz-2x (5 seeds × 5 samples, 25 structs) | 740s | 680s | + affinity + potentials |
+| Protenix v2 (5 seeds × 5 samples, 25 structs) | 492s | 484s | |
+| Bridge: Boltz MSA -> AF3 | <1s | <1s | CSV → A3M + JSON 패치 |
+| AlphaFold3 (25 structures) | 353s | 393s | |
+| Bridge: Docking prep | <5s | <5s | auto-select + SwinSite/P2Rank + SMILES→SDF/PDBQT + CIF→PDB→PDBQT |
+| Vina (5 seeds) | 254s | 130s | |
+| AutoDock-GPU (5 seeds) | 42s | 42s | per-seed 동적 GPF (ligand atom type + box center 런타임 재로드) |
+| Protenix-Dock (1 run) | 459s | 513s | multi-seed 불가 (너무 느려서) |
+| Multi-track docking (Track 2 + 3) | skipped | skipped | MCS < 0.5 |
+| Ion/metal placement | skipped | skipped | 입력에 ion entity 없음 |
+| Post-analysis (BA-Pred + RMSD-Pred) | ~1-2 min | ~1-2 min | 158 pose × 2 predictor (L2001 기준 vina 50 + ADG 100 + pxdock 8) |
+| compute_submission_scores | <5s | <5s | TSV → PoseScore aggregate, ensemble log-Kd |
+| make_casp_submission | <5s | <5s | best pose → MDL + LG file |
+| **Total wall-clock (`sacct`)** | **00:53:26** | **00:52:08** | Track 2/3 + Ion + 포스트 모두 활성일 때 +8~20분 정도 추가 예상 |
 
-> Protenix-Dock이 Track 1과 Track 2 모두에서 병목 (~77%).
+> Boltz-2x + Protenix v2 + Boltz-2 + AF3 가 cofolding 합산 36분, 전체 파이프라인의 ~67% 차지. Track 1 docking (Vina+ADG+PxDock) 은 ~13분 (~25%).
+
+**Track 2/3 활성화 조건 (관측 못 한 비용)**:
+- MCS ≥ 0.5 템플릿이 존재하면 `run_multi_track_docking.py`가 각 적합 템플릿에 대해 Vina/ADG/PxDock를 다시 돌림. 1-2개 템플릿 기준 추가 ~8-20분 예상.
+- Ion entity 가 input YAML에 있으면 template 정렬 + clustering stage가 추가됨 (~30초 - 1분).
 
 ---
 

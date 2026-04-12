@@ -86,8 +86,8 @@ template search → template filter (MCS) → cofolding (5 seeds × 5 samples = 
 4. **docking** — Track 1: Vina + AutoDock-GPU + Protenix-Dock (all read docking_prep_summary.json at runtime)
 5. **multi-track docking** (auto, MCS ≥ threshold) — Track 2: template-based box docking + Track 3: lig-align (MCS-guided)
 6. **ion placement** (auto, if ion CCD in input) — template alignment → ion position clustering by confidence
-7. **post-analysis** — BA-Pred + RMSD-Pred via mk_export.py SDF conversion
-8. **CASP17 LG submission** — aggregate scores, pick best pose, log-space ensemble AFFNTY → .lg file
+7. **post-analysis** — BA-Pred + RMSD-Pred on staged multi-seed pose SDFs (input_sdf excluded — unaligned conformer crashes BA-Pred)
+8. **CASP17 LG submission** — diversity-aware top-5 pose selection (greedy, ≥2Å pairwise RMSD), multi-MODEL LG file, log-space ensemble AFFNTY
 
 ### Key Design Decisions
 
@@ -96,14 +96,17 @@ template search → template filter (MCS) → cofolding (5 seeds × 5 samples = 
 - **AF3 dedicated runner**: `run_alphafold3.sh` sets LD_LIBRARY_PATH for JAX CUDA (venv nvidia libs)
 - **Protenix-Dock via micromamba**: needs ambertools (tleap) which is conda-only
 - **Unified box**: 22.5Å × 22.5Å × 22.5Å, spacing 0.375Å across all docking tools
-- **Binding site priority**: SwinSite (ML) > P2Rank (surface) > ligand coords (fallback)
+- **Binding site priority**: SwinSite (ML) > P2Rank (surface) > cofolding ligand coords (fallback). Known weakness: P2Rank/SwinSite can miss the correct pocket entirely (CASP16 L2001: 37Å error), future improvement: use cofolding predicted ligand position as primary box center
 - **Affinity auto-inject**: When ligand present, `properties.affinity` added to Boltz YAML
 - **RCSB ligand index**: External SQLite DB (mmcif-parser maintained), queried for template filtering
 - **Multi-track docking**: 3 tracks — Track 1 (always): cofolding→docking, Track 2 (MCS≥threshold): template-based box docking, Track 3 (MCS≥threshold): lig-align. Config: `template_search_sequence.mcs_threshold` (default 0.5)
 - **Template ligand SDF**: `prepare_template_docking.py` extracts bound-pose ligand from template CIF for lig-align reference
 - **Multi-seed**: `cofolding_seeds` (default 5) × `diffusion_samples` (default 5) = 25 structures per cofolding model. `docking_seeds` (default 5) for Vina/ADG (PxDock single run). Config: `cofolding_seeds`, `docking_seeds` lists in RunnerConfig
 - **AF3 templates field**: Adapter always adds `templates=[]` to AF3 protein blocks (required by AF3 schema even when empty)
-- **Submission ensemble**: LSCORE from RMSD-Pred `1 - P(RMSD>2Å)`; AFFNTY from log-space average of BA-Pred pKd + Boltz affinity (filtered by binder_prob ≥ 0.5)
+- **Submission top-5**: Diversity-aware greedy selection — pick by LSCORE desc, accept next only if heavy-atom RMSD ≥ 2Å to all previously selected. Emits MODEL 1..5 blocks in LG file. AFFNTY from log-space ensemble of BA-Pred pKd + Boltz affinity (filtered by binder_prob ≥ 0.5)
+- **Model auto-select**: `prepare_docking_inputs.py` picks cofolding model by mean pLDDT normalised to [0,100] scale (Boltz npz ×100, Protenix scalar, AF3 atom_plddts mean). Critical fix: previously compared Boltz [0,1] vs AF3 [0,100] raw → always picked AF3 even when Boltz was superior
+- **Post-analysis pose staging**: Multi-seed poses staged under `outputs/analysis/poses/{tool}_seed_{N}.sdf` with unique stems to avoid BA-Pred/RMSD-Pred name collisions. PxDock JSON→SDF via `_pxdock_json_to_sdf`. Input SDF excluded (unaligned conformer)
+- **ADG dynamic GPF**: AutoDock-GPU wrapper parses ligand PDBQT at runtime for atom types (F/Cl/Br/P/I/Si support), reads box center from `docking_prep_summary.json` (not compile-time defaults)
 
 ### Cluster Notes
 

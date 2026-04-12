@@ -51,7 +51,7 @@ Orchestrates external ML models (Boltz2/2x, Protenix v2, AlphaFold3), template s
     │  ┌────────┐  ┌─────────────┐  ┌───────────┐│
     │  │  Vina  │  │ AutoDock-GPU│  │Protenix-  ││
     │  │ 5 seeds│  │  5 seeds    │  │ Dock 1x   ││
-    │  │  ~15s  │  │   ~50s      │  │ ~5-30min  ││
+    │  │~2-4min │  │    ~45s     │  │ ~8-9min   ││
     │  └────────┘  └─────────────┘  └───────────┘│
     │                                             │
     │  Track 2+3 (MCS ≥ 0.5 — template receptor):│
@@ -210,14 +210,16 @@ hits = filter_hits_with_ligands(hits_tsv, db_path, target_smiles="CCO")
 
 ### Stage 2: Co-folding
 
-4 models run sequentially on GPU:
+4 models run sequentially on a single GPU, each with 5 seeds × 5 diffusion samples = 25 structures per model (100 structures total):
 
-| Model | Output | Time | Features |
+| Model | Output | Time (25 structs) | Features |
 |-------|--------|------|----------|
-| **Boltz-2** | `outputs/boltz2/` | ~50-140s | Structure + confidence + MSA + **affinity** |
-| **Boltz-2x** | `outputs/boltz2x/` | ~50-140s | Structure + confidence + MSA + **affinity** (with potentials) |
-| **Protenix** | `outputs/protenix/` | ~80-190s | Structure + confidence |
-| **AlphaFold3** | `outputs/alphafold3/` | ~110-130s | Structure + confidence + ranking |
+| **Boltz-2** | `outputs/boltz2/seed_*/` | ~10 min (600-620s) | Structure + confidence + MSA + **affinity** |
+| **Boltz-2x** | `outputs/boltz2x/seed_*/` | ~12 min (680-740s) | Structure + confidence + MSA + **affinity** (with potentials) |
+| **Protenix** | `outputs/protenix/seed_*/` | ~8 min (484-492s) | Structure + confidence |
+| **AlphaFold3** | `outputs/alphafold3/` | ~6 min (353-393s) | Structure + confidence + ranking |
+
+Measured on RTX 6000 Ada with `cofolding_seeds=[42,101,202,303,404]`, `diffusion_samples=5` (averaged over two L2000 CASP16 targets).
 
 **Automatic features:**
 - Affinity auto-enabled when ligand present (`properties.affinity.binder`)
@@ -273,13 +275,13 @@ Runs automatically between cofolding and docking in the wrapper pipeline.
 
 #### Track 1 (always): Cofolding-based docking
 
-| Tool | Type | Time | Output |
+| Tool | Type | Time (all 5 seeds combined) | Output |
 |------|------|------|--------|
-| **Vina** | Python API | ~3s | `outputs/vina/docked.pdbqt` |
-| **AutoDock-GPU** | CUDA GPU | ~10s | `outputs/autodock_gpu/docking.dlg` |
-| **Protenix-Dock** | CPU force field | ~5-30min | `outputs/protenix_dock/docking_results.json` |
+| **Vina** | Python API | ~2-4 min (130-254s) | `outputs/vina/seed_<seed>/docked.pdbqt` |
+| **AutoDock-GPU** | CUDA GPU | ~45s (42s both runs) | `outputs/autodock_gpu/seed_<seed>/docking.dlg` |
+| **Protenix-Dock** | CPU force field | ~8-9 min (459-513s) | `outputs/protenix_dock/*_out.json` (single run, no seed loop) |
 
-Receptor from cofolding best model, box from SwinSite/P2Rank. All tools auto-detect from `docking_prep_summary.json`.
+Receptor from cofolding best model, box from SwinSite/P2Rank. All tools auto-detect from `docking_prep_summary.json` at runtime (including the AutoDock-GPU wrapper, which also parses the ligand PDBQT to emit `ligand_types` / grid maps dynamically — any atom type present in the ligand gets its own map, so ligands with F / Cl / Br / P / I / Si work out of the box).
 
 #### Track 2 (MCS ≥ 0.5): Template-based Box Docking
 
@@ -343,9 +345,14 @@ Output: outputs/ion_placement/ion_placement_summary.json
 
 | Step | Tool | Input | Output |
 |------|------|-------|--------|
-| PDBQT → SDF | meeko `mk_export.py` | Vina/ADG output | `docked.sdf`, `docking.sdf` |
-| Affinity prediction | BA-Pred (GNN) | receptor PDB + ligand SDF | `ba_pred_*.tsv` (pKd, kcal/mol) |
-| Pose RMSD prediction | RMSD-Pred (GNN) | receptor PDB + ligand SDF | `rmsd_pred_*.tsv` (pRMSD, >2Å prob) |
+| Pose staging | `find_ligand_files` | `seed_*/docked.pdbqt`, `seed_*/docking.dlg`, `protenix_dock/*_out.json` | `outputs/analysis/poses/{tool}_seed_{N}{ext}` (+ parallel `.sdf` via meeko) |
+| PxDock JSON → SDF | RDKit + mapped SMILES | Protenix-Dock `ligand.xyz` | `outputs/protenix_dock/poses.sdf` (multi-record) |
+| Affinity prediction | BA-Pred (GNN) | receptor PDB + list of staged SDFs | `ba_pred_<tool>.tsv` (pKd, kcal/mol) |
+| Pose RMSD prediction | RMSD-Pred (GNN) | receptor PDB + list of staged SDFs | `rmsd_pred_<tool>.tsv` (pRMSD, >2Å prob) |
+
+Notes:
+- Pose files are staged under **unique stems** (e.g. `vina_seed_42.sdf`) because BA-Pred/RMSD-Pred name poses as `{basename}_{record_index}` and would otherwise collide across seeds.
+- The **raw input ligand SDF is not run through BA-Pred** — its 3D conformer comes from RDKit's SMILES embedding and is not aligned with the receptor, which makes BA-Pred's 8 Å protein-shell extraction return an empty mol and crash. Docking outputs only.
 
 ### Stage 7: CASP17 LG Submission
 
@@ -478,9 +485,9 @@ experiments/runs/<target>/
 │   ├── protenix/                    # structure + confidence
 │   ├── alphafold3/                  # structure + confidence + ranking
 │   ├── structure_search/            # Foldseek consensus across models
-│   ├── vina/                        # Track 1: docked.pdbqt
-│   ├── autodock_gpu/                # Track 1: docking.dlg
-│   ├── protenix_dock/               # Track 1: docking_results.json
+│   ├── vina/seed_*/                 # Track 1: docked.pdbqt (per docking seed)
+│   ├── autodock_gpu/seed_*/         # Track 1: docking.dlg  (per docking seed)
+│   ├── protenix_dock/               # Track 1: *_out.json + poses.sdf (built by post-analysis)
 │   ├── template_docking/            # Track 2+3 results (if MCS ≥ 0.5)
 │   │   ├── multi_track_summary.json   # aggregated results across all templates
 │   │   └── <pdb_id>/
@@ -536,23 +543,31 @@ uv run casp17-pl-mcp
 
 ## Tested End-to-End Results
 
-Full pipeline test on RTX 6000 Ada (37 min total):
+Full pipeline measured on CASP16 L2000 (cathepsin target, split into L2001 / L2002 sub-runs) using the `casp_submission` config (5 cofolding seeds × 5 samples + 5 docking seeds). Single RTX 6000 Ada per SLURM job, partition `6000ada`. Track 2 / 3 were inactive because no template had `MCS ≥ 0.5`, and no ion entity was present.
 
-| Stage | Time | Status |
-|-------|------|--------|
-| MMseqs2 sequence search | 3s | ✓ |
-| Boltz-2 + affinity | 143s | ✓ |
-| Boltz-2x + affinity | 88s | ✓ |
-| Protenix v1 | 133s | ✓ |
-| Bridge: Boltz MSA → AF3 | <1s | ✓ |
-| AlphaFold3 | 129s | ✓ |
-| Docking prep (P2Rank + auto-select) | 3s | ✓ |
-| Vina | 3s | ✓ |
-| AutoDock-GPU | 10s | ✓ |
-| Protenix-Dock | ~29min | ✓ |
-| Foldseek structure search (4 models) | ~30s | ✓ |
-| BA-Pred (3 docking tools) | ~10s | ✓ |
-| RMSD-Pred (3 docking tools) | ~10s | ✓ |
+| Stage | L2001 (23941) | L2002 (23942) | Status |
+|-------|------:|------:|:--:|
+| Template search (MMseqs2 + ligand filter) | 13s | 3s | ✓ |
+| Boltz-2 (5 seeds × 5 samples) | 622s | 600s | ✓ |
+| Boltz-2x (5 seeds × 5 samples) | 740s | 680s | ✓ |
+| Protenix v2 (5 seeds × 5 samples) | 492s | 484s | ✓ |
+| Bridge: Boltz MSA → AF3 | <1s | <1s | ✓ |
+| AlphaFold3 (25 structures) | 353s | 393s | ✓ |
+| Bridge: Docking prep (auto-select + SwinSite/P2Rank + SMILES→SDF/PDBQT) | <5s | <5s | ✓ |
+| Vina (5 seeds) | 254s | 130s | ✓ |
+| AutoDock-GPU (5 seeds) | 42s | 42s | ✓ |
+| Protenix-Dock (1 run) | 459s | 513s | ✓ |
+| Multi-track docking (Track 2 + 3) | skipped (no MCS≥0.5) | skipped | — |
+| Ion/metal placement | skipped (no ion) | skipped | — |
+| Post-analysis (BA-Pred + RMSD-Pred, 158 poses × 2) | ~1-2 min | ~1-2 min | ✓ |
+| CASP17 LG submission | <5s | <5s | ✓ |
+| **Total wall-clock** (`sacct` elapsed) | **00:53:26** | **00:52:08** | ✓ |
+
+Best-pose selection (both runs) used RMSD-Pred `LSCORE = 1 − P(RMSD > 2Å)`:
+- **L2001**: `vina/vina_seed_42_7`, pKd=4.88, pRMSD=1.04 Å, LSCORE=0.950, AFFNTY=709 nM
+- **L2002**: `vina` pose, pRMSD=2.43 Å, LSCORE=0.851 (updated AFFNTY pending second rerun)
+
+Full run artifacts + slurm logs are preserved under `experiments/runs/archive/2026-04-10_buggy_pipeline/` (first, buggy run) and `experiments/runs/L200{1,2}_input/` (second run with fixed ADG adapter + post-analysis). A detailed incident / fix log lives at `experiments/casp16_test/L2000/DEBUG_LOG.md`.
 
 ## Development
 

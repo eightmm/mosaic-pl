@@ -200,16 +200,35 @@ def find_best_ligand_pose(
     return best[0], best[1]
 
 
-def pose_to_mdl(pose_path: Path, output_mol: Path) -> Path:
-    """Convert ligand pose (PDBQT/DLG/SDF/JSON) to MDL V2000 format."""
+def pose_to_mdl(
+    pose_path: Path,
+    output_mol: Path,
+    pose_index: int | None = None,
+) -> Path:
+    """Convert ligand pose (PDBQT/DLG/SDF/JSON) to MDL V2000 format.
+
+    ``pose_index`` selects a specific record inside a multi-record SDF/PDBQT
+    when the pose selector (``compute_submission_scores``) identifies a pose
+    by name like ``vina_seed_42_3``. When ``None``, the first record is used.
+    """
+    if pose_path is None or str(pose_path) in ("", "."):
+        raise ValueError(
+            f"pose_to_mdl received an empty/unresolved pose path "
+            f"({pose_path!r}). This usually means the pose selector could not "
+            f"locate the staged pose file for the best pose; check "
+            f"outputs/analysis/poses/ and the ba_pred/rmsd_pred TSVs."
+        )
+    if not pose_path.exists():
+        raise FileNotFoundError(f"Pose file does not exist: {pose_path}")
+
     suffix = pose_path.suffix.lower()
 
     if suffix == ".sdf":
-        _sdf_to_mdl(pose_path, output_mol)
+        _sdf_to_mdl(pose_path, output_mol, record_index=pose_index or 0)
         return output_mol
 
     if suffix in (".pdbqt", ".dlg"):
-        _pdbqt_to_mdl(pose_path, output_mol)
+        _pdbqt_to_mdl(pose_path, output_mol, record_index=pose_index or 0)
         return output_mol
 
     if suffix == ".json":
@@ -220,26 +239,35 @@ def pose_to_mdl(pose_path: Path, output_mol: Path) -> Path:
         if sdf_str:
             tmp_sdf = output_mol.with_suffix(".tmp.sdf")
             tmp_sdf.write_text(sdf_str)
-            _sdf_to_mdl(tmp_sdf, output_mol)
+            _sdf_to_mdl(tmp_sdf, output_mol, record_index=0)
             tmp_sdf.unlink(missing_ok=True)
             return output_mol
         raise ValueError(f"Could not extract SDF from {pose_path}")
 
-    raise ValueError(f"Unsupported pose file format: {pose_path}")
+    raise ValueError(
+        f"Unsupported pose file format: suffix={suffix!r} path={pose_path}"
+    )
 
 
-def _sdf_to_mdl(sdf_path: Path, output_mol: Path) -> None:
-    """Extract first mol from SDF and write as MDL V2000."""
+def _sdf_to_mdl(sdf_path: Path, output_mol: Path, record_index: int = 0) -> None:
+    """Extract ``record_index``-th mol from SDF and write as MDL V2000."""
     from rdkit import Chem
     supplier = Chem.SDMolSupplier(str(sdf_path), removeHs=False, sanitize=False)
-    mol = next(supplier)
+    mol = None
+    for i, candidate in enumerate(supplier):
+        if i == record_index:
+            mol = candidate
+            break
     if mol is None:
-        raise ValueError(f"Failed to read SDF: {sdf_path}")
+        raise ValueError(
+            f"Failed to read record {record_index} from SDF: {sdf_path} "
+            f"(supplier had {sum(1 for _ in Chem.SDMolSupplier(str(sdf_path), removeHs=False, sanitize=False))} records)"
+        )
     mol_block = Chem.MolToMolBlock(mol, kekulize=True)
     output_mol.write_text(mol_block)
 
 
-def _pdbqt_to_mdl(pdbqt_path: Path, output_mol: Path) -> None:
+def _pdbqt_to_mdl(pdbqt_path: Path, output_mol: Path, record_index: int = 0) -> None:
     """Convert PDBQT/DLG → MDL via meeko mk_export.py, then clean up."""
     import subprocess
     import sys
@@ -253,7 +281,7 @@ def _pdbqt_to_mdl(pdbqt_path: Path, output_mol: Path) -> None:
                 check=True, capture_output=True, text=True, timeout=60,
             )
             if tmp_sdf.exists():
-                _sdf_to_mdl(tmp_sdf, output_mol)
+                _sdf_to_mdl(tmp_sdf, output_mol, record_index=record_index)
                 tmp_sdf.unlink(missing_ok=True)
                 return
         except Exception:
@@ -266,7 +294,7 @@ def _pdbqt_to_mdl(pdbqt_path: Path, output_mol: Path) -> None:
             check=True, capture_output=True, text=True,
         )
         if tmp_sdf.exists():
-            _sdf_to_mdl(tmp_sdf, output_mol)
+            _sdf_to_mdl(tmp_sdf, output_mol, record_index=record_index)
             tmp_sdf.unlink(missing_ok=True)
             return
     except (FileNotFoundError, subprocess.CalledProcessError):
@@ -280,43 +308,52 @@ def build_lg_submission(
     author: str,
     method: str,
     protein_pdb_lines: list[str],
-    ligand_mdl: str,
+    models: list[dict],
     ligand_number: int,
     ligand_name: str,
-    lscore: float | None = None,
     parent: str = "N/A",
     remark: str = "",
 ) -> str:
-    """Assemble CASP17 LG format submission text."""
+    """Assemble CASP17 LG format submission text (multi-model).
+
+    ``models`` is a list of dicts, each containing at least ``ligand_mdl``
+    (the MDL V2000 text for that model's pose) and optionally ``lscore``.
+    Models are emitted in list order as ``MODEL 1``, ``MODEL 2``, … The
+    protein ATOM block is shared across all models (same cofolding receptor
+    frame), so we only emit it once per MODEL block to stay compatible with
+    the CASP LG parser, which expects a complete PARENT/ATOM/TER/LIGAND set
+    inside each MODEL.
+    """
+    if not models:
+        raise ValueError("build_lg_submission requires at least one model")
+
     lines = [
         "PFRMAT LG",
         f"TARGET {target_id}",
         f"AUTHOR {author}",
         f"METHOD {method}",
         "METHOD -------------",
-        "MODEL 1",
     ]
-    if remark:
-        lines.append(f"REMARK {remark}")
-    lines.append(f"PARENT {parent}")
 
-    # Protein atoms
-    lines.extend(protein_pdb_lines)
+    # Ensure protein has a terminator row we can reuse.
+    protein_block = list(protein_pdb_lines)
+    if not protein_block or not protein_block[-1].startswith("TER"):
+        protein_block.append("TER")
 
-    # Ensure TER present
-    if not protein_pdb_lines or not protein_pdb_lines[-1].startswith("TER"):
-        lines.append("TER")
+    for idx, model in enumerate(models, start=1):
+        lines.append(f"MODEL {idx}")
+        if remark:
+            lines.append(f"REMARK {remark}")
+        lines.append(f"PARENT {parent}")
+        lines.extend(protein_block)
+        lines.append(f"LIGAND {ligand_number:03d} {ligand_name}")
+        if model.get("lscore") is not None:
+            lines.append(f"LSCORE {model['lscore']:.3f}")
 
-    # Ligand block
-    lines.append(f"LIGAND {ligand_number:03d} {ligand_name}")
-    if lscore is not None:
-        lines.append(f"LSCORE {lscore:.3f}")
-
-    # MDL block (strip any trailing newline, ensure M  END)
-    mdl_text = ligand_mdl.rstrip()
-    if not mdl_text.endswith("M  END"):
-        mdl_text += "\nM  END"
-    lines.append(mdl_text)
+        mdl_text = (model.get("ligand_mdl") or "").rstrip()
+        if not mdl_text.endswith("M  END"):
+            mdl_text += "\nM  END"
+        lines.append(mdl_text)
 
     lines.append("END")
     return "\n".join(lines) + "\n"
@@ -327,30 +364,28 @@ def build_lg_submission_with_affinity(
     author: str,
     method: str,
     protein_pdb_lines: list[str],
-    ligand_mdl: str,
+    models: list[dict],
     ligand_number: int,
     ligand_name: str,
-    lscore: float | None = None,
     affinity_nM: float | None = None,
     parent: str = "N/A",
     remark: str = "",
 ) -> str:
-    """Assemble LG submission with optional AFFNTY record."""
+    """Assemble LG submission with optional AFFNTY record (per-complex)."""
     result = build_lg_submission(
         target_id=target_id,
         author=author,
         method=method,
         protein_pdb_lines=protein_pdb_lines,
-        ligand_mdl=ligand_mdl,
+        models=models,
         ligand_number=ligand_number,
         ligand_name=ligand_name,
-        lscore=lscore,
         parent=parent,
         remark=remark,
     )
     if affinity_nM is None:
         return result
-    # Insert AFFNTY before the final END
+    # Insert AFFNTY before the final END (per-complex, not per-MODEL)
     lines = result.rstrip().splitlines()
     if lines[-1] == "END":
         lines.insert(-1, f"AFFNTY {affinity_nM:.3f} aa")
@@ -385,7 +420,11 @@ def main() -> int:
                                  "template", "lig_align"],
                         help="Ligand pose source (default: auto = from scores)")
     parser.add_argument("--lscore", type=float, default=None,
-                        help="Manual LSCORE override [0-1]")
+                        help="Manual LSCORE override for MODEL 1 [0-1]")
+    parser.add_argument("--top-k", type=int, default=5,
+                        help="Number of MODELs to emit (default 5, CASP LG allows 1-5)")
+    parser.add_argument("--diversity-rmsd", type=float, default=2.0,
+                        help="Minimum pairwise heavy-atom RMSD (Å) between MODELs (default 2.0)")
     parser.add_argument("--affinity-nM", type=float, default=None,
                         help="Manual AFFNTY override (Kd in nM)")
     parser.add_argument("--include-affinity", action="store_true",
@@ -420,27 +459,59 @@ def main() -> int:
     protein_lines = extract_pdb_atom_lines(protein_pdb)
     print(f"  Protein atoms: {len(protein_lines)}")
 
-    # 3. Select best ligand pose
-    print(f"\nSelecting ligand pose (source={args.pose_source})...")
-    lscore = args.lscore
+    # 3. Select diverse top-k ligand poses
+    print(f"\nSelecting ligand poses (source={args.pose_source}, top_k={args.top_k}, "
+          f"diversity>={args.diversity_rmsd}Å)...")
 
-    if args.pose_source == "auto" and scores.best_pose and scores.best_pose.pose_file.exists():
-        pose_source = scores.best_pose.source
-        pose_path = scores.best_pose.pose_file
-        if lscore is None and scores.best_pose.lscore is not None:
-            lscore = scores.best_pose.lscore
-        print(f"  Best pose (auto): {pose_source}/{scores.best_pose.pose_name}")
-        print(f"    pKd={scores.best_pose.ba_pred_pkd}, "
-              f"pRMSD={scores.best_pose.rmsd_pred}, LSCORE={lscore}")
+    from compute_submission_scores import select_diverse_top_k, _split_pose_name
+
+    if args.pose_source == "auto":
+        candidate_pool = scores.pose_scores
     else:
-        pose_source, pose_path = find_best_ligand_pose(run_dir, source=args.pose_source)
-        print(f"  Pose source: {pose_source}")
-        print(f"  Pose file: {pose_path}")
+        candidate_pool = [p for p in scores.pose_scores if p.source == args.pose_source]
+        if not candidate_pool:
+            print(f"  WARNING: no poses with source={args.pose_source}, falling back to all sources")
+            candidate_pool = scores.pose_scores
 
-    ligand_mdl_file = workdir / "ligand.mol"
-    pose_to_mdl(pose_path, ligand_mdl_file)
-    ligand_mdl = ligand_mdl_file.read_text()
-    print(f"  MDL block: {len(ligand_mdl.splitlines())} lines")
+    selected = select_diverse_top_k(
+        candidate_pool,
+        k=args.top_k,
+        rmsd_threshold=args.diversity_rmsd,
+    )
+    if not selected:
+        raise RuntimeError(
+            "No poses selected — check that post-analysis TSVs exist and that "
+            "outputs/analysis/poses/ contains the staged pose files."
+        )
+
+    models: list[dict] = []
+    top_sources: list[str] = []
+    for i, pose in enumerate(selected, start=1):
+        _, rec_idx = _split_pose_name(pose.pose_name)
+        pose_path = pose.pose_file
+        mdl_file = workdir / f"ligand_model{i}.mol"
+        pose_to_mdl(pose_path, mdl_file, pose_index=rec_idx)
+        mdl_text = mdl_file.read_text()
+        model_lscore = pose.lscore
+        if i == 1 and args.lscore is not None:
+            model_lscore = args.lscore  # user override applies to MODEL 1 only
+        models.append({
+            "ligand_mdl": mdl_text,
+            "lscore": model_lscore,
+            "source": pose.source,
+            "pose_name": pose.pose_name,
+            "ba_pred_pkd": pose.ba_pred_pkd,
+            "rmsd_pred": pose.rmsd_pred,
+        })
+        top_sources.append(pose.source)
+        print(f"  MODEL {i}: {pose.source}/{pose.pose_name} "
+              f"pKd={pose.ba_pred_pkd} pRMSD={pose.rmsd_pred} LSCORE={model_lscore}")
+        print(f"           file={pose_path} record={rec_idx} mdl_lines={len(mdl_text.splitlines())}")
+
+    if len(selected) < args.top_k:
+        print(f"  NOTE: only {len(selected)} of {args.top_k} MODELs satisfy the "
+              f"diversity threshold (>= {args.diversity_rmsd}Å). Submission has "
+              f"{len(selected)} MODELs.")
 
     # 4. Affinity
     affinity_nM = args.affinity_nM
@@ -450,18 +521,18 @@ def main() -> int:
               f"(log10={scores.ensemble_log_kd_nM:.3f})")
 
     # 5. Assemble LG submission
-    method_full = f"{args.method} [protein={protein_model}, pose={pose_source}]"
-    remark = args.remark or f"{protein_model} + {pose_source}"
+    source_tag = "+".join(dict.fromkeys(top_sources)) or "auto"
+    method_full = f"{args.method} [protein={protein_model}, pose={source_tag}, top{len(selected)}]"
+    remark = args.remark or f"{protein_model} + {source_tag} (top-{len(selected)})"
 
     submission = build_lg_submission_with_affinity(
         target_id=args.target_id,
         author=args.author,
         method=method_full,
         protein_pdb_lines=protein_lines,
-        ligand_mdl=ligand_mdl,
+        models=models,
         ligand_number=args.ligand_number,
         ligand_name=args.ligand_name,
-        lscore=lscore,
         affinity_nM=affinity_nM,
         parent=args.parent,
         remark=remark,
@@ -472,8 +543,11 @@ def main() -> int:
     print(f"  LG submission written: {args.output}")
     print(f"  Size: {len(submission):,} bytes")
     print(f"  Lines: {len(submission.splitlines()):,}")
-    if lscore is not None:
-        print(f"  LSCORE: {lscore:.3f}")
+    print(f"  MODELs: {len(models)}")
+    for i, m in enumerate(models, start=1):
+        sc = m["lscore"]
+        sc_txt = f"{sc:.3f}" if sc is not None else "N/A"
+        print(f"    MODEL {i}: {m['source']}/{m['pose_name']} LSCORE={sc_txt}")
     if affinity_nM is not None:
         print(f"  AFFNTY: {affinity_nM:.3g} nM")
     print(f"{'='*60}")

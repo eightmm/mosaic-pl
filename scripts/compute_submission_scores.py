@@ -192,12 +192,20 @@ def collect_boltz_affinities(run_dir: Path) -> list[BoltzAffinity]:
 
 
 def collect_pose_scores(run_dir: Path) -> list[PoseScore]:
-    """Collect all pose scores from BA-Pred and RMSD-Pred TSVs."""
+    """Collect all pose scores from BA-Pred and RMSD-Pred TSVs.
+
+    Each PoseScore is resolved to the concrete staged file that contains that
+    specific pose, plus a record index. ``run_post_analysis.py`` stages every
+    docked input under ``outputs/analysis/poses/{stem}.sdf`` (one SDF per
+    original pose source, e.g. ``vina_seed_42.sdf``) and BA-Pred/RMSD-Pred
+    name poses as ``{stem}_{record_index}``, so the pose_name alone is enough
+    to recover both the file and the record.
+    """
     analysis_dir = run_dir / "outputs" / "analysis"
     if not analysis_dir.exists():
         return []
 
-    # Map docking tool name → (ba_pred tsv, rmsd_pred tsv, pose file)
+    # Map docking tool name → (ba_pred tsv, rmsd_pred tsv)
     tool_files: dict[str, dict[str, Path]] = {}
     for ba_tsv in analysis_dir.glob("ba_pred_*.tsv"):
         key = ba_tsv.stem.replace("ba_pred_", "")
@@ -211,16 +219,14 @@ def collect_pose_scores(run_dir: Path) -> list[PoseScore]:
         ba_data = parse_ba_pred_tsv(files.get("ba", Path())) if "ba" in files else {}
         rmsd_data = parse_rmsd_pred_tsv(files.get("rmsd", Path())) if "rmsd" in files else {}
 
-        # Find the corresponding pose file
-        pose_file = _find_pose_file(run_dir, tool)
-
         all_names = set(ba_data.keys()) | set(rmsd_data.keys())
         for name in sorted(all_names):
             ba = ba_data.get(name)
             rmsd_info = rmsd_data.get(name, (None, None))
+            pose_file = _resolve_pose_file(run_dir, tool, name) or Path("")
             pose_scores.append(PoseScore(
                 source=tool,
-                pose_file=pose_file or Path(""),
+                pose_file=pose_file,
                 pose_name=name,
                 ba_pred_pkd=ba,
                 rmsd_pred=rmsd_info[0],
@@ -230,21 +236,52 @@ def collect_pose_scores(run_dir: Path) -> list[PoseScore]:
     return pose_scores
 
 
-def _find_pose_file(run_dir: Path, tool: str) -> Path | None:
-    """Locate the docked pose file for a given tool name."""
-    candidates = [
+def _split_pose_name(pose_name: str) -> tuple[str, int | None]:
+    """Split ``{stem}_{index}`` into ``(stem, index)``. Returns (name, None) if
+    no trailing ``_<digits>`` suffix is present."""
+    if "_" not in pose_name:
+        return pose_name, None
+    stem, _, tail = pose_name.rpartition("_")
+    if tail.isdigit():
+        return stem, int(tail)
+    return pose_name, None
+
+
+def _resolve_pose_file(run_dir: Path, tool: str, pose_name: str) -> Path | None:
+    """Find the concrete file that contains the pose named ``pose_name``.
+
+    Prefers the staged SDFs written by ``run_post_analysis.py`` under
+    ``outputs/analysis/poses/``. Falls back to legacy flat layouts for
+    backwards compatibility with older runs.
+    """
+    stem, _ = _split_pose_name(pose_name)
+    staged_dir = run_dir / "outputs" / "analysis" / "poses"
+
+    # Preferred: staged SDF matching the pose stem exactly
+    candidate = staged_dir / f"{stem}.sdf"
+    if candidate.exists():
+        return candidate
+    # Same stem but original format
+    for ext in (".pdbqt", ".dlg", ".mol2"):
+        c = staged_dir / f"{stem}{ext}"
+        if c.exists():
+            return c
+
+    # Protenix-Dock multi-record SDF (one file, many poses)
+    pxdock_sdf = run_dir / "outputs" / "protenix_dock" / "poses.sdf"
+    if tool == "protenix_dock" and pxdock_sdf.exists():
+        return pxdock_sdf
+
+    # Legacy flat layouts (single-seed pipelines before multi-seed refactor)
+    legacy = [
         run_dir / "outputs" / tool / "docked.sdf",
         run_dir / "outputs" / tool / "docked.pdbqt",
         run_dir / "outputs" / tool / "docking.sdf",
         run_dir / "outputs" / tool / "docking.dlg",
     ]
-    for c in candidates:
+    for c in legacy:
         if c.exists():
             return c
-    # Fallback: search
-    for ext in (".sdf", ".pdbqt", ".dlg"):
-        for f in (run_dir / "outputs").rglob(f"*{tool}*{ext}"):
-            return f
     return None
 
 
@@ -258,6 +295,162 @@ def select_best_pose(poses: list[PoseScore]) -> PoseScore | None:
             return poses[0] if poses else None
         return max(scored, key=lambda p: p.ba_pred_pkd or 0)
     return max(scored, key=lambda p: p.lscore or 0)
+
+
+def _load_pose_mol(pose: "PoseScore", mol_cache: dict):
+    """Load the RDKit Mol for a specific pose (file + record index), with caching.
+
+    Returns ``None`` if the pose file is missing or cannot be parsed. All poses
+    live as records inside a single staged SDF (``analysis/poses/{stem}.sdf``)
+    or inside ``protenix_dock/poses.sdf``; we advance the SDMolSupplier to the
+    correct record and keep the Mol in a per-call cache so repeated accesses
+    during greedy selection are free.
+    """
+    from rdkit import Chem  # type: ignore
+
+    if not pose.pose_file or str(pose.pose_file) in ("", "."):
+        return None
+    if not pose.pose_file.exists():
+        return None
+
+    stem, rec_idx = _split_pose_name(pose.pose_name)
+    if rec_idx is None:
+        rec_idx = 0
+
+    cache_key = (str(pose.pose_file), rec_idx)
+    if cache_key in mol_cache:
+        return mol_cache[cache_key]
+
+    suffix = pose.pose_file.suffix.lower()
+    source_path = pose.pose_file
+    if suffix in (".pdbqt", ".dlg"):
+        # Staging produces a parallel .sdf for every pdbqt/dlg; prefer that.
+        sdf_sibling = pose.pose_file.with_suffix(".sdf")
+        if sdf_sibling.exists():
+            source_path = sdf_sibling
+
+    def _read(sanitize: bool):
+        try:
+            supplier = Chem.SDMolSupplier(str(source_path), removeHs=True, sanitize=sanitize)
+            for i, m in enumerate(supplier):
+                if i == rec_idx:
+                    return m
+        except Exception:
+            pass
+        return None
+
+    mol = _read(sanitize=True)
+    if mol is None:
+        mol = _read(sanitize=False)
+
+    # Sanitized mols allow RDKit's CalcRMS/GetSubstructMatch to work across
+    # pose sources with different atom orderings (e.g. meeko vs PxDock).
+    mol_cache[cache_key] = mol
+    return mol
+
+
+def _pose_pair_rmsd(mol_a, mol_b) -> float | None:
+    """Heavy-atom RMSD between two pose conformers *in the same frame*.
+
+    Poses come from docking tools that all use the receptor coordinate frame,
+    so we do not re-align — this is the raw positional difference. RDKit's
+    ``rdMolAlign.CalcRMS`` handles symmetry-equivalent atoms by trying
+    substructure matches. If the two mols have different atom counts (which
+    should not happen for the same ligand) we return ``None``.
+    """
+    if mol_a is None or mol_b is None:
+        return None
+    if mol_a.GetNumAtoms() != mol_b.GetNumAtoms():
+        return None
+    try:
+        from rdkit.Chem import rdMolAlign  # type: ignore
+        return float(rdMolAlign.CalcRMS(mol_a, mol_b))
+    except Exception:
+        # Fallback: direct atom-index RMSD (no symmetry correction)
+        try:
+            ca = mol_a.GetConformer()
+            cb = mol_b.GetConformer()
+            n = mol_a.GetNumAtoms()
+            s = 0.0
+            for i in range(n):
+                pa = ca.GetAtomPosition(i)
+                pb = cb.GetAtomPosition(i)
+                s += (pa.x - pb.x) ** 2 + (pa.y - pb.y) ** 2 + (pa.z - pb.z) ** 2
+            return (s / n) ** 0.5
+        except Exception:
+            return None
+
+
+def select_diverse_top_k(
+    poses: list[PoseScore],
+    k: int = 5,
+    rmsd_threshold: float = 2.0,
+) -> list[PoseScore]:
+    """Greedy diversity-aware top-k selection.
+
+    Algorithm:
+        1. Keep only poses with a usable LSCORE.
+        2. Sort by LSCORE descending.
+        3. Start with the top-1 pose.
+        4. Walk the sorted list; accept the next candidate only if its
+           heavy-atom RMSD to every already-selected pose is ``>= rmsd_threshold``.
+        5. Stop when ``k`` poses are selected or no candidate satisfies the
+           constraint.
+
+    If fewer than ``k`` diverse poses exist, the list is shorter than ``k``.
+    If no LSCOREs are available, falls back to BA-Pred pKd ordering (diversity
+    check still applied) so a submission can still be built from partial data.
+    """
+    if k <= 0:
+        return []
+
+    scorer = lambda p: p.lscore
+    scored = [p for p in poses if p.lscore is not None]
+    if not scored:
+        scorer = lambda p: p.ba_pred_pkd
+        scored = [p for p in poses if p.ba_pred_pkd is not None]
+    if not scored:
+        return poses[:k]
+
+    ordered = sorted(scored, key=lambda p: scorer(p) or 0.0, reverse=True)
+
+    mol_cache: dict = {}
+    selected: list[PoseScore] = []
+    selected_mols: list = []
+
+    for cand in ordered:
+        cand_mol = _load_pose_mol(cand, mol_cache)
+        # If we cannot load a mol for diversity checking, still allow the first
+        # pick so we never return an empty list when data exists.
+        if not selected:
+            selected.append(cand)
+            selected_mols.append(cand_mol)
+            if len(selected) == k:
+                break
+            continue
+
+        if cand_mol is None:
+            # Cannot verify diversity, skip defensively.
+            continue
+
+        too_close = False
+        for prev_mol in selected_mols:
+            if prev_mol is None:
+                continue
+            r = _pose_pair_rmsd(cand_mol, prev_mol)
+            if r is None:
+                continue
+            if r < rmsd_threshold:
+                too_close = True
+                break
+
+        if not too_close:
+            selected.append(cand)
+            selected_mols.append(cand_mol)
+            if len(selected) == k:
+                break
+
+    return selected
 
 
 def ensemble_affinity(

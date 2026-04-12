@@ -178,22 +178,39 @@ def find_best_cofolding_structure(cofolding_dir: Path, model: str) -> Path | Non
 
 
 def read_confidence_score(cofolding_dir: Path, model: str) -> float:
-    """Read average confidence score from cofolding output."""
+    """Read mean per-residue/atom pLDDT, normalised to the ``[0, 100]`` scale.
+
+    Each cofolding backend stores pLDDT differently:
+      * **Boltz-2 / Boltz-2x** write a per-residue array in ``plddt_*.npz`` on
+        the ``[0, 1]`` scale. We multiply by 100 so it is comparable with AF3.
+      * **Protenix v2** writes a scalar mean pLDDT already on ``[0, 100]``
+        inside the per-sample ``confidences.json`` (``"plddt": <float>``).
+        The earlier version of this function called ``sum(float)`` on that
+        scalar and fell through to the exception handler, returning ``-1`` —
+        the bug that made Protenix invisible to the auto-selector.
+      * **AlphaFold3** writes a ``"atom_plddts"`` list already on ``[0, 100]``.
+    """
     try:
         if model.startswith("boltz"):
+            import numpy as np
             for npz in cofolding_dir.rglob("plddt_*model_0.npz"):
-                import numpy as np
                 data = np.load(str(npz))
-                return float(data[data.files[0]].mean())
+                return float(data[data.files[0]].mean()) * 100.0
         elif model == "protenix":
             for json_f in cofolding_dir.rglob("*confidence*.json"):
                 data = json.loads(json_f.read_text())
                 if "plddt" in data:
-                    return float(sum(data["plddt"]) / len(data["plddt"]))
+                    val = data["plddt"]
+                    if isinstance(val, (list, tuple)) and val:
+                        return float(sum(val) / len(val))
+                    if isinstance(val, (int, float)):
+                        return float(val)
         elif model == "alphafold3":
             for json_f in cofolding_dir.rglob("*confidence*.json"):
+                if "summary" in json_f.name:
+                    continue
                 data = json.loads(json_f.read_text())
-                if "atom_plddts" in data:
+                if "atom_plddts" in data and data["atom_plddts"]:
                     return float(sum(data["atom_plddts"]) / len(data["atom_plddts"]))
     except Exception:
         pass

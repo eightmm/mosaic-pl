@@ -18,30 +18,142 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+
+def _stage_pose_file(src: Path, staged_dir: Path, stem: str) -> Path | None:
+    """Copy a docked pose file to ``staged_dir`` with a unique stem and, when
+    possible, convert it to SDF alongside the original.
+
+    BA-Pred/RMSD-Pred name each pose ``{base_stem}_{index}``, so if we pass a
+    ``.txt`` list of files that all have the same basename (``docked.pdbqt``),
+    the emitted TSVs have name collisions. Staging each file under a unique
+    stem fixes this, and producing a parallel ``{stem}.sdf`` lets downstream
+    pose-extraction code (``make_casp_submission.py``) load any selected pose
+    by its canonical name without caring about the original format.
+
+    Returns the preferred representative for downstream tools: the SDF if the
+    conversion succeeded, otherwise the original staged file.
+    """
+    if not src.exists():
+        return None
+    dst_orig = staged_dir / f"{stem}{src.suffix}"
+    if dst_orig.resolve() != src.resolve():
+        shutil.copyfile(src, dst_orig)
+    dst_sdf = staged_dir / f"{stem}.sdf"
+    if not dst_sdf.exists():
+        _pdbqt_to_sdf(dst_orig, dst_sdf)
+    return dst_sdf if dst_sdf.exists() else dst_orig
 
 
 def _pdbqt_to_sdf(pdbqt_path: Path, sdf_path: Path) -> Path | None:
     """Convert PDBQT/DLG to SDF using meeko mk_export.py CLI."""
     mk_export = Path(sys.executable).parent / "mk_export.py"
     if not mk_export.exists():
-        print(f"    mk_export.py not found at {mk_export}")
         return None
     try:
-        result = subprocess.run(
+        subprocess.run(
             [str(mk_export), str(pdbqt_path), "-s", str(sdf_path)],
             capture_output=True, text=True, timeout=60,
         )
         if sdf_path.exists() and sdf_path.stat().st_size > 0:
-            print(f"    Converted {pdbqt_path.name} → {sdf_path.name}")
             return sdf_path
-        print(f"    mk_export produced empty output: {result.stderr[-200:]}")
         return None
+    except Exception:
+        return None
+
+
+def _write_list_file(paths: list[Path], list_path: Path) -> Path | None:
+    if not paths:
+        return None
+    list_path.write_text("\n".join(str(p) for p in paths) + "\n")
+    return list_path
+
+
+def _pxdock_json_to_sdf(json_path: Path, sdf_path: Path) -> Path | None:
+    """Convert a Protenix-Dock ``*_out.json`` pose file to a multi-pose SDF.
+
+    The JSON stores an atom-mapped SMILES plus per-pose Cartesian coordinates.
+    We build an RDKit Mol from the mapped SMILES, re-order atoms to match the
+    mapping indices, then stamp each pose's xyz onto a conformer and write
+    them out as a multi-record SDF.
+    """
+    try:
+        from rdkit import Chem  # type: ignore
+        from rdkit.Chem import AllChem  # noqa: F401  (needed for conformer ops)
+    except Exception as e:  # pragma: no cover - optional dep path
+        print(f"    protenix_dock: rdkit unavailable ({e}), skipping SDF conversion")
+        return None
+
+    try:
+        data = json.loads(json_path.read_text())
     except Exception as e:
-        print(f"    mk_export failed: {e}")
+        print(f"    protenix_dock: failed to parse {json_path.name}: {e}")
         return None
+
+    smiles = data.get("mapped_smiles")
+    poses = data.get("poses") or []
+    if not smiles or not poses:
+        print(f"    protenix_dock: {json_path.name} missing mapped_smiles or poses")
+        return None
+
+    template = Chem.MolFromSmiles(smiles)
+    if template is None:
+        print(f"    protenix_dock: rdkit failed to parse mapped_smiles")
+        return None
+    template = Chem.AddHs(template)
+
+    # Atom index from the mapped SMILES (:N) → RDKit atom index.
+    map_to_idx: dict[int, int] = {}
+    for atom in template.GetAtoms():
+        m = atom.GetAtomMapNum()
+        if m > 0:
+            map_to_idx[m] = atom.GetIdx()
+    if not map_to_idx:
+        print(f"    protenix_dock: mapped_smiles has no atom maps")
+        return None
+
+    # Build a stable ordering for xyz assignment. The JSON's ligand.xyz array
+    # is stored in atom-map order (1..N).
+    ordered_indices = [map_to_idx[k] for k in sorted(map_to_idx.keys())]
+    n_atoms = template.GetNumAtoms()
+
+    writer = Chem.SDWriter(str(sdf_path))
+    written = 0
+    for i, pose in enumerate(poses):
+        xyz = pose.get("ligand", {}).get("xyz")
+        if not xyz or len(xyz) < len(ordered_indices):
+            continue
+        conf = Chem.Conformer(n_atoms)
+        # Initialize all atoms to origin, then overlay mapped atoms.
+        for j in range(n_atoms):
+            conf.SetAtomPosition(j, (0.0, 0.0, 0.0))
+        for pos_i, atom_idx in enumerate(ordered_indices):
+            x, y, z = xyz[pos_i]
+            conf.SetAtomPosition(atom_idx, (float(x), float(y), float(z)))
+        mol = Chem.Mol(template)
+        mol.RemoveAllConformers()
+        mol.AddConformer(conf, assignId=True)
+        mol.SetProp("_Name", f"pxdock_pose_{i}")
+        pscore = pose.get("pscore")
+        if pscore is not None:
+            mol.SetProp("pxdock_pscore", str(pscore))
+        writer.write(mol)
+        written += 1
+    writer.close()
+
+    if written == 0:
+        print(f"    protenix_dock: no poses converted from {json_path.name}")
+        try:
+            sdf_path.unlink()
+        except OSError:
+            pass
+        return None
+    print(f"    protenix_dock: converted {written} poses → {sdf_path.name}")
+    return sdf_path
 
 
 def find_receptor_pdbs(run_dir: Path) -> dict[str, Path]:
@@ -68,38 +180,71 @@ def find_receptor_pdbs(run_dir: Path) -> dict[str, Path]:
 
 
 def find_ligand_files(run_dir: Path) -> dict[str, Path]:
-    """Find ligand files from docking outputs."""
+    """Collect docked-pose ligand files per tool, across all docking seeds.
+
+    Returns a mapping ``tool_key -> pose_input`` where ``pose_input`` is either
+    a concrete pose file (SDF/DLG/PDBQT) or a ``.txt`` list of per-seed staged
+    poses. BA-Pred and RMSD-Pred both accept all of these formats.
+
+    The raw input SDF (``inputs/docking/ligand_*.sdf``) is intentionally
+    excluded: its conformer comes from RDKit's SMILES embedding and is not
+    aligned with the receptor, which makes BA-Pred's 8Å protein-context
+    extraction return an empty mol and crash. Docking outputs only.
+    """
     ligands: dict[str, Path] = {}
+    analysis_dir = run_dir / "outputs" / "analysis"
+    staged_dir = analysis_dir / "poses"
+    staged_dir.mkdir(parents=True, exist_ok=True)
 
-    # Docking prep SDF (3D from SMILES)
-    for sdf in (run_dir / "inputs" / "docking").glob("ligand_*.sdf"):
-        ligands["input_sdf"] = sdf
-        break
+    # --- Vina: multi-seed PDBQT -> staged txt list ---
+    vina_seed_poses: list[Path] = []
+    for seed_dir in sorted((run_dir / "outputs" / "vina").glob("seed_*")):
+        pdbqt = seed_dir / "docked.pdbqt"
+        staged = _stage_pose_file(pdbqt, staged_dir, f"vina_{seed_dir.name}")
+        if staged is not None:
+            vina_seed_poses.append(staged)
+    # Flat layout fallback (single-seed legacy)
+    if not vina_seed_poses:
+        flat = run_dir / "outputs" / "vina" / "docked.pdbqt"
+        staged = _stage_pose_file(flat, staged_dir, "vina_flat")
+        if staged is not None:
+            vina_seed_poses.append(staged)
+    if vina_seed_poses:
+        lst = _write_list_file(vina_seed_poses, analysis_dir / "vina_poses.txt")
+        if lst is not None:
+            ligands["vina"] = lst
 
-    # Vina docked poses → convert PDBQT to SDF via meeko
-    vina_pdbqt = run_dir / "outputs" / "vina" / "docked.pdbqt"
-    if vina_pdbqt.exists():
-        vina_sdf = run_dir / "outputs" / "vina" / "docked.sdf"
-        if not vina_sdf.exists():
-            vina_sdf = _pdbqt_to_sdf(vina_pdbqt, vina_sdf)
-        if vina_sdf and vina_sdf.exists():
-            ligands["vina"] = vina_sdf
+    # --- AutoDock-GPU: multi-seed DLG -> staged txt list ---
+    adg_seed_poses: list[Path] = []
+    for seed_dir in sorted((run_dir / "outputs" / "autodock_gpu").glob("seed_*")):
+        dlg = seed_dir / "docking.dlg"
+        staged = _stage_pose_file(dlg, staged_dir, f"autodock_gpu_{seed_dir.name}")
+        if staged is not None:
+            adg_seed_poses.append(staged)
+    if not adg_seed_poses:
+        flat = run_dir / "outputs" / "autodock_gpu" / "docking.dlg"
+        staged = _stage_pose_file(flat, staged_dir, "autodock_gpu_flat")
+        if staged is not None:
+            adg_seed_poses.append(staged)
+    if adg_seed_poses:
+        lst = _write_list_file(adg_seed_poses, analysis_dir / "autodock_gpu_poses.txt")
+        if lst is not None:
+            ligands["autodock_gpu"] = lst
 
-    # AutoDock-GPU DLG → convert to SDF via meeko
-    adg_dlg = run_dir / "outputs" / "autodock_gpu" / "docking.dlg"
-    if adg_dlg.exists():
-        adg_sdf = run_dir / "outputs" / "autodock_gpu" / "docking.sdf"
-        if not adg_sdf.exists():
-            adg_sdf = _pdbqt_to_sdf(adg_dlg, adg_sdf)
-        if adg_sdf and adg_sdf.exists():
-            ligands["autodock_gpu"] = adg_sdf
+    # --- Protenix-Dock: JSON -> multi-record SDF ---
+    pxdock_dir = run_dir / "outputs" / "protenix_dock"
+    if pxdock_dir.exists():
+        # Prefer any pre-existing SDF if PxDock ever emits one.
+        existing_sdf = next(pxdock_dir.rglob("*.sdf"), None)
+        if existing_sdf is not None:
+            ligands["protenix_dock"] = existing_sdf
         else:
-            ligands["autodock_gpu"] = adg_dlg
-
-    # Protenix-Dock SDF results
-    for sdf in (run_dir / "outputs" / "protenix_dock").rglob("*.sdf"):
-        ligands["protenix_dock"] = sdf
-        break
+            out_json = next((p for p in pxdock_dir.glob("*_out.json")), None)
+            if out_json is not None:
+                sdf_path = pxdock_dir / "poses.sdf"
+                converted = _pxdock_json_to_sdf(out_json, sdf_path)
+                if converted is not None:
+                    ligands["protenix_dock"] = converted
 
     return ligands
 

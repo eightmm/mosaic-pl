@@ -833,10 +833,9 @@ def test_build_lg_submission_basic() -> None:
         author="0123-4567-8901",
         method="test method",
         protein_pdb_lines=protein_lines,
-        ligand_mdl=mdl,
+        models=[{"ligand_mdl": mdl, "lscore": 0.82}],
         ligand_number=1,
         ligand_name="761",
-        lscore=0.82,
         parent="1CGH",
     )
 
@@ -861,7 +860,7 @@ def test_build_lg_submission_no_lscore() -> None:
         author="0000-0000-0000",
         method="test",
         protein_pdb_lines=["ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 50.00", "TER"],
-        ligand_mdl="test\n\n 0  0  0  0  0  0  0  0  0  0999 V2000\nM  END",
+        models=[{"ligand_mdl": "test\n\n 0  0  0  0  0  0  0  0  0  0999 V2000\nM  END", "lscore": None}],
         ligand_number=2,
         ligand_name="380",
     )
@@ -880,7 +879,7 @@ def test_build_lg_submission_auto_appends_ter() -> None:
         author="A",
         method="M",
         protein_pdb_lines=["ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 50.00"],
-        ligand_mdl="     RDKit          3D\n\n 0  0  0  0  0  0  0  0  0  0999 V2000\nM  END",
+        models=[{"ligand_mdl": "     RDKit          3D\n\n 0  0  0  0  0  0  0  0  0  0999 V2000\nM  END", "lscore": None}],
         ligand_number=1,
         ligand_name="X",
     )
@@ -898,10 +897,9 @@ def test_build_lg_submission_with_affinity() -> None:
         author="0000-0000-0000",
         method="test",
         protein_pdb_lines=["ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 50.00", "TER"],
-        ligand_mdl="test\n\n 0  0  0  0  0  0  0  0  0  0999 V2000\nM  END",
+        models=[{"ligand_mdl": "test\n\n 0  0  0  0  0  0  0  0  0  0999 V2000\nM  END", "lscore": 0.85}],
         ligand_number=1,
         ligand_name="761",
-        lscore=0.85,
         affinity_nM=12.5,
     )
     assert "LSCORE 0.850" in result
@@ -923,10 +921,9 @@ def test_build_lg_submission_without_affinity_still_works() -> None:
         author="0000-0000-0000",
         method="test",
         protein_pdb_lines=["ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 50.00", "TER"],
-        ligand_mdl="test\n\n 0  0  0  0  0  0  0  0  0  0999 V2000\nM  END",
+        models=[{"ligand_mdl": "test\n\n 0  0  0  0  0  0  0  0  0  0999 V2000\nM  END", "lscore": 0.85}],
         ligand_number=1,
         ligand_name="761",
-        lscore=0.85,
         affinity_nM=None,  # Pose-only task
     )
     assert "LSCORE 0.850" in result
