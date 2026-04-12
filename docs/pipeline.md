@@ -884,11 +884,16 @@ graph TB
         RCSBDB["rcsb_index.db\n251k PDBs, 2.5M ligands"]
     end
 
+    subgraph HUB[".venv (hub)"]
+        HUBPY["Py3.12\ngemmi + rdkit\nlig_align (Track 3)"]
+    end
+
     BOLTZ ---|"Boltz-2/2x"| COFOLDING["Co-folding"]
     PROTENIX --- COFOLDING
     AF3 --- COFOLDING
-    PXDOCK ---|"PxDock + Vina"| DOCKING["Docking"]
+    PXDOCK ---|"PxDock + Vina + meeko"| DOCKING["Docking"]
     PRED ---|"BA-Pred + RMSD-Pred + SwinSite"| ANALYSIS["Analysis"]
+    HUBPY ---|"lig_align + align_cofolding + submission"| PIPELINE["Pipeline Bridges"]
     MMSEQS --- SEARCH["Search"]
     FOLDSEEK --- SEARCH
     ADGPU --- DOCKING
