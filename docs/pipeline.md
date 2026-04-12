@@ -24,7 +24,7 @@ flowchart TB
     end
 
     subgraph S4["4. Docking Prep"]
-        E1["Best Model (_aligned)\n+ Binding Site\n(cofolding > SwinSite > P2Rank)\n+ File Conversion"]
+        E1["Best Model (_aligned)\n+ Binding Site\n(cofolding > SwinSite > P2Rank > ligand)\n+ File Conversion"]
     end
 
     subgraph S5["5. Docking"]
@@ -59,6 +59,7 @@ flowchart TB
     S1 -->|"template CIF as\nalignment ref"| S25
     S25 --> S3
     S25 --> S4 --> T1
+    %% S3 (Foldseek) and S4 (Docking Prep) run independently from aligned CIFs
     S1 -->|"MCS >= 0.5"| T23
     S1 -->|"ion in input"| S55
     S25 --> S55
@@ -494,7 +495,7 @@ flowchart TB
 
 | Track | Receptor | Box Source | Method | 조건 |
 |-------|----------|-----------|--------|------|
-| Track 1 | Cofolding best model | SwinSite > P2Rank | Vina + ADG + PxDock | 항상 |
+| Track 1 | Cofolding best model (_aligned) | Cofolding centroid > SwinSite > P2Rank | Vina + ADG + PxDock | 항상 |
 | Track 2 | Template PDB (RCSB) | Template ligand centroid | Vina + ADG + PxDock | MCS >= 0.5 |
 | Track 3 | Template PDB (RCSB) | MCS anchor alignment | lig-align | MCS >= 0.5 |
 
