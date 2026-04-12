@@ -159,19 +159,32 @@ def pdb_to_pdbqt(pdb_path: Path, output_path: Path) -> Path:
 
 
 def find_best_cofolding_structure(cofolding_dir: Path, model: str) -> Path | None:
-    """Find the best-ranked structure from cofolding output."""
-    if model.startswith("boltz"):
-        for cif in sorted(cofolding_dir.rglob("predictions/**/*.cif")):
-            return cif
-    elif model == "protenix":
-        for cif in sorted(cofolding_dir.rglob("*.cif")):
-            return cif
-    elif model == "alphafold3":
-        for cif in sorted(cofolding_dir.rglob("*model*.cif")):
-            return cif
+    """Find the best-ranked structure from cofolding output.
 
-    for cif in sorted(cofolding_dir.rglob("*.cif")):
-        return cif
+    Prefers ``_aligned.cif`` (produced by ``align_cofolding_outputs.py``) over
+    the raw CIF so that downstream stages work in the common reference frame.
+    """
+    def _prefer_aligned(cifs: list[Path]) -> Path | None:
+        for cif in cifs:
+            aligned = cif.with_name(cif.stem + "_aligned.cif")
+            if aligned.exists():
+                return aligned
+            return cif
+        return None
+
+    if model.startswith("boltz"):
+        return _prefer_aligned(sorted(cofolding_dir.rglob("predictions/**/*.cif")))
+    elif model == "protenix":
+        raw = [c for c in sorted(cofolding_dir.rglob("*.cif")) if "_aligned" not in c.name]
+        return _prefer_aligned(raw)
+    elif model == "alphafold3":
+        raw = [c for c in sorted(cofolding_dir.rglob("*model*.cif")) if "_aligned" not in c.name]
+        return _prefer_aligned(raw)
+
+    raw = [c for c in sorted(cofolding_dir.rglob("*.cif")) if "_aligned" not in c.name]
+    result = _prefer_aligned(raw)
+    if result:
+        return result
     for pdb in sorted(cofolding_dir.rglob("*.pdb")):
         return pdb
     return None

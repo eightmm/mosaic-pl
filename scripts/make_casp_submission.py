@@ -30,7 +30,22 @@ from pathlib import Path
 
 
 def find_best_cofolding_cif(run_dir: Path, preferred: str | None = None) -> tuple[str, Path]:
-    """Find best cofolding CIF, preferring specified model or using pLDDT ranking."""
+    """Find best cofolding CIF, preferring ``_aligned.cif`` and pLDDT ranking."""
+
+    def _first_cif(model_dir: Path, model: str) -> Path | None:
+        if model.startswith("boltz"):
+            raw = sorted(model_dir.rglob("predictions/**/*.cif"))
+        elif model == "protenix":
+            raw = sorted(c for c in model_dir.rglob("*.cif") if "_aligned" not in c.name)
+        elif model == "alphafold3":
+            raw = sorted(c for c in model_dir.rglob("*model*.cif") if "_aligned" not in c.name)
+        else:
+            raw = sorted(c for c in model_dir.rglob("*.cif") if "_aligned" not in c.name)
+        for cif in raw:
+            aligned = cif.with_name(cif.stem + "_aligned.cif")
+            return aligned if aligned.exists() else cif
+        return None
+
     candidates = []
     for model in ("boltz2x", "boltz2", "protenix", "alphafold3"):
         if preferred and model != preferred:
@@ -38,22 +53,10 @@ def find_best_cofolding_cif(run_dir: Path, preferred: str | None = None) -> tupl
         model_dir = run_dir / "outputs" / model
         if not model_dir.exists():
             continue
-
-        if model.startswith("boltz"):
-            for cif in sorted(model_dir.rglob("predictions/**/*.cif")):
-                score = _read_plddt(model_dir, model)
-                candidates.append((model, cif, score))
-                break
-        elif model == "protenix":
-            for cif in sorted(model_dir.rglob("*.cif")):
-                score = _read_plddt(model_dir, model)
-                candidates.append((model, cif, score))
-                break
-        elif model == "alphafold3":
-            for cif in sorted(model_dir.rglob("*model*.cif")):
-                score = _read_plddt(model_dir, model)
-                candidates.append((model, cif, score))
-                break
+        cif = _first_cif(model_dir, model)
+        if cif is not None:
+            score = _read_plddt(model_dir, model)
+            candidates.append((model, cif, score))
 
     if not candidates:
         raise ValueError(f"No cofolding outputs found in {run_dir}/outputs/")
@@ -64,23 +67,33 @@ def find_best_cofolding_cif(run_dir: Path, preferred: str | None = None) -> tupl
 
 
 def _read_plddt(model_dir: Path, model: str) -> float:
-    """Return average pLDDT for a cofolding output (for ranking)."""
+    """Return average pLDDT normalised to [0, 100] for ranking.
+
+    Boltz stores per-residue pLDDT on [0, 1] → multiply by 100.
+    Protenix stores a scalar on [0, 100].
+    AF3 stores per-atom pLDDT on [0, 100].
+    """
     try:
         if model.startswith("boltz"):
             import numpy as np
             for npz in model_dir.rglob("plddt_*model_0.npz"):
                 data = np.load(str(npz))
-                return float(data[data.files[0]].mean())
+                return float(data[data.files[0]].mean()) * 100.0
         elif model == "protenix":
             for j in model_dir.rglob("*confidence*.json"):
                 d = json.loads(j.read_text())
                 if "plddt" in d:
-                    vals = d["plddt"] if isinstance(d["plddt"], list) else [d["plddt"]]
-                    return float(sum(vals) / len(vals))
+                    val = d["plddt"]
+                    if isinstance(val, (list, tuple)) and val:
+                        return float(sum(val) / len(val))
+                    if isinstance(val, (int, float)):
+                        return float(val)
         elif model == "alphafold3":
             for j in model_dir.rglob("*confidence*.json"):
+                if "summary" in j.name:
+                    continue
                 d = json.loads(j.read_text())
-                if "atom_plddts" in d:
+                if "atom_plddts" in d and d["atom_plddts"]:
                     return float(sum(d["atom_plddts"]) / len(d["atom_plddts"]))
     except Exception:
         pass

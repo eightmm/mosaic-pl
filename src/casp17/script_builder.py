@@ -202,6 +202,7 @@ def build_wrapper_shell_script(
             'echo "Starting CASP17 wrapper pipeline"',
         ]
     )
+    align_script = repo_root / "scripts" / "align_cofolding_outputs.py"
     prep_script = repo_root / "scripts" / "prepare_docking_inputs.py"
     filter_script = repo_root / "scripts" / "run_template_filter.py"
     multi_track_script = repo_root / "scripts" / "run_multi_track_docking.py"
@@ -217,9 +218,19 @@ def build_wrapper_shell_script(
     has_cofolding = "cofolding" in stage_names
     prev_stage = None
     for stage_name, script_path in stage_scripts:
-        # Insert docking prep bridge between cofolding and docking
+        # Insert alignment + docking prep bridges between cofolding and docking
         if stage_name == "docking" and prev_stage == "cofolding":
             run_dir = script_path.parent.parent
+            # Align all cofolding outputs to a common frame
+            lines.extend([
+                f'echo ""',
+                f'echo "================================================================"',
+                f'echo "  BRIDGE: Aligning cofolding outputs to common frame"',
+                f'echo "================================================================"',
+                f"{shlex.quote(str(hub_python))} {shlex.quote(str(align_script))} "
+                f"--run-dir {shlex.quote(str(run_dir))}",
+                "",
+            ])
             lines.extend([
                 f'echo ""',
                 f'echo "----------------------------------------------------------------"',
