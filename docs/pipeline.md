@@ -15,12 +15,16 @@ flowchart TB
         C1["Boltz-2"] --- C2["Boltz-2x"] --- C3["Protenix"] --- C4["AF3"]
     end
 
+    subgraph S25["2.5 Frame Alignment"]
+        AL["align_cofolding_outputs.py\nKabsch CA superposition\n→ *_aligned.cif"]
+    end
+
     subgraph S3["3. Structure Search"]
         D1["Foldseek x4"] --> D2["Consensus"]
     end
 
     subgraph S4["4. Docking Prep"]
-        E1["Best Model\n+ Binding Site\n+ File Conversion"]
+        E1["Best Model (_aligned)\n+ Binding Site\n(cofolding > SwinSite > P2Rank)\n+ File Conversion"]
     end
 
     subgraph S5["5. Docking"]
@@ -47,15 +51,17 @@ flowchart TB
 
     subgraph S7["7. CASP17 LG Submission"]
         direction LR
-        SS1["Ensemble Scores"] --> SS2["Best Pose\n+ LSCORE + AFFNTY"] --> SS3[".lg file"]
+        SS1["Ensemble Scores"] --> SS2["Top-5 Diverse\n(≥2Å pairwise RMSD)\n+ LSCORE + AFFNTY"] --> SS3[".lg file\n(MODEL 1..5)"]
     end
 
     INPUT --> S1 & S2
+    S2 --> S25
+    S1 -->|"template CIF as\nalignment ref"| S25
+    S25 --> S3
+    S25 --> S4 --> T1
     S1 -->|"MCS >= 0.5"| T23
-    S2 --> S3
-    S2 --> S4 --> T1
     S1 -->|"ion in input"| S55
-    S2 --> S55
+    S25 --> S55
     S5 --> S6 --> S7
     S55 --> S7
 ```
@@ -187,6 +193,56 @@ flowchart TB
 
 ---
 
+## Stage 2.5: Frame Alignment (cofolding → common coordinate frame)
+
+각 cofolding 모델(Boltz2/2x, Protenix, AF3)은 자체 좌표계에서 구조를 출력한다. 이 bridge는 모든 CIF를 단일 reference frame으로 Kabsch 정렬해서 downstream 전체 (docking, post-analysis, submission, reference comparison)가 동일한 좌표계에서 동작하도록 만든다.
+
+**Script**: `scripts/align_cofolding_outputs.py`
+
+```mermaid
+flowchart LR
+    REF["Reference Frame\n(template CIF or\nbest pLDDT model)"]
+    B2["Boltz-2\n(5 seeds × 5 samples)"] --> AL["Kabsch CA\nsuperposition\n(gemmi)"]
+    B2X["Boltz-2x"] --> AL
+    PTX["Protenix"] --> AL
+    AF3["AF3"] --> AL
+    REF --> AL
+    AL --> OUT["*_aligned.cif\n(alongside originals)"]
+
+    style REF fill:#ffd54f,color:#000
+    style OUT fill:#66bb6a,color:#000
+```
+
+### Reference 선택 우선순위
+
+1. **Template CIF** — template search에서 히트가 있으면 top-1 template의 RCSB mmCIF를 reference로 사용. Track 2/3 template-based docking과 자연스럽게 동일 좌표계.
+2. **Best pLDDT cofolding model** — template 없으면 pLDDT 가장 높은 cofolding 모델의 첫 번째 CIF를 reference로. 나머지 모델을 여기에 정렬.
+
+### 동작 방식
+
+1. Reference CIF에서 CA 원자 추출 (chain별, residue name sequence)
+2. 각 query CIF에서 CA 추출 → sliding offset으로 residue name 매칭 (결정학적 번호 차이 허용)
+3. `gemmi.superpose_positions(ref_cas, query_cas)` → rotation + translation
+4. Query CIF의 **모든 원자** (protein + ligand)에 동일 rigid transform 적용
+5. `*_aligned.cif`로 원본 옆에 저장
+
+### Downstream 참조
+
+`find_best_cofolding_structure()` (docking prep)와 `find_best_cofolding_cif()` (submission)는 `_aligned.cif`가 존재하면 원본 대신 우선 참조.
+
+### CASP16 L2001 실측
+
+| Model | CIFs | Mean CA RMSD after alignment |
+|---|---|---|
+| Boltz-2 | 25 | 4.72 Å |
+| Boltz-2x (ref) | 25 | 4.15 Å (0.00 = reference 자신) |
+| Protenix | 25 | 19.32 Å (fold 자체가 다름) |
+| AF3 | 26 | 20.66 Å (fold 자체가 다름) |
+
+> Boltz끼리는 같은 fold (4-5 Å 수준)이지만 Protenix/AF3는 이 타겟에서 완전히 다른 구조를 예측. 정렬은 올바르게 동작하되, fold이 다르면 잔차 RMSD가 높은 것이 정상.
+
+---
+
 ## Stage 3: Structure Search (Foldseek Consensus)
 
 각 cofolding 모델의 출력 구조를 RCSB 구조 DB에서 검색하고, 교차 모델 합의로 순위 매김.
@@ -275,21 +331,27 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    PDB["receptor.pdb"] --> SWIN["SwinSite\n(Swin-Unet ML)"]
-    PDB --> P2R["P2Rank\n(surface-based)"]
-    SDF["ligand.sdf"] --> FALLBACK["Ligand 3D\ncoordinates"]
+    CIF["cofolding CIF\n(aligned)"] --> COFOLD["Cofolding Ligand\nCentroid\n(non-polymer atoms)"]
+    PDB["receptor.pdb"] --> SWIN["SwinSite\n(Swin-Unet ML, GPU)"]
+    PDB --> P2R["P2Rank\n(surface-based, CPU)"]
+    SDF["ligand.sdf"] --> FALLBACK["Ligand 3D\ncoordinates\n(RDKit embedding)"]
 
-    SWIN -->|"priority 1"| BOX["Docking Box\n22.5A x 22.5A x 22.5A\nspacing 0.375A"]
-    P2R -->|"priority 2"| BOX
-    FALLBACK -->|"priority 3"| BOX
+    COFOLD -->|"priority 1"| BOX["Docking Box\n22.5A x 22.5A x 22.5A\nspacing 0.375A"]
+    SWIN -->|"priority 2"| BOX
+    P2R -->|"priority 3"| BOX
+    FALLBACK -->|"priority 4"| BOX
 
+    style COFOLD fill:#ffd54f,color:#000
     style BOX fill:#66bb6a,color:#000
 ```
 
-- **우선순위**: SwinSite (ML) > P2Rank (surface) > Ligand coordinates (fallback)
-- **Unified box**: 22.5A x 22.5A x 22.5A, grid spacing 0.375A (모든 docking tool 공통)
-- **Script**: `scripts/prepare_docking_inputs.py`
+- **우선순위**: **Cofolding ligand centroid** > SwinSite (ML) > P2Rank (surface) > Ligand coordinates (fallback)
+- **Cofolding centroid**: co-folding 모델이 단백질-리간드 complex를 예측하면서 리간드를 놓은 위치. non-polymer heavy atom 좌표의 centroid. CIF에서 gemmi로 추출. **가장 직접적인 신호** — 모델이 예측한 binding pocket 위치를 그대로 사용.
+- **Unified box**: 22.5Å × 22.5Å × 22.5Å, grid spacing 0.375Å (모든 docking tool 공통)
+- **Script**: `scripts/prepare_docking_inputs.py` (`_extract_cofolding_ligand_centroid`)
 - **Output**: `inputs/docking/docking_prep_summary.json` (모든 docking tool이 runtime에 읽음)
+
+> **CASP16 L2001 교훈**: SwinSite가 포켓을 못 찾고 ("no pockets"), P2Rank가 실제 crystal 사이트에서 37Å 떨어진 곳을 예측함. 이 타겟에선 cofolding centroid도 ~35Å 빗나갔으나 (모든 모델이 동일하게 틀림), 일반적인 case에서 cofolding ligand 위치가 가장 신뢰할 수 있는 소스.
 
 ---
 
@@ -581,42 +643,72 @@ flowchart TB
 
 - **Script**: `scripts/compute_submission_scores.py`
 - **LSCORE** (per pose): `1 - P(RMSD > 2Å)` from RMSD-Pred (higher = more confident)
-- **Best pose**: picked by highest LSCORE. Pose는 `pose_name`(`{stem}_{record_idx}`)에서 역산해 `outputs/analysis/poses/{stem}.sdf`의 정확한 레코드로 해상(`_resolve_pose_file` + `_split_pose_name`). Protenix-Dock best pose는 `outputs/protenix_dock/poses.sdf` 내부의 record index로 해상됨
 - **AFFNTY** (per complex): log-space ensemble of BA-Pred median + Boltz median (filtered by binder_prob ≥ 0.5)
+
+#### Top-5 Diversity-aware Pose Selection (`select_diverse_top_k`)
+
+CASP LG 포맷은 MODEL 1..5까지 허용. 단순 top-5 LSCORE 선택 시 매우 유사한 포즈가 반복되므로, **greedy diversity selection** 적용:
+
+```
+1. LSCORE 내림차순 정렬
+2. Top-1 무조건 선택
+3. 나머지를 순서대로 순회:
+   - 이미 선택된 모든 포즈와의 heavy-atom RMSD ≥ 2Å 이면 선택
+   - 아니면 스킵
+4. 5개 선택되거나 후보 소진 시 종료
+```
+
+- Heavy-atom RMSD: RDKit `CalcRMS` (symmetry-aware, sanitized mol, same receptor frame이므로 alignment 불필요)
+- Pose 파일 해상: `pose_name` (`{stem}_{record_idx}`)에서 역산 → `outputs/analysis/poses/{stem}.sdf`의 정확한 레코드 (`_resolve_pose_file` + `_split_pose_name`)
+- **Config**: `--top-k 5 --diversity-rmsd 2.0` (CLI args)
 
 ### Step 7-2: LG Format Assembly
 
 ```mermaid
 flowchart TB
-    CIF["Best cofolding CIF\n(by pLDDT)"] --> PDB["gemmi: CIF → PDB\nB-factor = pLDDT"]
-    NAME["best_pose.pose_name\n(e.g. vina_seed_42_3)"] --> SPLIT["_split_pose_name()"]
-    SPLIT --> STEM["stem = vina_seed_42\nidx = 3"]
-    STEM --> POSE["analysis/poses/\nvina_seed_42.sdf"]
-    POSE --> MDL["pose_to_mdl(path,\n  pose_index=idx)\n→ rdkit / meeko / obabel\n→ MDL V2000"]
-    SCORES["LSCORE + AFFNTY"]
+    CIF["Best cofolding CIF\n(_aligned, by pLDDT)"] --> PDB["gemmi: CIF → PDB\nB-factor = pLDDT"]
+    SEL["select_diverse_top_k()\n(5 poses, ≥2Å apart)"]
+
+    subgraph MODELS["MODEL 1..5"]
+        direction TB
+        M1["MODEL 1: highest LSCORE"]
+        M2["MODEL 2: next, ≥2Å from M1"]
+        M3["MODEL 3..5: greedy diverse"]
+    end
+
+    SEL --> MODELS
+    MODELS -->|"per-model\npose_to_mdl(file, idx)"| MDL["MDL V2000\n(per MODEL)"]
+    SCORES["LSCORE (per MODEL)\nAFFNTY (per complex)"]
 
     PDB & MDL & SCORES --> BUILD["build_lg_submission()"]
-    BUILD --> LG[".lg file"]
+    BUILD --> LG[".lg file\n(MODEL 1..5)"]
 
     style LG fill:#66bb6a,color:#000
+    style SEL fill:#ffd54f,color:#000
 ```
 
 - **Script**: `scripts/make_casp_submission.py`
-- **Format**:
+- **Format** (multi-MODEL):
   ```
   PFRMAT LG
   TARGET L2001
   AUTHOR <casp-code>
   METHOD <description>
+  METHOD -------------
   MODEL 1
+  REMARK <protein_model + pose_sources>
   PARENT <template_pdb_or_N/A>
   ATOM ... (receptor, B-factor = pLDDT)
   TER
   LIGAND 001 <name>
-  LSCORE 0.850          # from RMSD-Pred (per-ligand)
+  LSCORE 0.994
   <MDL V2000 block>
   M  END
-  AFFNTY 12.345 aa      # optional, Kd in nM (per-complex)
+  MODEL 2
+  ...                    # 같은 protein, 다른 ligand pose
+  MODEL 5
+  ...
+  AFFNTY 362.000 aa     # optional, per-complex (MODEL 전체에 1번)
   END
   ```
 
@@ -628,15 +720,19 @@ python scripts/make_casp_submission.py \
     --target-id L2001 \
     --ligand-name 761 \
     --author <casp-code> \
-    --method "Boltz-2x + Multi-track ensemble" \
+    --method "Boltz-2x + Vina/ADG ensemble" \
     --include-affinity \
+    --top-k 5 \
+    --diversity-rmsd 2.0 \
     --output experiments/submissions/L2001.lg
 ```
 
-- `--pose-source auto` (default): best pose by LSCORE
-- `--pose-source vina/autodock_gpu/protenix_dock/template/lig_align`: force source
-- `--include-affinity`: auto-compute AFFNTY from ensemble (omit for P-only tasks)
-- `--lscore N`, `--affinity-nM N`: manual override
+- `--top-k 5` (default): MODEL 개수 (1-5)
+- `--diversity-rmsd 2.0` (default): 최소 pairwise heavy-atom RMSD (Å)
+- `--pose-source auto` (default): 모든 docking tool에서 LSCORE 기준 선택
+- `--pose-source vina/autodock_gpu/protenix_dock/template/lig_align`: 특정 tool만 사용
+- `--include-affinity`: AFFNTY record 포함 (per-complex)
+- `--lscore N`, `--affinity-nM N`: manual override (MODEL 1에만 적용)
 
 ### Wrapper Integration
 
@@ -662,16 +758,17 @@ submission:
 ```
 template-search-sequence
   → BRIDGE: template filter (Tanimoto + MCS)
-cofolding (5 seeds × 5 samples)
-  → BRIDGE: docking prep (auto-select + binding site + file conversion)
+cofolding (5 seeds × 5 samples, 4 models)
+  → BRIDGE: align cofolding outputs (Kabsch to common frame)     ← NEW
+  → BRIDGE: docking prep (auto-select _aligned CIF + binding site + file conversion)
 docking (Track 1: Vina/ADG 5 seeds, PxDock 1x)
   → MULTI-TRACK DOCKING (Track 2+3 if MCS ≥ 0.5)
   → ION/METAL PLACEMENT (if ion in input)
-  → POST-ANALYSIS (BA-Pred + RMSD-Pred)
-  → CASP17 LG SUBMISSION (if submission.enabled)
+  → POST-ANALYSIS (BA-Pred + RMSD-Pred, staged multi-seed poses)
+  → CASP17 LG SUBMISSION (top-5 diverse MODEL, if submission.enabled)
 ```
 
-Output: `experiments/submissions/<target>.lg`
+Output: `experiments/submissions/<target>.lg` (multi-MODEL, up to 5)
 
 ---
 
@@ -748,13 +845,15 @@ Wrapper pipeline에서 stage 사이에 자동 삽입되는 bridge step 목록.
 
 | Bridge | 삽입 위치 | Script | 역할 |
 |--------|----------|--------|------|
-| Boltz MSA -> AF3 | Boltz -> AF3 (cofolding 내부) | `bridge_boltz_msa_to_af3.py` | MSA CSV -> A3M + AF3 JSON 패치 |
+| Boltz MSA → AF3 | Boltz → AF3 (cofolding 내부) | `bridge_boltz_msa_to_af3.py` | MSA CSV → A3M + AF3 JSON 패치 |
 | Template Filter | template-search-sequence 직후 | `run_template_filter.py` | Tanimoto + MCS scoring |
-| Docking Prep | cofolding -> docking 사이 | `prepare_docking_inputs.py` | 자동 모델 선택 + binding site + 파일 변환 |
+| **Frame Alignment** | **cofolding 직후** | **`align_cofolding_outputs.py`** | **모든 CIF → 공통 좌표계 Kabsch 정렬 (`_aligned.cif`)** |
+| Docking Prep | alignment → docking 사이 | `prepare_docking_inputs.py` | 자동 모델 선택 (`_aligned.cif` 우선) + binding site (cofolding > SwinSite > P2Rank) + 파일 변환 |
 | Multi-track Docking | docking 직후 (조건부) | `run_multi_track_docking.py` | Track 2 + Track 3 실행 |
 | Ion Placement | multi-track 직후 (조건부) | `collect_template_ions.py` | template alignment → ion 위치 수집 |
-| Score Aggregation | post-analysis 후 | `compute_submission_scores.py` | BA/RMSD/Boltz 집계, best pose + ensemble Kd |
-| CASP Submission | 최종 | `make_casp_submission.py` | LG format .lg 파일 생성 |
+| Score Aggregation | post-analysis 후 | `compute_submission_scores.py` | BA/RMSD/Boltz 집계 + **diversity-aware top-5 selection** |
+| CASP Submission | 최종 | `make_casp_submission.py` | LG format .lg 파일 생성 (**multi-MODEL 1..5**) |
+| Reference Analysis | post-hoc (수동) | `analyze_reference.py` | 정답 crystal vs predicted poses RMSD 비교 |
 
 ---
 
