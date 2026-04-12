@@ -401,6 +401,42 @@ def extract_smiles_from_json(input_json: Path) -> list[tuple[str, str]]:
     return results
 
 
+def _extract_cofolding_ligand_centroid(cif_path: Path) -> list[float] | None:
+    """Extract the centroid of ligand (non-polymer) heavy atoms from a cofolding CIF.
+
+    Boltz/Protenix/AF3 cofolding outputs contain both protein and ligand atoms.
+    Non-polymer entities (ligand) are identified by ``entity_type == NonPolymer``
+    or residue names starting with ``LIG``. Returns ``[x, y, z]`` or ``None``
+    if no ligand atoms are found.
+    """
+    try:
+        import gemmi
+        st = gemmi.read_structure(str(cif_path))
+        coords: list[tuple[float, float, float]] = []
+        for model in st:
+            for chain in model:
+                for res in chain:
+                    is_ligand = (
+                        res.entity_type == gemmi.EntityType.NonPolymer
+                        or res.name.startswith("LIG")
+                    )
+                    if not is_ligand:
+                        continue
+                    for atom in res:
+                        if atom.element.is_hydrogen:
+                            continue
+                        coords.append((atom.pos.x, atom.pos.y, atom.pos.z))
+        if not coords:
+            return None
+        cx = sum(c[0] for c in coords) / len(coords)
+        cy = sum(c[1] for c in coords) / len(coords)
+        cz = sum(c[2] for c in coords) / len(coords)
+        return [round(cx, 4), round(cy, 4), round(cz, 4)]
+    except Exception as e:
+        print(f"  WARNING: could not extract cofolding ligand centroid: {e}")
+        return None
+
+
 def compute_box_from_ligand(sdf_path: Path, box_side: float = 22.5) -> tuple[list[float], list[float]]:
     """Compute docking box center from ligand 3D coordinates. Box size fixed."""
     from rdkit import Chem
@@ -491,31 +527,40 @@ def main() -> int:
     protonated_pdb = pqr_to_protonated_pdb(pqr_path, args.output_dir / "receptor_protonated.pdb")
     pqr_path.unlink(missing_ok=True)
 
-    # 4. Determine docking box: P2Rank > ligand coordinates fallback
+    # 4. Determine docking box
+    # Priority: cofolding ligand > SwinSite > P2Rank > input ligand coords
     center, size = None, None
     box_method = "fallback"
-
-    # Try binding site predictors: SwinSite (ML) > P2Rank (surface) > ligand fallback
     binding_site_results = {}
 
+    # 4a. Cofolding predicted ligand centroid (most direct signal — the
+    #     cofolding model already placed the ligand in what it thinks is the
+    #     binding pocket). Extract from the selected CIF.
+    cofold_center = _extract_cofolding_ligand_centroid(structure)
+    if cofold_center is not None:
+        default_size = [22.5, 22.5, 22.5]
+        binding_site_results["cofolding"] = (cofold_center, default_size)
+        print(f"  Cofolding ligand centroid: {cofold_center}")
+
+    # 4b. SwinSite (ML-based surface pocket predictor, needs GPU)
+    print("  Running SwinSite binding site prediction...")
+    swinsite_result = run_swinsite(pdb_path, args.output_dir)
+    if swinsite_result:
+        binding_site_results["swinsite"] = swinsite_result
+
+    # 4c. P2Rank (surface geometry-based)
     if not args.no_p2rank:
         print("  Running P2Rank binding site prediction...")
         p2rank_result = run_p2rank(pdb_path, args.output_dir)
         if p2rank_result:
             binding_site_results["p2rank"] = p2rank_result
 
-    print("  Running SwinSite binding site prediction...")
-    swinsite_result = run_swinsite(pdb_path, args.output_dir)
-    if swinsite_result:
-        binding_site_results["swinsite"] = swinsite_result
-
-    # Pick best: prefer SwinSite (ML-based), fallback to P2Rank, then ligand coords
-    if "swinsite" in binding_site_results:
-        center, size = binding_site_results["swinsite"]
-        box_method = "swinsite"
-    elif "p2rank" in binding_site_results:
-        center, size = binding_site_results["p2rank"]
-        box_method = "p2rank"
+    # Pick best by priority
+    for method in ("cofolding", "swinsite", "p2rank"):
+        if method in binding_site_results:
+            center, size = binding_site_results[method]
+            box_method = method
+            break
 
     if center is None:
         first_sdf = args.output_dir / f"ligand_{ligands[0][0]}.sdf"
