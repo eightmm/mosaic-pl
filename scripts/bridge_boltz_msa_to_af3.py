@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
 
 
@@ -34,7 +33,7 @@ def boltz_csv_to_a3m(csv_path: Path) -> str:
         if len(parts) != 2:
             continue
         key, seq = parts
-        header = f">query" if idx == 0 else f">seq_{idx}_key_{key}"
+        header = ">query" if idx == 0 else f">seq_{idx}_key_{key}"
         a3m_lines.append(header)
         a3m_lines.append(seq)
     return "\n".join(a3m_lines) + "\n"

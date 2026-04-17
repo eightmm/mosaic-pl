@@ -165,12 +165,13 @@ def find_best_cofolding_structure(cofolding_dir: Path, model: str) -> Path | Non
     the raw CIF so that downstream stages work in the common reference frame.
     """
     def _prefer_aligned(cifs: list[Path]) -> Path | None:
+        # First pass: return the first cif that has a sibling ``_aligned``.
+        # Second pass: fall back to the first raw cif.
         for cif in cifs:
             aligned = cif.with_name(cif.stem + "_aligned.cif")
             if aligned.exists():
                 return aligned
-            return cif
-        return None
+        return cifs[0] if cifs else None
 
     if model.startswith("boltz"):
         return _prefer_aligned(sorted(cofolding_dir.rglob("predictions/**/*.cif")))
@@ -289,8 +290,6 @@ def run_p2rank(pdb_path: Path, output_dir: Path) -> tuple[list[float], list[floa
             cx = float(row["center_x"])
             cy = float(row["center_y"])
             cz = float(row["center_z"])
-            # Estimate box size from SAS points (rough heuristic)
-            sas = int(row["sas_points"])
             box_side = 22.5
             print(f"  P2Rank pocket 1: center=[{cx:.1f}, {cy:.1f}, {cz:.1f}], score={row['score'].strip()}")
             return ([cx, cy, cz], [box_side, box_side, box_side])
@@ -359,7 +358,6 @@ def run_swinsite(pdb_path: Path, output_dir: Path) -> tuple[list[float], list[fl
         import numpy as _np
         arr = _np.array(coords)
         center = arr.mean(axis=0).tolist()
-        extent = (arr.max(axis=0) - arr.min(axis=0))
         box_side = 22.5
         print(f"  SwinSite pocket 1: center=[{center[0]:.1f}, {center[1]:.1f}, {center[2]:.1f}], atoms={len(coords)}")
         return (center, [box_side, box_side, box_side])
@@ -369,29 +367,32 @@ def run_swinsite(pdb_path: Path, output_dir: Path) -> tuple[list[float], list[fl
 
 
 def extract_smiles_from_yaml(input_yaml: Path) -> list[tuple[str, str]]:
-    """Extract (ligand_id, smiles) pairs from unified input YAML."""
-    # Simple YAML parsing to avoid heavy dependency
-    text = input_yaml.read_text()
-    results = []
-    current_id = None
-    in_ligand = False
+    """Extract ``(ligand_id, smiles)`` pairs from the unified input YAML.
 
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("- ligand:") or stripped == "ligand:":
-            in_ligand = True
-            current_id = None
+    Uses ``yaml.safe_load`` so block-style nested mappings parse correctly
+    and multi-ligand inputs (candidate + cofactors + metals) preserve their
+    declared order. Ligand entries that carry only a ``ccd`` field
+    (metals/ions addressed by CCD code) are skipped — docking can only
+    consume real SMILES.
+    """
+    try:
+        import yaml
+    except Exception:
+        return []
+    try:
+        data = yaml.safe_load(input_yaml.read_text()) or {}
+    except Exception:
+        return []
+    results: list[tuple[str, str]] = []
+    for entry in data.get("sequences", []) or []:
+        if not isinstance(entry, dict) or "ligand" not in entry:
             continue
-        if in_ligand:
-            if stripped.startswith("id:"):
-                current_id = stripped.split(":", 1)[1].strip()
-            elif stripped.startswith("smiles:"):
-                smiles = stripped.split(":", 1)[1].strip()
-                results.append((current_id or "L", smiles))
-                in_ligand = False
-            elif stripped.startswith("- ") or (stripped and not stripped.startswith((" ", "#"))):
-                in_ligand = False
-
+        lig = entry["ligand"] or {}
+        smi = lig.get("smiles")
+        if not smi:
+            continue  # CCD-only ligand (metal/ion) — not dockable
+        lid = str(lig.get("id") or "L").strip()
+        results.append((lid, str(smi).strip().strip("'\"")))
     return results
 
 
@@ -537,7 +538,7 @@ def main() -> int:
     pqr_path = args.output_dir / "receptor.pqr"
     if not pqr_path.exists():
         run_pdb2pqr(pdb_path, pqr_path)
-    protonated_pdb = pqr_to_protonated_pdb(pqr_path, args.output_dir / "receptor_protonated.pdb")
+    pqr_to_protonated_pdb(pqr_path, args.output_dir / "receptor_protonated.pdb")
     pqr_path.unlink(missing_ok=True)
 
     # 4. Determine docking box

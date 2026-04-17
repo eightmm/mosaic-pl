@@ -22,7 +22,7 @@ from casp17.configs import RunnerConfig
 from casp17.io_utils import dump_json, dump_structured_file
 from casp17.models import CommonInput
 from casp17.script_builder import build_shell_script, build_wrapper_shell_script
-from casp17.validation import _model_is_enabled, _resolve_stages, _validate_stage_dependencies
+from casp17.validation import _resolve_stages, _validate_stage_dependencies
 
 
 @dataclass(slots=True)

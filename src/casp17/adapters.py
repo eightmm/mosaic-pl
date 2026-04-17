@@ -474,12 +474,11 @@ def prepare_alphafold3(
     af3_cmd_args.extend(config.alphafold3.extra_args)
 
     # Write a bash wrapper that sets LD_LIBRARY_PATH for JAX CUDA
-    import shlex as _shlex
     af3_runner.write_text(
         "#!/usr/bin/env bash\n"
         "# Auto-generated AF3 runner with CUDA library paths for JAX\n"
         f'for _nv_lib in {nv_lib_glob}; do export LD_LIBRARY_PATH="$_nv_lib:${{LD_LIBRARY_PATH:-}}"; done\n'
-        f"exec {' '.join(_shlex.quote(a) for a in af3_cmd_args)}\n"
+        f"exec {' '.join(shlex.quote(a) for a in af3_cmd_args)}\n"
     )
     af3_runner.chmod(0o755)
 
@@ -687,7 +686,7 @@ def prepare_vina(common: CommonInput, config: RunnerConfig, run_dir: Path) -> Pr
         "from pathlib import Path",
         "from vina import Vina",
         "",
-        f"# Config defaults (overridden by docking_prep_summary.json at runtime)",
+        "# Config defaults (overridden by docking_prep_summary.json at runtime)",
         f"receptor_pdbqt = {receptor_pdbqt!r}",
         f"ligand_pdbqt = {ligand_pdbqt!r}",
         f"center = [{center_x}, {center_y}, {center_z}]",
@@ -707,7 +706,7 @@ def prepare_vina(common: CommonInput, config: RunnerConfig, run_dir: Path) -> Pr
         "    out_path = str(_out_dir / 'docked.pdbqt')",
         "    log_path = str(_out_dir / 'vina.log')",
         "",
-        f"# Runtime auto-detect from docking prep bridge",
+        "# Runtime auto-detect from docking prep bridge",
         f"summary_path = Path({str(summary_path)!r})",
         "if summary_path.exists():",
         "    prep = json.loads(summary_path.read_text())",
@@ -798,10 +797,10 @@ def prepare_autodock_gpu(
         f"ligand_pdbqt = {ligand_pdbqt!r}",
         f"user_center = [{center_x!r}, {center_y!r}, {center_z!r}]",
         f"user_size = [{size_x!r}, {size_y!r}, {size_z!r}]",
-        f"center = [0.0, 0.0, 0.0]",
-        f"size = [22.5, 22.5, 22.5]",
+        "center = [0.0, 0.0, 0.0]",
+        "size = [22.5, 22.5, 22.5]",
         f"grid_dir = Path({str(grid_dir)!r})",
-        f"fld_path = grid_dir / 'receptor.maps.fld'",
+        "fld_path = grid_dir / 'receptor.maps.fld'",
         f"output_dir = Path({str(output_dir)!r})",
         f"binary = {str(repo_root / config.autodock_gpu.binary)!r}",
         f"nrun = {config.autodock_gpu.nrun}",
@@ -819,9 +818,9 @@ def prepare_autodock_gpu(
         "    grid_dir.mkdir(parents=True, exist_ok=True)",
         "    fld_path = grid_dir / 'receptor.maps.fld'",
         "",
-        f"# Runtime auto-detect from docking prep bridge. Prefer runtime prep",
-        f"# summary over compile-time config because adapter runs before the",
-        f"# docking prep bridge creates the summary file.",
+        "# Runtime auto-detect from docking prep bridge. Prefer runtime prep",
+        "# summary over compile-time config because adapter runs before the",
+        "# docking prep bridge creates the summary file.",
         f"summary_path = Path({str(summary_path)!r})",
         "if summary_path.exists():",
         "    prep = json.loads(summary_path.read_text())",
@@ -890,9 +889,9 @@ def prepare_autodock_gpu(
         "# Run AutoDock-GPU",
         "subprocess.run([",
         "    binary, '--ffile', str(fld_path), '--lfile', ligand_pdbqt,",
-        f"    '--nrun', str(nrun), '--nev', str(nev),",
-        f"    '--heuristics', str(heuristics), '--autostop', str(autostop),",
-        f"    '--seed', str(seed), '--resnam', str(output_dir / 'docking'),",
+        "    '--nrun', str(nrun), '--nev', str(nev),",
+        "    '--heuristics', str(heuristics), '--autostop', str(autostop),",
+        "    '--seed', str(seed), '--resnam', str(output_dir / 'docking'),",
         "], check=True)",
         "",
         "print(f'AutoDock-GPU: results in {output_dir}')",
@@ -969,7 +968,7 @@ def prepare_protenix_dock(
         f"cache_map_spacing = {config.protenix_dock.cache_map_spacing}",
         f"use_cache_maps = {config.protenix_dock.use_cache_maps}",
         "",
-        f"# Runtime auto-detect from docking prep bridge",
+        "# Runtime auto-detect from docking prep bridge",
         f"summary_path = Path({str(summary_path)!r})",
         "if summary_path.exists():",
         "    prep = json.loads(summary_path.read_text())",

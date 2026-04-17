@@ -82,7 +82,6 @@ def _pick_best_cofolding_as_ref(run_dir: Path, scores: dict[str, float]) -> Path
 
 def _collect_ca(structure):
     """Extract (chain, resi, resname, Position) for all CA atoms."""
-    import gemmi
     cas = []
     for model in structure:
         for chain in model:
@@ -97,7 +96,6 @@ def _collect_ca(structure):
 def _sequence_match_cas(ref_cas, query_cas):
     """Match CA atoms by 1-letter residue sequence with sliding offset.
     Returns list of (ref_Position, query_Position) pairs."""
-    import gemmi
 
     _AA3TO1 = {
         "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C", "GLU": "E",

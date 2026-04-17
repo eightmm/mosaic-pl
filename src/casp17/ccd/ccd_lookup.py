@@ -78,7 +78,7 @@ def download_components_cif(
                     print(f"\r  {downloaded/1e6:.0f}/{total/1e6:.0f} MB ({pct:.0f}%)", end="", flush=True)
     print()
 
-    print(f"[ccd] decompressing ...")
+    print("[ccd] decompressing ...")
     with gzip.open(gz_tmp, "rb") as gz_in, cif_tmp.open("wb") as out:
         shutil.copyfileobj(gz_in, out)
     gz_tmp.unlink()

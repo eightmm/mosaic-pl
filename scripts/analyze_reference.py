@@ -400,7 +400,6 @@ def main() -> int:
     from compute_submission_scores import (  # noqa: E402
         aggregate,
         select_diverse_top_k,
-        _split_pose_name,
         _load_pose_mol,
     )
 

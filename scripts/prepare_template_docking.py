@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import gzip
 import json
 import shutil
 import subprocess
@@ -127,7 +126,7 @@ def extract_template_ligand_sdf(cif_path: Path, ligand_ccd: str, output_sdf: Pat
 
     # Fallback: try openbabel
     try:
-        result = subprocess.run(
+        subprocess.run(
             ["obabel", str(ligand_pdb), "-O", str(output_sdf)],
             check=True, capture_output=True, text=True,
         )
@@ -296,7 +295,6 @@ def main() -> int:
     for i, hit in enumerate(hits[:args.max_templates]):
         pdb_id = hit["pdb_id"]
         ligand_codes = hit.get("ligand_codes", "").split(";")
-        ligand_smiles_list = hit.get("ligand_smiles", "").split(";")
 
         print(f"\n{'='*60}")
         print(f"  Template {i+1}: {pdb_id} (pident={hit.get('pident', '?')}%)")
@@ -328,7 +326,7 @@ def main() -> int:
                 break
 
         if not center:
-            print(f"  Could not extract ligand center, skipping.")
+            print("  Could not extract ligand center, skipping.")
             continue
 
         box_size = [args.box_size] * 3
