@@ -20,7 +20,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -286,7 +285,16 @@ def _resolve_pose_file(run_dir: Path, tool: str, pose_name: str) -> Path | None:
 
 
 def select_best_pose(poses: list[PoseScore]) -> PoseScore | None:
-    """Pick the pose with highest LSCORE (lowest RMSD-Pred prob > 2A)."""
+    """Pick the pose with smallest predicted pRMSD (tie-break: highest LSCORE)."""
+    primary = [p for p in poses if p.rmsd_pred is not None]
+    if primary:
+        return min(
+            primary,
+            key=lambda p: (
+                p.rmsd_pred,
+                -(p.lscore if p.lscore is not None else 0.0),
+            ),
+        )
     scored = [p for p in poses if p.lscore is not None]
     if not scored:
         # Fallback: pick best by BA-Pred
@@ -398,21 +406,37 @@ def select_diverse_top_k(
            constraint.
 
     If fewer than ``k`` diverse poses exist, the list is shorter than ``k``.
-    If no LSCOREs are available, falls back to BA-Pred pKd ordering (diversity
-    check still applied) so a submission can still be built from partial data.
+
+    Ordering priority:
+        1. RMSD-Pred ``pRMSD`` ascending (primary — smaller predicted pose RMSD
+           to the native frame is better).
+        2. ``LSCORE`` descending as tie-break (equivalent to ``prob_gt_2A``
+           ascending).
+        3. If neither is available, fall back to BA-Pred ``pKd`` descending.
+
+    LSCORE is still written into the LG MODEL header as the "0..1 confidence"
+    readout — only the selection ordering is driven by pRMSD.
     """
     if k <= 0:
         return []
 
-    scorer = lambda p: p.lscore
-    scored = [p for p in poses if p.lscore is not None]
-    if not scored:
-        scorer = lambda p: p.ba_pred_pkd
+    # Tier 1: poses with a real pRMSD value.
+    primary = [p for p in poses if p.rmsd_pred is not None]
+    if primary:
+        ordered = sorted(
+            primary,
+            key=lambda p: (
+                p.rmsd_pred,                                  # smaller pRMSD first
+                -(p.lscore if p.lscore is not None else 0.0), # larger LSCORE first
+            ),
+        )
+    else:
+        # Tier 2: no pRMSD anywhere → fall back to BA-Pred pKd descending so a
+        # submission can still be produced from partial data.
         scored = [p for p in poses if p.ba_pred_pkd is not None]
-    if not scored:
-        return poses[:k]
-
-    ordered = sorted(scored, key=lambda p: scorer(p) or 0.0, reverse=True)
+        if not scored:
+            return poses[:k]
+        ordered = sorted(scored, key=lambda p: p.ba_pred_pkd or 0.0, reverse=True)
 
     mol_cache: dict = {}
     selected: list[PoseScore] = []
@@ -573,7 +597,7 @@ def main() -> int:
         print(f"  pRMSD: {bp.rmsd_pred}")
 
     if scores.ensemble_affinity_nM is not None:
-        print(f"\nEnsemble affinity:")
+        print("\nEnsemble affinity:")
         print(f"  log10(Kd nM): {scores.ensemble_log_kd_nM:.3f}")
         print(f"  Kd: {scores.ensemble_affinity_nM:.3g} nM")
 

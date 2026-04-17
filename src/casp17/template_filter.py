@@ -12,7 +12,6 @@ import csv
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,12 +131,30 @@ def lookup_ligands(db_path: Path, pdb_id: str) -> list[LigandHit]:
     return results
 
 
+def lookup_deposition_date(db_path: Path, pdb_id: str) -> str | None:
+    """Return the ISO ``deposition_date`` for a PDB entry, or ``None`` if not
+    indexed. Used by ``filter_hits_with_ligands`` to drop post-cutoff templates
+    for time-split experiments (e.g. exclude 2025+ structures when benchmarking
+    on held-out 2025 targets)."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cur = conn.execute(
+            "SELECT deposition_date FROM entries WHERE pdb_id = ?",
+            (pdb_id.lower(),),
+        )
+        row = cur.fetchone()
+    finally:
+        conn.close()
+    return row[0] if row and row[0] else None
+
+
 def filter_hits_with_ligands(
     hits_tsv: Path,
     db_path: Path,
     target_smiles: str | None = None,
     ligand_types: set[str] | None = None,
     output_path: Path | None = None,
+    max_deposition_date: str | None = None,
 ) -> list[TemplateHit]:
     """Filter template search hits to those with candidate ligands.
 
@@ -147,6 +164,10 @@ def filter_hits_with_ligands(
         target_smiles: Target ligand SMILES for similarity comparison.
         ligand_types: Optional set of ligand types to keep.
         output_path: Optional path to write filtered results TSV.
+        max_deposition_date: Drop any hit whose RCSB ``deposition_date`` is
+            on or after this ISO date (``YYYY-MM-DD``). Hits missing a date
+            in the index are kept. Used for time-split benchmarks where
+            templates released after a cutoff must not leak into inference.
 
     Returns:
         List of TemplateHit with ligand information and similarity scores.
@@ -156,11 +177,18 @@ def filter_hits_with_ligands(
 
     raw_hits = parse_mmseqs_hits(hits_tsv)
     results: list[TemplateHit] = []
+    date_skipped = 0
 
     for hit in raw_hits:
         target = hit["target"]
         pdb_id = target.split("_")[0].lower() if "_" in target else target[:4].lower()
         chain_id = target.split("_")[1] if "_" in target else ""
+
+        if max_deposition_date:
+            dep = lookup_deposition_date(db_path, pdb_id)
+            if dep and dep >= max_deposition_date:
+                date_skipped += 1
+                continue
 
         ligands = lookup_ligands(db_path, pdb_id)
         filtered_ligands = [l for l in ligands if l.ligand_type in ligand_types]
@@ -202,6 +230,9 @@ def filter_hits_with_ligands(
             best_mcs_coverage=best_mcs,
         )
         results.append(template_hit)
+
+    if max_deposition_date and date_skipped:
+        print(f"  date-filter: dropped {date_skipped} hit(s) with deposition_date >= {max_deposition_date}")
 
     # Sort: best tanimoto first, then ligand count, then identity
     results.sort(key=lambda h: (-h.best_tanimoto, -h.best_mcs_coverage, -len(h.ligands), -h.pident))

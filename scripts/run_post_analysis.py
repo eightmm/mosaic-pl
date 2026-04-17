@@ -102,7 +102,7 @@ def _pxdock_json_to_sdf(json_path: Path, sdf_path: Path) -> Path | None:
 
     template = Chem.MolFromSmiles(smiles)
     if template is None:
-        print(f"    protenix_dock: rdkit failed to parse mapped_smiles")
+        print("    protenix_dock: rdkit failed to parse mapped_smiles")
         return None
     template = Chem.AddHs(template)
 
@@ -113,7 +113,7 @@ def _pxdock_json_to_sdf(json_path: Path, sdf_path: Path) -> Path | None:
         if m > 0:
             map_to_idx[m] = atom.GetIdx()
     if not map_to_idx:
-        print(f"    protenix_dock: mapped_smiles has no atom maps")
+        print("    protenix_dock: mapped_smiles has no atom maps")
         return None
 
     # Build a stable ordering for xyz assignment. The JSON's ligand.xyz array
@@ -179,12 +179,127 @@ def find_receptor_pdbs(run_dir: Path) -> dict[str, Path]:
     return receptors
 
 
-def find_ligand_files(run_dir: Path) -> dict[str, Path]:
-    """Collect docked-pose ligand files per tool, across all docking seeds.
+def _extract_cofolding_ligand(cif_path: Path, template_mol):
+    """Extract the ligand from an aligned cofolding CIF with correct bond orders.
 
-    Returns a mapping ``tool_key -> pose_input`` where ``pose_input`` is either
-    a concrete pose file (SDF/DLG/PDBQT) or a ``.txt`` list of per-seed staged
+    Reads HETATM-like atoms (chain ``L`` or residues named LIG*/UNK/UNL) via
+    gemmi, builds a minimal PDB block, parses with RDKit, then assigns bond
+    orders from ``template_mol`` (built from the input ligand SDF/SMILES so
+    the atom graph is authoritative). Returns an RDKit Mol or None.
+    """
+    try:
+        import gemmi  # type: ignore
+        from rdkit import Chem  # type: ignore
+        from rdkit.Chem.AllChem import AssignBondOrdersFromTemplate  # type: ignore
+    except Exception:
+        return None
+    try:
+        st = gemmi.read_structure(str(cif_path))
+    except Exception:
+        return None
+    lines = []
+    serial = 1
+    for model in st:
+        for chain in model:
+            for res in chain:
+                is_lig = (
+                    res.name in ("LIG", "LIG1", "UNL", "UNK")
+                    or getattr(res, "het_flag", "") == "H"
+                    or chain.name == "L"
+                )
+                if not is_lig:
+                    continue
+                for atom in res:
+                    if atom.element.name == "H":
+                        continue
+                    x, y, z = atom.pos.x, atom.pos.y, atom.pos.z
+                    elem = atom.element.name
+                    lines.append(
+                        f"HETATM{serial:>5d} {atom.name:>4s} LIG L"
+                        f"{1:>4d}    {x:>8.3f}{y:>8.3f}{z:>8.3f}  1.00  0.00          {elem:>2s}\n"
+                    )
+                    serial += 1
+        break
+    if not lines:
+        return None
+    raw = Chem.MolFromPDBBlock("".join(lines) + "END\n", removeHs=True, sanitize=False)
+    if raw is None:
+        return None
+    try:
+        return AssignBondOrdersFromTemplate(template_mol, raw)
+    except Exception:
+        return None
+
+
+def _stage_cofolding_poses(run_dir: Path, staged_dir: Path) -> dict[str, Path]:
+    """Extract aligned ligand poses from cofolding CIFs into multi-pose SDFs.
+
+    Writes ``staged_dir / cofold_{model}.sdf`` for each cofolding tool that
+    produced aligned outputs. Returns ``{tool_key: sdf_path}`` for successfully
+    written SDFs, where ``tool_key`` is ``cofold_boltz2``/``cofold_boltz2x``/
+    ``cofold_protenix``/``cofold_af3`` so downstream BA-Pred/RMSD-Pred tsvs
+    carry the cofolding provenance in their filenames.
+
+    The bond-order template is loaded from ``inputs/docking/ligand_*.sdf``
+    (meeko-prepped from input SMILES) which has the authoritative molecular
+    graph; cofolding CIFs alone don't encode bond orders.
+    """
+    try:
+        from rdkit import Chem  # type: ignore
+    except Exception:
+        return {}
+
+    # Load template from the docking prep ligand (authoritative bond graph).
+    template = None
+    for cand in sorted((run_dir / "inputs" / "docking").glob("ligand_*.sdf")):
+        template = next(iter(Chem.SDMolSupplier(str(cand), removeHs=False, sanitize=True)), None)
+        if template is not None:
+            break
+    if template is None:
+        print("  cofold: no ligand template SDF, skipping cofolding pose extraction")
+        return {}
+    template_heavy = Chem.RemoveHs(template)
+
+    patterns = {
+        "cofold_boltz2": ("boltz2", "*_aligned.cif"),
+        "cofold_boltz2x": ("boltz2x", "*_aligned.cif"),
+        "cofold_protenix": ("protenix", "*_aligned.cif"),
+        "cofold_af3": ("alphafold3", "*_aligned.cif"),
+    }
+    written: dict[str, Path] = {}
+    for key, (subdir, pat) in patterns.items():
+        cifs = sorted((run_dir / "outputs" / subdir).rglob(pat))
+        if not cifs:
+            continue
+        sdf_path = staged_dir / f"{key}.sdf"
+        writer = Chem.SDWriter(str(sdf_path))
+        n = 0
+        for cif in cifs:
+            mol = _extract_cofolding_ligand(cif, template_heavy)
+            if mol is None:
+                continue
+            mol.SetProp("_Name", f"{key}_{n}")
+            writer.write(mol)
+            n += 1
+        writer.close()
+        if n > 0:
+            written[key] = sdf_path
+            print(f"  {key}: {n} cofolding poses → {sdf_path.name}")
+        else:
+            sdf_path.unlink(missing_ok=True)
+    return written
+
+
+def find_ligand_files(run_dir: Path) -> dict[str, Path]:
+    """Collect pose files per source (docking + cofolding), for BA-Pred/RMSD-Pred.
+
+    Returns a mapping ``tool_key -> pose_input``. ``pose_input`` is either a
+    concrete pose file (SDF/DLG/PDBQT) or a ``.txt`` list of per-seed staged
     poses. BA-Pred and RMSD-Pred both accept all of these formats.
+
+    Cofolding aligned poses are extracted from ``*_aligned.cif`` and staged as
+    ``analysis/poses/cofold_{model}.sdf`` so the same scorer that picks the
+    final top-5 sees cofolding candidates alongside docking outputs.
 
     The raw input SDF (``inputs/docking/ligand_*.sdf``) is intentionally
     excluded: its conformer comes from RDKit's SMILES embedding and is not
@@ -246,6 +361,10 @@ def find_ligand_files(run_dir: Path) -> dict[str, Path]:
                 if converted is not None:
                     ligands["protenix_dock"] = converted
 
+    # --- Cofolding aligned ligand poses (boltz2/2x/protenix/af3) ---
+    cofold_sdfs = _stage_cofolding_poses(run_dir, staged_dir)
+    ligands.update(cofold_sdfs)
+
     return ligands
 
 
@@ -264,7 +383,7 @@ def run_prediction(
             print(f"    FAILED: {result.stderr[-200:]}")
             return False
     except subprocess.TimeoutExpired:
-        print(f"    TIMEOUT")
+        print("    TIMEOUT")
         return False
 
 

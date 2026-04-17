@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
 from typing import Any
 
 
@@ -638,6 +637,9 @@ class TemplateSearchSequenceConfig:
     rcsb_dir: str = "~/DB/RCSB/raw/mmCIF_data"
     rcsb_db_path: str = "~/DB/RCSB/processed/rcsb_index.db"
     mcs_threshold: float = 0.5
+    # Time-split benchmarks: drop any hit whose RCSB deposition_date is
+    # on or after this ISO date (YYYY-MM-DD). None = no date filter.
+    max_deposition_date: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "TemplateSearchSequenceConfig":
@@ -658,6 +660,10 @@ class TemplateSearchSequenceConfig:
             rcsb_dir=str(data.get("rcsb_dir", "~/DB/RCSB/raw/mmCIF_data")),
             rcsb_db_path=str(data.get("rcsb_db_path", "~/DB/RCSB/processed/rcsb_index.db")),
             mcs_threshold=float(data.get("mcs_threshold", 0.5)),
+            max_deposition_date=_optional_string(
+                data.get("max_deposition_date"),
+                "template_search_sequence.max_deposition_date",
+            ),
         )
 
 
@@ -723,7 +729,7 @@ class SubmissionConfig:
     enabled: bool = False
     author: str = "0000-0000-0000"
     method: str = "CASP17 protein-ligand pipeline ensemble"
-    include_affinity: bool = False
+    include_affinity: bool = True
     parent: str = "N/A"
     ligand_number: int = 1
 
@@ -735,7 +741,7 @@ class SubmissionConfig:
             enabled=_to_bool(data.get("enabled"), False),
             author=str(data.get("author", "0000-0000-0000")),
             method=str(data.get("method", "CASP17 protein-ligand pipeline ensemble")),
-            include_affinity=_to_bool(data.get("include_affinity"), False),
+            include_affinity=_to_bool(data.get("include_affinity"), True),
             parent=str(data.get("parent", "N/A")),
             ligand_number=int(data.get("ligand_number", 1)),
         )

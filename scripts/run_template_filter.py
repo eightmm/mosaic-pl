@@ -19,19 +19,23 @@ from pathlib import Path
 
 
 def extract_first_smiles(yaml_path: Path) -> str | None:
-    """Extract first ligand SMILES from unified input YAML."""
-    text = yaml_path.read_text()
-    in_ligand = False
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("- ligand:") or stripped == "ligand:":
-            in_ligand = True
-            continue
-        if in_ligand:
-            if stripped.startswith("smiles:"):
-                return stripped.split(":", 1)[1].strip().strip("'\"")
-            if stripped.startswith("- ") or (stripped and not stripped.startswith((" ", "#"))):
-                in_ligand = False
+    """Extract first ligand SMILES from unified input YAML.
+
+    Uses yaml.safe_load so block-style nested mappings (the default Boltz
+    adapter output where ``id`` and ``smiles`` sit under a ``- ligand:``
+    list entry) parse correctly. Returns the first ligand SMILES found or
+    None if there is no ligand block.
+    """
+    try:
+        import yaml  # pyyaml is already a hub dep
+    except Exception:
+        return None
+    data = yaml.safe_load(yaml_path.read_text()) or {}
+    for entry in data.get("sequences", []) or []:
+        if isinstance(entry, dict) and "ligand" in entry:
+            smi = (entry["ligand"] or {}).get("smiles")
+            if smi:
+                return str(smi).strip().strip("'\"")
     return None
 
 
@@ -41,6 +45,13 @@ def main() -> int:
     parser.add_argument("--rcsb-db", type=Path, required=True)
     parser.add_argument("--input-yaml", type=Path, required=True)
     parser.add_argument("--output-tsv", type=Path, required=True)
+    parser.add_argument(
+        "--max-deposition-date",
+        type=str,
+        default=None,
+        help="Drop template hits whose RCSB deposition_date is on or after this "
+             "ISO date (YYYY-MM-DD). Used for time-split benchmarks.",
+    )
     args = parser.parse_args()
 
     if not args.hits_tsv.exists():
@@ -57,6 +68,7 @@ def main() -> int:
         db_path=args.rcsb_db,
         target_smiles=target_smiles,
         output_path=args.output_tsv,
+        max_deposition_date=args.max_deposition_date,
     )
     print(f"Filtered: {len(results)} hits with ligands → {args.output_tsv}")
     for h in results[:5]:

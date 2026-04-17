@@ -79,7 +79,7 @@ submission:
   enabled: true
   author: "0000-0000-0000"          # replace with real CASP registration code
   method: "Boltz-2x + Multi-track ensemble + lig-align (5 seeds x 5 samples)"
-  include_affinity: false            # L2000 is pose-only (P task)
+  include_affinity: true             # emit AFFNTY header (PA tasks like L1000)
   parent: "N/A"
   ligand_number: 1
 
