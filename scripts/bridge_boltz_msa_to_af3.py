@@ -40,11 +40,19 @@ def boltz_csv_to_a3m(csv_path: Path) -> str:
 
 
 def find_boltz_msa_csvs(boltz_output_dir: Path) -> dict[str, Path]:
-    """Find MSA CSV files in Boltz output. Returns {chain_name: csv_path}."""
+    """Find MSA CSV files in Boltz output. Returns ``{chain_name: csv_path}``.
+
+    Multi-seed Boltz runs nest results one level deeper under ``seed_<N>/``
+    (``boltz_output_dir/seed_42/boltz_results_*/msa/*.csv``); single-seed runs
+    keep the flat layout (``boltz_output_dir/boltz_results_*/msa/*.csv``).
+    ``rglob`` handles both. When the same chain CSV exists under multiple
+    seeds we deterministically keep the smallest seed number so A3M ordering
+    stays stable across reruns.
+    """
     results: dict[str, Path] = {}
-    for results_dir in boltz_output_dir.glob("boltz_results_*/msa"):
+    for results_dir in sorted(boltz_output_dir.rglob("boltz_results_*/msa")):
         for csv_file in results_dir.glob("*.csv"):
-            results[csv_file.stem] = csv_file
+            results.setdefault(csv_file.stem, csv_file)
     return results
 
 
