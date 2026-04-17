@@ -111,6 +111,7 @@ flowchart LR
 - **Output**: `outputs/template_search_sequence/filtered_hits.tsv`
 - **핵심 결정**: `best_mcs_coverage >= 0.5`이면 Stage 5에서 Track 2+3 활성화
 - CCD 분류 기반으로 drug-like 리간드만 필터링 (ion, 결정화 보조제, 당류 등 제외)
+- **Time-split 필터링** (옵션): `template_search_sequence.max_deposition_date: "YYYY-MM-DD"` 설정 시 `rcsb_index.db`의 `deposition_date`가 해당 날짜 이상인 hit을 drop. held-out 벤치(예: `experiments/novel2025_test`, 2025년 이후 공개 구조)에서 template leakage 차단 용도 — CLI로는 `scripts/run_template_filter.py --max-deposition-date 2025-01-01`
 
 ---
 
@@ -179,10 +180,21 @@ flowchart TB
 
 > RTX 6000 Ada 단일 GPU, CASP16 L2001/L2002 기준. `cofolding_seeds=[42,101,202,303,404]`, `diffusion_samples=5`.
 
+**MSA 재사용 (cross-seed + cross-model)**
+- Boltz 첫 seed만 MSA 서버 fetch. 이후 seed들과 Boltz2x는 생성된 `boltz_results_*/msa/` 디렉토리를 재사용하도록 wrapper가 `_boltz_msa_cache` 쉘 변수에 경로를 보관하고 다음 seed의 출력 경로로 `cp -r`
+- MSA는 서열-결정적 (diffusion seed와 무관)이므로 한 번의 fetch가 모든 seed × Boltz2 + Boltz2x를 커버
+- Script: `src/casp17/script_builder.py` (인라인 생성)
+
 **Bridge: Boltz MSA -> AF3**
 - Boltz가 생성한 MSA CSV를 AF3 A3M 포맷으로 변환
 - AF3 JSON에 `pairedMsa=""`, `templates=[]` 패치
 - Script: `scripts/bridge_boltz_msa_to_af3.py`
+
+**Bridge: Boltz MSA -> Protenix**
+- Boltz MSA 캐시에서 `uniref.a3m`을 찾아 Protenix JSON의 각 `proteinChain`에 `unpairedMsaPath` 주입 + `pairedMsa=""` 패치
+- Protenix가 자체 MSA 서버 fetch를 건너뛰어 동일 서열에서 중복 fetch 방지
+- Cache miss 시엔 Protenix의 기본 MSA 경로로 graceful fallback
+- Script: `src/casp17/script_builder.py` (인라인 heredoc)
 
 **Boltz Affinity Output:**
 ```json
@@ -598,7 +610,8 @@ flowchart TB
   - multi-seed docking 결과(`vina`, `autodock_gpu`)는 각 seed 파일을 `outputs/analysis/poses/{tool}_seed_{N}.{ext}`로 유니크 stem으로 복사. BA-Pred/RMSD-Pred의 `{basename}_{idx}` pose 명명 규칙 때문에 stem이 유니크해야 TSV row가 seed별로 분리됨
   - 각 staged 파일에 대해 meeko `mk_export.py`로 `.sdf` 복제본도 생성 → downstream `make_casp_submission.py`가 pose를 레코드 인덱스로 정확히 꺼낼 수 있음
   - **Protenix-Dock**은 포즈를 `.sdf`로 내보내지 않고 `*_out.json`(atom-mapped SMILES + `ligand.xyz`)에만 담음 → `_pxdock_json_to_sdf`로 RDKit 멀티레코드 SDF 생성 후 BA/RMSD-Pred에 전달
-  - **입력 ligand SDF (`inputs/docking/ligand_*.sdf`)는 post-analysis에서 제외**. RDKit embedding 좌표는 receptor와 정렬되지 않아 BA-Pred의 "8 Å 이내 단백질 원자만 추출" 로직이 빈 `MolFromPDBBlock` → `None`을 반환하고 `mol_to_graph` 단계에서 `AttributeError: 'NoneType' object has no attribute 'GetNumAtoms'`로 죽음. Docking 결과 pose만 대상으로 함
+  - **Cofolding 포즈도 포함**: aligned CIF(`outputs/{boltz2,boltz2x,protenix,alphafold3}/**/*_aligned.cif`)에서 리간드(chain `L` 또는 `LIG*/UNK/UNL` residue, het_flag `H`)를 추출 → 입력 docking ligand SDF(`inputs/docking/ligand_*.sdf`)를 템플릿으로 `AssignBondOrdersFromTemplate`로 bond graph 재부여 → `analysis/poses/cofold_{model}.sdf` (multi-record)로 스테이지. 결과적으로 cofolding 포즈가 docking 포즈와 함께 BA-Pred/RMSD-Pred를 거치고 Stage 7 Top-5 선택에서도 동등 후보로 경합. Bond graph 재부여 없이는 cofolding CIF의 결합차수 정보가 소실되어 BA-Pred의 `mol_to_graph`가 실패
+  - **입력 ligand SDF (`inputs/docking/ligand_*.sdf`)는 post-analysis에서 제외**. RDKit embedding 좌표는 receptor와 정렬되지 않아 BA-Pred의 "8 Å 이내 단백질 원자만 추출" 로직이 빈 `MolFromPDBBlock` → `None`을 반환하고 `mol_to_graph` 단계에서 `AttributeError: 'NoneType' object has no attribute 'GetNumAtoms'`로 죽음. Docking 결과 + cofolding aligned 포즈만 대상으로 함
 - **Output**:
   - `outputs/analysis/poses/` — staged pose 파일들 (pdbqt/dlg + sdf 쌍)
   - `outputs/analysis/{vina,autodock_gpu}_poses.txt` — BA/RMSD-Pred 입력용 리스트 파일
@@ -648,10 +661,13 @@ flowchart TB
 
 #### Top-5 Diversity-aware Pose Selection (`select_diverse_top_k`)
 
-CASP LG 포맷은 MODEL 1..5까지 허용. 단순 top-5 LSCORE 선택 시 매우 유사한 포즈가 반복되므로, **greedy diversity selection** 적용:
+CASP LG 포맷은 MODEL 1..5까지 허용. 단순 top-5 선택 시 매우 유사한 포즈가 반복되므로, **greedy diversity selection** 적용:
 
 ```
-1. LSCORE 내림차순 정렬
+1. 정렬 기준 (tier 우선순위):
+   1순위: pRMSD 오름차순 (RMSD-Pred의 예측 포즈 RMSD — 작을수록 native frame에 가까울 것으로 예측)
+   2순위: LSCORE 내림차순 (= 1 - P(RMSD > 2Å) 내림차순, tie-break)
+   3순위 (fallback): pRMSD/LSCORE 모두 없으면 BA-Pred pKd 내림차순
 2. Top-1 무조건 선택
 3. 나머지를 순서대로 순회:
    - 이미 선택된 모든 포즈와의 heavy-atom RMSD ≥ 2Å 이면 선택
@@ -659,8 +675,10 @@ CASP LG 포맷은 MODEL 1..5까지 허용. 단순 top-5 LSCORE 선택 시 매우
 4. 5개 선택되거나 후보 소진 시 종료
 ```
 
+- **Primary 기준이 pRMSD로 변경**된 이유: LSCORE는 threshold 기반 sigmoid-like 확률이라 0.95–0.99 구간이 포화되고 변별력이 약함. pRMSD는 연속 회귀 값이라 단일 Å 수준의 차이를 보존 → diverse top-5에서 더 좋은 spread 확보. LSCORE는 여전히 LG MODEL 헤더에 그대로 기록됨 (표시/컴파일러 호환 목적).
 - Heavy-atom RMSD: RDKit `CalcRMS` (symmetry-aware, sanitized mol, same receptor frame이므로 alignment 불필요)
 - Pose 파일 해상: `pose_name` (`{stem}_{record_idx}`)에서 역산 → `outputs/analysis/poses/{stem}.sdf`의 정확한 레코드 (`_resolve_pose_file` + `_split_pose_name`)
+- 후보 pool: docking 툴(`vina/autodock_gpu/protenix_dock/template/lig_align`) + cofolding aligned 포즈(`cofold_boltz2/boltz2x/protenix/af3`)
 - **Config**: `--top-k 5 --diversity-rmsd 2.0` (CLI args)
 
 ### Step 7-2: LG Format Assembly
@@ -749,7 +767,7 @@ submission:
   enabled: true              # default off; set true to auto-generate .lg files
   author: "XXXX-XXXX-XXXX"   # CASP registration code
   method: "Boltz-2x + ensemble ..."
-  include_affinity: false    # true for A/PA tasks
+  include_affinity: true     # default on (PA tasks like L1000). Set false for pose-only P tasks (L2000)
   parent: "N/A"              # template PDB ID or N/A
   ligand_number: 1
 ```
@@ -846,8 +864,10 @@ Wrapper pipeline에서 stage 사이에 자동 삽입되는 bridge step 목록.
 
 | Bridge | 삽입 위치 | Script | 역할 |
 |--------|----------|--------|------|
+| Boltz MSA cross-seed 캐시 | Boltz seed 1 → 이후 seed + Boltz2x | `script_builder.py` (인라인) | seed 1의 `msa/` 디렉토리를 재사용해 서버 fetch 중복 제거 |
+| Boltz MSA → Protenix | Boltz → Protenix (cofolding 내부) | `script_builder.py` (인라인 heredoc) | Boltz `uniref.a3m` → Protenix JSON `unpairedMsaPath` 주입 |
 | Boltz MSA → AF3 | Boltz → AF3 (cofolding 내부) | `bridge_boltz_msa_to_af3.py` | MSA CSV → A3M + AF3 JSON 패치 |
-| Template Filter | template-search-sequence 직후 | `run_template_filter.py` | Tanimoto + MCS scoring |
+| Template Filter | template-search-sequence 직후 | `run_template_filter.py` | Tanimoto + MCS scoring (+ 옵션: `--max-deposition-date`로 time-split) |
 | **Frame Alignment** | **cofolding 직후** | **`align_cofolding_outputs.py`** | **모든 CIF → 공통 좌표계 Kabsch 정렬 (`_aligned.cif`)** |
 | Docking Prep | alignment → docking 사이 | `prepare_docking_inputs.py` | 자동 모델 선택 (`_aligned.cif` 우선) + binding site (cofolding > SwinSite > P2Rank) + 파일 변환 |
 | Multi-track Docking | docking 직후 (조건부) | `run_multi_track_docking.py` | Track 2 + Track 3 실행 |
@@ -855,6 +875,33 @@ Wrapper pipeline에서 stage 사이에 자동 삽입되는 bridge step 목록.
 | Score Aggregation | post-analysis 후 | `compute_submission_scores.py` | BA/RMSD/Boltz 집계 + **diversity-aware top-5 selection** |
 | CASP Submission | 최종 | `make_casp_submission.py` | LG format .lg 파일 생성 (**multi-MODEL 1..5**) |
 | Reference Analysis | post-hoc (수동) | `analyze_reference.py` | 정답 crystal vs predicted poses RMSD 비교 |
+
+---
+
+## Shared Utility Modules
+
+여러 스크립트에서 중복 구현되던 포즈-평가 헬퍼들을 정리한 공통 모듈.
+
+| Module | 포함 API | 이전 중복 위치 |
+|--------|---------|------|
+| `src/casp17/geometry.py` | `parse_ca`, `kabsch`, `transform_mol`, `reassign_bonds`, `mol_from_mdl_body`, `pose_rmsd` (symmetry-aware RDKit `CalcRMS`) | `experiments/casp16_test/L1000/{evaluate,best_pose,compare_selection,compare_cofold_metrics}.py`, `experiments/novel2025_test/evaluate.py` |
+| `src/casp17/lg_format.py` | `parse_lg` (multi-MODEL LG 파서 — ATOM/HETATM/TER + MDL body + `LSCORE`/`AFFNTY`/`LIGAND` 분리) | 위 evaluate 스크립트 2곳 |
+
+> 기존 `src/casp17/yaml_utils.py`는 삭제됨 — 커스텀 YAML dumper 대신 `yaml.safe_dump` 사용 (hub venv의 `pyyaml` 의존성).
+
+---
+
+## Held-out Benchmarks (`experiments/`)
+
+파이프라인 튜닝/회귀 검증용 오프라인 벤치 세트. 모두 wrapper가 생성하는 `experiments/runs/<target>/` 트리 위에서 동작하며, `evaluate.py`는 최종 `.lg` 파일과 ground-truth 결정구조를 매칭해 ligand RMSD/pKd 오차를 집계한다.
+
+| Dir | 타겟 수 | 용도 | Time-split 설정 |
+|-----|--------|------|-----|
+| `experiments/casp16_test/L1000/` | 18 (L1000–L1017) | CASP16 L-task regression | 제한 없음 (과거 데이터) |
+| `experiments/casp16_test/L2000/` | — (준비 중) | CASP16 pose-only 재현 | — |
+| `experiments/novel2025_test/` | 499 / 543 (RCSB 2025-01-01 이후 non-redundant) | 시간 분할 held-out 벤치 | `template_search_sequence.max_deposition_date: "2025-01-01"` — template leakage 차단 |
+
+`novel2025_test`는 `max_deposition_date` + RCSB non-redundant 인덱스를 결합해 "2025년 이후에만 공개된 구조"를 타겟팅하고, template 검색은 pre-2025 PDB로 제한한다. 자세한 입력 컬럼 매핑과 ligand 선정 규칙은 `experiments/novel2025_test/README.md` 참조.
 
 ---
 

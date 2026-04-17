@@ -595,7 +595,8 @@ src/casp17/
 │   ├── ccd_lookup.py
 │   └── ligands.py
 ├── io_utils.py
-└── yaml_utils.py
+├── geometry.py          # Shared pose-eval geometry (Kabsch, RMSD, bond reassignment)
+└── lg_format.py         # CASP LG multi-MODEL format parser
 
 scripts/
 ├── install_external_models.sh     # Full installation + verify
