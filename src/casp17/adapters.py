@@ -322,9 +322,49 @@ def prepare_alphafold3(
     notes: list[str] = []
     sequences: list[dict[str, Any]] = []
 
+    # AF3 requires chain ids to be upper-case letters only (regex: [A-Z]+).
+    # Our unified YAML uses conventions like ``L2``/``X2`` for additional
+    # ligands/cofactors which AF3 rejects with
+    # ``ValueError: IDs must be upper case letters``. Build a stable remap:
+    # single-letter upper ids keep their name (so ``A``/``B``/``L`` survive);
+    # anything else is replaced by the next unused letter in ``A..Z, AA..ZZ``.
+    # The same remap is applied to bondedAtomPairs so covalent links still
+    # resolve to the new ids.
+    import re
+    _AF3_ID_RE = re.compile(r"^[A-Z]+$")
+
+    def _af3_alloc(used: set[str]) -> str:
+        import string
+        for c in string.ascii_uppercase:
+            if c not in used:
+                return c
+        for a in string.ascii_uppercase:
+            for b in string.ascii_uppercase:
+                cand = a + b
+                if cand not in used:
+                    return cand
+        raise ValueError("AlphaFold3 adapter ran out of two-letter chain ids")
+
+    used_af3_ids: set[str] = set()
+    af3_id_remap: dict[str, str] = {}
+    for entry in common.sequences:
+        _, entity = _entity(entry)
+        for cid in _entity_ids(entity):
+            if _AF3_ID_RE.match(cid) and cid not in used_af3_ids:
+                used_af3_ids.add(cid)
+                af3_id_remap[cid] = cid
+    for entry in common.sequences:
+        _, entity = _entity(entry)
+        for cid in _entity_ids(entity):
+            if cid not in af3_id_remap:
+                new = _af3_alloc(used_af3_ids)
+                used_af3_ids.add(new)
+                af3_id_remap[cid] = new
+                notes.append(f"AlphaFold3 adapter renamed chain id '{cid}' → '{new}' (AF3 accepts letters only).")
+
     for entry in common.sequences:
         entity_type, entity = _entity(entry)
-        ids = _entity_ids(entity)
+        ids = [af3_id_remap[c] for c in _entity_ids(entity)]
         af3_id: str | list[str] = ids[0] if len(ids) == 1 else ids
 
         if entity_type == "protein":
@@ -383,6 +423,17 @@ def prepare_alphafold3(
             sequences.append({"ligand": ligand_block})
 
     bonded_atom_pairs = _alphafold3_bonds(common, chain_lookup, notes)
+    # Translate bond chain ids through the AF3 remap so covalent links stay
+    # resolvable after ``L2``/``X2`` → alphabet-letter renames.
+    if bonded_atom_pairs and af3_id_remap:
+        remapped_pairs = []
+        for pair in bonded_atom_pairs:
+            new_pair = []
+            for atom in pair:
+                cid = str(atom[0])
+                new_pair.append([af3_id_remap.get(cid, cid), atom[1], atom[2]])
+            remapped_pairs.append(new_pair)
+        bonded_atom_pairs = remapped_pairs
     payload: dict[str, Any] = {
         "name": common.name,
         "modelSeeds": [common.seed],
