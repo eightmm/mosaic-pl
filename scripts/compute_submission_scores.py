@@ -213,10 +213,44 @@ def collect_pose_scores(run_dir: Path) -> list[PoseScore]:
         key = rmsd_tsv.stem.replace("rmsd_pred_", "")
         tool_files.setdefault(key, {})["rmsd"] = rmsd_tsv
 
+    staged_dir = run_dir / "outputs" / "analysis" / "poses"
+
+    def _canonicalize(pose_name: str) -> str:
+        """Normalize a BA-Pred/RMSD-Pred pose name to ``{stem}_{record}``.
+
+        RMSD-Pred appends a record index to the SDF record's ``_Name``; BA-Pred
+        does not. Older cofolding runs staged with ``SetProp("_Name", key_N)``
+        therefore produced mismatched names (``cofold_af3_0`` in BA-Pred,
+        ``cofold_af3_0_0`` in RMSD-Pred). Collapse by walking from the longest
+        possible stem down to find which prefix actually matches a staged file;
+        everything after that prefix except the first numeric token is
+        discarded. No-op for tools whose names already match a staged file.
+        """
+        parts = pose_name.split("_")
+        for i in range(len(parts), 0, -1):
+            prefix = "_".join(parts[:i])
+            for ext in (".sdf", ".pdbqt", ".dlg", ".mol2"):
+                if (staged_dir / f"{prefix}{ext}").exists():
+                    if i == len(parts):
+                        return pose_name
+                    # Keep one record index after the resolved stem.
+                    tail = parts[i] if parts[i].isdigit() else "0"
+                    return f"{prefix}_{tail}"
+        return pose_name
+
     pose_scores = []
     for tool, files in tool_files.items():
-        ba_data = parse_ba_pred_tsv(files.get("ba", Path())) if "ba" in files else {}
-        rmsd_data = parse_rmsd_pred_tsv(files.get("rmsd", Path())) if "rmsd" in files else {}
+        raw_ba = parse_ba_pred_tsv(files.get("ba", Path())) if "ba" in files else {}
+        raw_rmsd = parse_rmsd_pred_tsv(files.get("rmsd", Path())) if "rmsd" in files else {}
+
+        # Normalize and merge (last-writer-wins per canonical name; ordered
+        # traversal means we keep the first-seen value deterministically).
+        ba_data: dict[str, float] = {}
+        for k, v in raw_ba.items():
+            ba_data.setdefault(_canonicalize(k), v)
+        rmsd_data: dict[str, tuple[float, float]] = {}
+        for k, v in raw_rmsd.items():
+            rmsd_data.setdefault(_canonicalize(k), v)
 
         all_names = set(ba_data.keys()) | set(rmsd_data.keys())
         for name in sorted(all_names):

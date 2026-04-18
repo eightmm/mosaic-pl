@@ -278,7 +278,12 @@ def _stage_cofolding_poses(run_dir: Path, staged_dir: Path) -> dict[str, Path]:
             mol = _extract_cofolding_ligand(cif, template_heavy)
             if mol is None:
                 continue
-            mol.SetProp("_Name", f"{key}_{n}")
+            # Deliberately do not SetProp("_Name") — BA-Pred and RMSD-Pred
+            # disagree on how they combine an existing _Name with the
+            # record index (BA uses _Name directly; RMSD appends "_<idx>"
+            # producing e.g. cofold_af3_0_0). Leaving _Name unset makes
+            # both tools fall back to "{filename_stem}_{idx}" which joins
+            # cleanly in compute_submission_scores.aggregate().
             writer.write(mol)
             n += 1
         writer.close()
