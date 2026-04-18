@@ -95,14 +95,19 @@ def extract_template_ligand_sdf(cif_path: Path, ligand_ccd: str, output_sdf: Pat
     if target_residue is None:
         return None
 
-    # Write ligand atoms as minimal PDB
+    # Write ligand atoms as minimal PDB. RCSB CIFs sometimes use multi-char
+    # chain names (e.g. "AAA" for a polymer entity) which shift PDB columns
+    # and make RDKit's MolFromPDBFile fail with
+    # "Problem with residue number". Normalize chain→"X" and resid→1 so
+    # the fixed-width PDB layout is always valid; coordinates are all
+    # downstream consumers of this file need.
     ligand_pdb = output_sdf.with_suffix(".pdb")
     with open(ligand_pdb, "w") as f:
         for i, atom in enumerate(target_residue):
             name = f" {atom.name:<3s}" if len(atom.name) < 4 else atom.name
             f.write(
                 f"HETATM{i + 1:5d} {name:4s} {target_residue.name:>3s}"
-                f" {target_chain.name:>1s}{target_residue.seqid.num:4d}    "
+                f" X{1:4d}    "
                 f"{atom.pos.x:8.3f}{atom.pos.y:8.3f}{atom.pos.z:8.3f}"
                 f"  1.00  0.00          {atom.element.name:>2s}\n"
             )
