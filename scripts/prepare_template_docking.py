@@ -144,10 +144,33 @@ def extract_template_ligand_sdf(cif_path: Path, ligand_ccd: str, output_sdf: Pat
 
 
 def cif_to_receptor_pdb(cif_path: Path, output_pdb: Path) -> Path:
-    """Extract protein chains from CIF to PDB."""
+    """Extract protein chains from CIF to PDB.
+
+    RCSB CIFs often use multi-character chain labels (e.g. ``AAA`` for a
+    polymer-entity asym_id) which gemmi rejects at PDB serialization with
+    ``RuntimeError: chain name too long for the PDB format``. Since the
+    docking pipeline only needs receptor coordinates (not the original
+    chain identity), rename each retained chain to a fresh single letter
+    A..Z (then AA..ZZ is impossible in PDB anyway) before writing.
+    """
     import gemmi
+    import string
     structure = gemmi.read_structure(str(cif_path))
     structure.remove_ligands_and_waters()
+    # Collect already-valid single-letter chain names so we allocate from the
+    # unused remainder without clobbering them.
+    used = {chain.name for model in structure for chain in model if len(chain.name) == 1}
+    pool = (c for c in string.ascii_uppercase if c not in used)
+    for model in structure:
+        for chain in model:
+            if len(chain.name) != 1:
+                try:
+                    chain.name = next(pool)
+                except StopIteration:
+                    raise RuntimeError(
+                        f"More than 26 protein chains in {cif_path.name}; "
+                        "cannot fit PDB single-letter chain ids."
+                    )
     structure.write_pdb(str(output_pdb))
     return output_pdb
 
