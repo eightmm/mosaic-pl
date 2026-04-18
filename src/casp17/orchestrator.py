@@ -128,15 +128,15 @@ def prepare_vina_run(common: CommonInput, config: RunnerConfig, output_root: Pat
     run_dir = output_root / common.name
     _ensure_run_dirs(run_dir)
 
-    model_run = prepare_vina(common, config, run_dir)
-    if model_run is None:
+    vina_runs = prepare_vina(common, config, run_dir)
+    if not vina_runs:
         raise ValueError("AutoDock Vina is not enabled in the runner config.")
 
     shell_script = run_dir / "scripts" / ("run_vina.sbatch.sh" if backend == "slurm" else "run_vina.sh")
     return _finalize_prepared_run(
         common.name,
         config,
-        [model_run],
+        vina_runs,
         backend,
         run_dir,
         shell_script,
@@ -180,15 +180,12 @@ def prepare_docking_run(
     run_dir = output_root / common.name
     _ensure_run_dirs(run_dir)
 
-    model_runs = [
-        model_run
-        for model_run in [
-            prepare_vina(common, config, run_dir),
-            prepare_autodock_gpu(common, config, run_dir),
-            prepare_protenix_dock(common, config, run_dir),
-        ]
-        if model_run is not None
-    ]
+    model_runs: list = []
+    model_runs.extend(prepare_vina(common, config, run_dir))
+    model_runs.extend(prepare_autodock_gpu(common, config, run_dir))
+    pxd = prepare_protenix_dock(common, config, run_dir)
+    if pxd is not None:
+        model_runs.append(pxd)
     if not model_runs:
         raise ValueError("No docking tool is enabled in the runner config.")
 

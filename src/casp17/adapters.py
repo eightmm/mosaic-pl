@@ -690,12 +690,33 @@ def _load_docking_prep_summary(run_dir: Path) -> dict[str, Any] | None:
     return None
 
 
-def prepare_vina(common: CommonInput, config: RunnerConfig, run_dir: Path) -> PreparedModelRun | None:
-    if not config.vina.enabled:
-        return None
+_DOCKING_BOX_SOURCES = ("cofolding", "swinsite", "p2rank")
 
-    input_path = run_dir / "inputs" / "vina_config.txt"
-    output_dir = run_dir / "outputs" / "vina"
+
+def prepare_vina(
+    common: CommonInput, config: RunnerConfig, run_dir: Path
+) -> list[PreparedModelRun]:
+    """Emit one PreparedModelRun per binding-site source.
+
+    Instead of dispatching docking from a single box center (the old
+    priority-picked "best" prediction), we create three independent variants —
+    ``vina_cofolding``, ``vina_swinsite``, ``vina_p2rank`` — each reading its
+    designated center from ``docking_prep_summary.binding_site_predictions``
+    at runtime. Variants whose predictor yielded no pocket exit cleanly so
+    the pipeline does not fail; downstream post-analysis simply sees fewer
+    pose files for that tool key.
+    """
+    if not config.vina.enabled:
+        return []
+    return [_prepare_vina_variant(common, config, run_dir, box_source)
+            for box_source in _DOCKING_BOX_SOURCES]
+
+
+def _prepare_vina_variant(
+    common: CommonInput, config: RunnerConfig, run_dir: Path, box_source: str
+) -> PreparedModelRun:
+    model_name = f"vina_{box_source}"
+    output_dir = run_dir / "outputs" / model_name
     output_dir.mkdir(parents=True, exist_ok=True)
     notes: list[str] = []
 
@@ -730,14 +751,13 @@ def prepare_vina(common: CommonInput, config: RunnerConfig, run_dir: Path) -> Pr
     seed = config.vina.seed if config.vina.seed is not None else common.seed
 
     summary_path = run_dir / "inputs" / "docking" / "docking_prep_summary.json"
-    runner_script = run_dir / "scripts" / "run_vina.py"
+    runner_script = run_dir / "scripts" / f"run_{model_name}.py"
     runner_script.parent.mkdir(parents=True, exist_ok=True)
     script_lines = [
-        "import json, os",
+        "import json, os, sys",
         "from pathlib import Path",
-        "from vina import Vina",
         "",
-        "# Config defaults (overridden by docking_prep_summary.json at runtime)",
+        f"BOX_SOURCE = {box_source!r}  # binding-site predictor this variant uses",
         f"receptor_pdbqt = {receptor_pdbqt!r}",
         f"ligand_pdbqt = {ligand_pdbqt!r}",
         f"center = [{center_x}, {center_y}, {center_z}]",
@@ -764,14 +784,25 @@ def prepare_vina(common: CommonInput, config: RunnerConfig, run_dir: Path) -> Pr
         "    receptor_pdbqt = receptor_pdbqt or prep['receptor_pdbqt']",
         "    if prep.get('ligands'):",
         "        ligand_pdbqt = ligand_pdbqt or prep['ligands'][0]['pdbqt']",
-        "    if center[0] is None:",
-        "        center = prep.get('box_center', [0, 0, 0])",
+        "    # Prefer this variant's dedicated binding-site source over the",
+        "    # default box_center. If the source predictor yielded no pocket,",
+        "    # exit cleanly so the wrapper moves on to the next variant/tool.",
+        "    bs_preds = prep.get('binding_site_predictions') or {}",
+        "    source_pred = bs_preds.get(BOX_SOURCE)",
+        "    if source_pred and source_pred.get('center'):",
+        "        center = list(source_pred['center'])",
+        "        if source_pred.get('size'):",
+        "            size = list(source_pred['size'])",
+        "    else:",
+        "        print(f'Vina[{BOX_SOURCE}]: no {BOX_SOURCE} prediction in prep summary — skipping variant.')",
+        "        sys.exit(0)",
         "    if size[0] is None:",
         "        size = prep.get('box_size', [20, 20, 20])",
         "",
-        'print(f"Vina: receptor={receptor_pdbqt}")',
-        'print(f"Vina: ligand={ligand_pdbqt}")',
-        'print(f"Vina: center={center}, size={size}, seed={seed}")',
+        "from vina import Vina",
+        'print(f"Vina[{BOX_SOURCE}]: receptor={receptor_pdbqt}")',
+        'print(f"Vina[{BOX_SOURCE}]: ligand={ligand_pdbqt}")',
+        'print(f"Vina[{BOX_SOURCE}]: center={center}, size={size}, seed={seed}")',
         "",
         "v = Vina(sf_name='vina', seed=seed)",
         "v.set_receptor(receptor_pdbqt)",
@@ -784,26 +815,35 @@ def prepare_vina(common: CommonInput, config: RunnerConfig, run_dir: Path) -> Pr
         "with open(log_path, 'w') as f:",
         "    f.write(v.score().__repr__())",
         "",
-        'print(f"Vina: results written to {out_path}")',
+        'print(f"Vina[{BOX_SOURCE}]: results written to {out_path}")',
     ]
     runner_script.write_text("\n".join(script_lines) + "\n")
 
     input_path = runner_script
     command = [".venvs/protenix-dock/bin/python", str(runner_script)]
-    return PreparedModelRun("vina", input_path, output_dir, command, notes)
+    return PreparedModelRun(model_name, input_path, output_dir, command, notes)
 
 
 def prepare_autodock_gpu(
     common: CommonInput, config: RunnerConfig, run_dir: Path
-) -> PreparedModelRun | None:
+) -> list[PreparedModelRun]:
+    """Emit one PreparedModelRun per binding-site source (see ``prepare_vina``)."""
     if not config.autodock_gpu.enabled:
-        return None
+        return []
+    return [_prepare_autodock_gpu_variant(common, config, run_dir, box_source)
+            for box_source in _DOCKING_BOX_SOURCES]
 
+
+def _prepare_autodock_gpu_variant(
+    common: CommonInput, config: RunnerConfig, run_dir: Path, box_source: str
+) -> PreparedModelRun:
     repo_root = Path(__file__).resolve().parents[2]
 
-    output_dir = run_dir / "outputs" / "autodock_gpu"
+    model_name = f"autodock-gpu_{box_source}"
+    output_dir_name = f"autodock_gpu_{box_source}"  # underscore in dir, hyphen in model_name
+    output_dir = run_dir / "outputs" / output_dir_name
     output_dir.mkdir(parents=True, exist_ok=True)
-    grid_dir = run_dir / "inputs" / "autodock_gpu_grid"
+    grid_dir = run_dir / "inputs" / f"autodock_gpu_grid_{box_source}"
     grid_dir.mkdir(parents=True, exist_ok=True)
     notes: list[str] = []
 
@@ -834,16 +874,17 @@ def prepare_autodock_gpu(
     # the docking prep bridge has not run yet at this point.
 
     # Shell script that runs autogrid4 then autodock_gpu
-    runner_script = run_dir / "scripts" / "run_autodock_gpu.py"
+    runner_script = run_dir / "scripts" / f"run_{output_dir_name}.py"
     runner_script.parent.mkdir(parents=True, exist_ok=True)
     seed = config.autodock_gpu.seed if config.autodock_gpu.seed is not None else common.seed
     autostop_flag = "1" if config.autodock_gpu.autostop else "0"
     summary_path = run_dir / "inputs" / "docking" / "docking_prep_summary.json"
 
     script_lines = [
-        "import json, subprocess, os",
+        "import json, subprocess, os, sys",
         "from pathlib import Path",
         "",
+        f"BOX_SOURCE = {box_source!r}  # binding-site predictor this variant uses",
         f"receptor_pdbqt = {receptor_pdbqt!r}",
         f"ligand_pdbqt = {ligand_pdbqt!r}",
         f"user_center = [{center_x!r}, {center_y!r}, {center_z!r}]",
@@ -878,8 +919,16 @@ def prepare_autodock_gpu(
         "    receptor_pdbqt = receptor_pdbqt or prep['receptor_pdbqt']",
         "    if prep.get('ligands'):",
         "        ligand_pdbqt = ligand_pdbqt or prep['ligands'][0]['pdbqt']",
-        "    center = list(prep.get('box_center', center))",
-        "    size = list(prep.get('box_size', size))",
+        "    # Prefer this variant's dedicated binding-site source; skip if missing.",
+        "    bs_preds = prep.get('binding_site_predictions') or {}",
+        "    source_pred = bs_preds.get(BOX_SOURCE)",
+        "    if source_pred and source_pred.get('center'):",
+        "        center = list(source_pred['center'])",
+        "        if source_pred.get('size'):",
+        "            size = list(source_pred['size'])",
+        "    else:",
+        "        print(f'AutoDock-GPU[{BOX_SOURCE}]: no {BOX_SOURCE} prediction in prep summary — skipping variant.')",
+        "        sys.exit(0)",
         "# Explicit user config takes precedence over prep summary",
         "for i, v in enumerate(user_center):",
         "    if v is not None:",
@@ -952,7 +1001,7 @@ def prepare_autodock_gpu(
     input_path = runner_script
     command = [".venvs/protenix-dock/bin/python", str(runner_script)]
     notes.append("AutoDock-GPU requires autogrid4 in PATH for grid map generation.")
-    return PreparedModelRun("autodock-gpu", input_path, output_dir, command, notes)
+    return PreparedModelRun(model_name, input_path, output_dir, command, notes)
 
 
 def prepare_protenix_dock(

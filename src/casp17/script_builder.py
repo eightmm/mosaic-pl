@@ -17,8 +17,15 @@ _COFOLDING_SEED_ARG = {
     "protenix": "--seeds",
 }
 
-# Docking models that support multi-seed (PxDock excluded — too expensive)
-_DOCKING_MULTI_SEED = {"vina", "autodock-gpu"}
+# Docking models that support multi-seed (PxDock excluded — too expensive).
+# After the binding-site variant refactor, model_names are
+# ``vina_cofolding``/``vina_swinsite``/``vina_p2rank`` etc., so we match by
+# prefix rather than exact set membership.
+_DOCKING_MULTI_SEED_PREFIXES = ("vina", "autodock-gpu")
+
+
+def _is_docking_multi_seed(model_name: str) -> bool:
+    return model_name.startswith(_DOCKING_MULTI_SEED_PREFIXES) and model_name != "protenix-dock"
 
 
 def _multi_seed_cofolding_commands(
@@ -151,7 +158,7 @@ def build_shell_script(
 
         # Determine if this model uses multi-seed
         is_cofolding_multi = model_run.model_name in _COFOLDING_SEED_ARG and len(cofolding_seeds) > 1
-        is_docking_multi = model_run.model_name in _DOCKING_MULTI_SEED and len(docking_seeds) > 1
+        is_docking_multi = _is_docking_multi_seed(model_run.model_name) and len(docking_seeds) > 1
 
         if is_cofolding_multi:
             seed_runs = _multi_seed_cofolding_commands(model_run, cofolding_seeds)

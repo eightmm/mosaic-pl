@@ -316,40 +316,59 @@ def find_ligand_files(run_dir: Path) -> dict[str, Path]:
     staged_dir = analysis_dir / "poses"
     staged_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Vina: multi-seed PDBQT -> staged txt list ---
-    vina_seed_poses: list[Path] = []
-    for seed_dir in sorted((run_dir / "outputs" / "vina").glob("seed_*")):
-        pdbqt = seed_dir / "docked.pdbqt"
-        staged = _stage_pose_file(pdbqt, staged_dir, f"vina_{seed_dir.name}")
-        if staged is not None:
-            vina_seed_poses.append(staged)
-    # Flat layout fallback (single-seed legacy)
-    if not vina_seed_poses:
-        flat = run_dir / "outputs" / "vina" / "docked.pdbqt"
-        staged = _stage_pose_file(flat, staged_dir, "vina_flat")
-        if staged is not None:
-            vina_seed_poses.append(staged)
-    if vina_seed_poses:
-        lst = _write_list_file(vina_seed_poses, analysis_dir / "vina_poses.txt")
-        if lst is not None:
-            ligands["vina"] = lst
+    # --- Vina: auto-discover per binding-site variant (vina / vina_cofolding /
+    #     vina_swinsite / vina_p2rank). Each variant's seed_*/docked.pdbqt is
+    #     staged under a unique key so BA-Pred/RMSD-Pred and top-5 selection
+    #     can rank poses across binding-site hypotheses independently.
+    outputs_dir = run_dir / "outputs"
+    vina_variant_dirs = sorted(
+        [outputs_dir / "vina"]
+        + [d for d in outputs_dir.glob("vina_*") if d.is_dir()]
+    )
+    for var_dir in vina_variant_dirs:
+        if not var_dir.exists():
+            continue
+        tool_key = var_dir.name  # "vina" or "vina_<source>"
+        seed_poses: list[Path] = []
+        for seed_dir in sorted(var_dir.glob("seed_*")):
+            pdbqt = seed_dir / "docked.pdbqt"
+            staged = _stage_pose_file(pdbqt, staged_dir, f"{tool_key}_{seed_dir.name}")
+            if staged is not None:
+                seed_poses.append(staged)
+        if not seed_poses:
+            flat = var_dir / "docked.pdbqt"
+            staged = _stage_pose_file(flat, staged_dir, f"{tool_key}_flat")
+            if staged is not None:
+                seed_poses.append(staged)
+        if seed_poses:
+            lst = _write_list_file(seed_poses, analysis_dir / f"{tool_key}_poses.txt")
+            if lst is not None:
+                ligands[tool_key] = lst
 
-    # --- AutoDock-GPU: multi-seed DLG -> staged txt list ---
-    adg_seed_poses: list[Path] = []
-    for seed_dir in sorted((run_dir / "outputs" / "autodock_gpu").glob("seed_*")):
-        dlg = seed_dir / "docking.dlg"
-        staged = _stage_pose_file(dlg, staged_dir, f"autodock_gpu_{seed_dir.name}")
-        if staged is not None:
-            adg_seed_poses.append(staged)
-    if not adg_seed_poses:
-        flat = run_dir / "outputs" / "autodock_gpu" / "docking.dlg"
-        staged = _stage_pose_file(flat, staged_dir, "autodock_gpu_flat")
-        if staged is not None:
-            adg_seed_poses.append(staged)
-    if adg_seed_poses:
-        lst = _write_list_file(adg_seed_poses, analysis_dir / "autodock_gpu_poses.txt")
-        if lst is not None:
-            ligands["autodock_gpu"] = lst
+    # --- AutoDock-GPU: same auto-discovery over autodock_gpu{,_<source>} dirs ---
+    adg_variant_dirs = sorted(
+        [outputs_dir / "autodock_gpu"]
+        + [d for d in outputs_dir.glob("autodock_gpu_*") if d.is_dir()]
+    )
+    for var_dir in adg_variant_dirs:
+        if not var_dir.exists():
+            continue
+        tool_key = var_dir.name
+        seed_poses = []
+        for seed_dir in sorted(var_dir.glob("seed_*")):
+            dlg = seed_dir / "docking.dlg"
+            staged = _stage_pose_file(dlg, staged_dir, f"{tool_key}_{seed_dir.name}")
+            if staged is not None:
+                seed_poses.append(staged)
+        if not seed_poses:
+            flat = var_dir / "docking.dlg"
+            staged = _stage_pose_file(flat, staged_dir, f"{tool_key}_flat")
+            if staged is not None:
+                seed_poses.append(staged)
+        if seed_poses:
+            lst = _write_list_file(seed_poses, analysis_dir / f"{tool_key}_poses.txt")
+            if lst is not None:
+                ligands[tool_key] = lst
 
     # --- Protenix-Dock: JSON -> multi-record SDF ---
     pxdock_dir = run_dir / "outputs" / "protenix_dock"

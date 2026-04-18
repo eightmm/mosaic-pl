@@ -313,8 +313,11 @@ def test_prepare_vina_and_validate_docking_stage(tmp_path: Path) -> None:
     )
 
     prepared = prepare_vina_run(common, config, tmp_path, "slurm")
-    assert prepared.model_runs[0].model_name == "vina"
-    assert (prepared.run_dir / "scripts" / "run_vina.py").exists()
+    names = [m.model_name for m in prepared.model_runs]
+    assert names == ["vina_cofolding", "vina_swinsite", "vina_p2rank"]
+    # One runner script per variant.
+    for name in names:
+        assert (prepared.run_dir / "scripts" / f"run_{name}.py").exists()
 
     report = validate_run(common, config, "slurm", repo_root=tmp_path, stages=["docking"])
     assert report.ok
@@ -459,9 +462,10 @@ def test_prepare_docking_run_combines_vina_and_protenix_dock(tmp_path: Path) -> 
 
     prepared = prepare_docking_run(common, config, tmp_path, "slurm")
     model_names = [m.model_name for m in prepared.model_runs]
-    assert "vina" in model_names
+    # Vina fans out into one variant per binding-site source.
+    assert {"vina_cofolding", "vina_swinsite", "vina_p2rank"}.issubset(set(model_names))
     assert "protenix-dock" in model_names
-    assert len(prepared.model_runs) == 2
+    assert len(prepared.model_runs) == 4
 
 
 def test_write_example_config_includes_protenix_dock(tmp_path: Path) -> None:
