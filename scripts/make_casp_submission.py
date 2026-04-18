@@ -217,12 +217,17 @@ def pose_to_mdl(
     pose_path: Path,
     output_mol: Path,
     pose_index: int | None = None,
+    title: str | None = None,
 ) -> Path:
     """Convert ligand pose (PDBQT/DLG/SDF/JSON) to MDL V2000 format.
 
     ``pose_index`` selects a specific record inside a multi-record SDF/PDBQT
     when the pose selector (``compute_submission_scores``) identifies a pose
     by name like ``vina_seed_42_3``. When ``None``, the first record is used.
+    ``title`` overrides the MDL block's first-line name; when not supplied
+    RDKit's default ``"     RDKit          3D"`` leaks through and carries
+    no source information. Passing ``pose.pose_name`` here is the canonical
+    call.
     """
     if pose_path is None or str(pose_path) in ("", "."):
         raise ValueError(
@@ -237,11 +242,11 @@ def pose_to_mdl(
     suffix = pose_path.suffix.lower()
 
     if suffix == ".sdf":
-        _sdf_to_mdl(pose_path, output_mol, record_index=pose_index or 0)
+        _sdf_to_mdl(pose_path, output_mol, record_index=pose_index or 0, title=title)
         return output_mol
 
     if suffix in (".pdbqt", ".dlg"):
-        _pdbqt_to_mdl(pose_path, output_mol, record_index=pose_index or 0)
+        _pdbqt_to_mdl(pose_path, output_mol, record_index=pose_index or 0, title=title)
         return output_mol
 
     if suffix == ".json":
@@ -252,7 +257,7 @@ def pose_to_mdl(
         if sdf_str:
             tmp_sdf = output_mol.with_suffix(".tmp.sdf")
             tmp_sdf.write_text(sdf_str)
-            _sdf_to_mdl(tmp_sdf, output_mol, record_index=0)
+            _sdf_to_mdl(tmp_sdf, output_mol, record_index=0, title=title)
             tmp_sdf.unlink(missing_ok=True)
             return output_mol
         raise ValueError(f"Could not extract SDF from {pose_path}")
@@ -262,8 +267,19 @@ def pose_to_mdl(
     )
 
 
-def _sdf_to_mdl(sdf_path: Path, output_mol: Path, record_index: int = 0) -> None:
-    """Extract ``record_index``-th mol from SDF and write as MDL V2000."""
+def _sdf_to_mdl(
+    sdf_path: Path,
+    output_mol: Path,
+    record_index: int = 0,
+    title: str | None = None,
+) -> None:
+    """Extract ``record_index``-th mol from SDF and write as MDL V2000.
+
+    ``title`` forces the MDL block's title/header line. When unset we fall
+    back to the mol's ``_Name`` property (if present) and finally to RDKit's
+    default ``"     RDKit          3D"`` — which the evaluator then picks up
+    as the pose name. Passing an explicit ``title`` avoids that.
+    """
     from rdkit import Chem
     supplier = Chem.SDMolSupplier(str(sdf_path), removeHs=False, sanitize=False)
     mol = None
@@ -276,11 +292,18 @@ def _sdf_to_mdl(sdf_path: Path, output_mol: Path, record_index: int = 0) -> None
             f"Failed to read record {record_index} from SDF: {sdf_path} "
             f"(supplier had {sum(1 for _ in Chem.SDMolSupplier(str(sdf_path), removeHs=False, sanitize=False))} records)"
         )
+    if title:
+        mol.SetProp("_Name", title)
     mol_block = Chem.MolToMolBlock(mol, kekulize=True)
     output_mol.write_text(mol_block)
 
 
-def _pdbqt_to_mdl(pdbqt_path: Path, output_mol: Path, record_index: int = 0) -> None:
+def _pdbqt_to_mdl(
+    pdbqt_path: Path,
+    output_mol: Path,
+    record_index: int = 0,
+    title: str | None = None,
+) -> None:
     """Convert PDBQT/DLG → MDL via meeko mk_export.py, then clean up."""
     import subprocess
     import sys
@@ -294,7 +317,7 @@ def _pdbqt_to_mdl(pdbqt_path: Path, output_mol: Path, record_index: int = 0) -> 
                 check=True, capture_output=True, text=True, timeout=60,
             )
             if tmp_sdf.exists():
-                _sdf_to_mdl(tmp_sdf, output_mol, record_index=record_index)
+                _sdf_to_mdl(tmp_sdf, output_mol, record_index=record_index, title=title)
                 tmp_sdf.unlink(missing_ok=True)
                 return
         except Exception:
@@ -307,7 +330,7 @@ def _pdbqt_to_mdl(pdbqt_path: Path, output_mol: Path, record_index: int = 0) -> 
             check=True, capture_output=True, text=True,
         )
         if tmp_sdf.exists():
-            _sdf_to_mdl(tmp_sdf, output_mol, record_index=record_index)
+            _sdf_to_mdl(tmp_sdf, output_mol, record_index=record_index, title=title)
             tmp_sdf.unlink(missing_ok=True)
             return
     except (FileNotFoundError, subprocess.CalledProcessError):
@@ -503,7 +526,7 @@ def main() -> int:
         _, rec_idx = _split_pose_name(pose.pose_name)
         pose_path = pose.pose_file
         mdl_file = workdir / f"ligand_model{i}.mol"
-        pose_to_mdl(pose_path, mdl_file, pose_index=rec_idx)
+        pose_to_mdl(pose_path, mdl_file, pose_index=rec_idx, title=pose.pose_name)
         mdl_text = mdl_file.read_text()
         model_lscore = pose.lscore
         if i == 1 and args.lscore is not None:

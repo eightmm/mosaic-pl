@@ -278,12 +278,14 @@ def _stage_cofolding_poses(run_dir: Path, staged_dir: Path) -> dict[str, Path]:
             mol = _extract_cofolding_ligand(cif, template_heavy)
             if mol is None:
                 continue
-            # Deliberately do not SetProp("_Name") — BA-Pred and RMSD-Pred
-            # disagree on how they combine an existing _Name with the
-            # record index (BA uses _Name directly; RMSD appends "_<idx>"
-            # producing e.g. cofold_af3_0_0). Leaving _Name unset makes
-            # both tools fall back to "{filename_stem}_{idx}" which joins
-            # cleanly in compute_submission_scores.aggregate().
+            # Set a meaningful _Name so downstream MDL blocks (in the CASP
+            # LG submission) carry the pose source instead of RDKit's
+            # generic "RDKit          3D" default title. BA-Pred reads
+            # _Name directly while RMSD-Pred appends a record index on top
+            # of it, producing a double-indexed name (``cofold_af3_0_0``);
+            # compute_submission_scores._canonicalize collapses that to
+            # ``cofold_af3_0`` so the two tools still join 1-1.
+            mol.SetProp("_Name", f"{key}_{n}")
             writer.write(mol)
             n += 1
         writer.close()
