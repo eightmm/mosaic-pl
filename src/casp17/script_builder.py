@@ -282,6 +282,13 @@ def build_wrapper_shell_script(
             'export LD_LIBRARY_PATH="$_nv_lib:$LD_LIBRARY_PATH"; done',
             f"export PATH={shlex.quote(str(repo_root / '.local' / 'bin'))}:$PATH",
             'echo "Starting CASP17 wrapper pipeline"',
+            # Stamp the assigned GPU/node up-front so post-hoc log review
+            # (e.g. diagnosing CUDA kernel mismatches on a specific node)
+            # can tell which GPU ran this job without sacct round-trips.
+            'echo "--- GPU allocation ---"',
+            'echo "SLURM_NODELIST=${SLURM_NODELIST:-<none>}  SLURM_JOB_ID=${SLURM_JOB_ID:-<none>}"',
+            'nvidia-smi --query-gpu=name,compute_cap,driver_version,memory.total --format=csv,noheader 2>/dev/null || echo "(nvidia-smi unavailable)"',
+            'echo "----------------------"',
         ]
     )
     align_script = repo_root / "scripts" / "align_cofolding_outputs.py"
