@@ -149,6 +149,7 @@ flowchart LR
 - 리간드가 있으면 `properties.affinity` 자동 추가 (Boltz 전용)
 - Boltz-2: `use_potentials=false`, Boltz-2x: `use_potentials=true` (별도 run)
 - `prepare_boltz()` → `[boltz2, boltz2x]` 리스트 반환
+- **AF3 chain id remap**: AF3 스키마가 `^[A-Z]+$`만 허용해서 `L2`/`X2`/`L3` 같은 숫자 포함 id는 validate에서 `ValueError: IDs must be upper case letters`로 거절됨. `prepare_alphafold3`는 단일 letter id는 유지, 그 외는 미사용 letter (A..Z → AA..ZZ 순)로 배정하고 `bondedAtomPairs`의 chain 참조도 동일 remap 적용. Boltz/Protenix는 YAML id 그대로 사용 (downstream 비교 시 주 binder `L`만 전 툴 공통)
 
 ### Step 2-2: Model Inference
 
@@ -372,25 +373,41 @@ flowchart TB
 
 3개 트랙으로 구성. Track 1은 항상 실행, Track 2+3은 MCS >= threshold일 때 자동 활성화.
 
-### Track 1: Cofolding-based Docking (항상 실행)
+### Track 1: Cofolding-based Docking (항상 실행) — **3-variant fan-out**
 
-Cofolding best model의 구조를 receptor로, SwinSite/P2Rank 예측 위치를 docking box로 사용.
-**Multi-seed**: Vina/ADG는 5개 seed 반복, PxDock은 비용 때문에 1회만 실행.
+Cofolding best model을 receptor로, **세 binding-site 예측기 (cofolding ligand centroid / SwinSite / P2Rank)의 좌표 각각을 독립 docking box로** 사용해서 Vina와 AutoDock-GPU를 **3 × 2 = 6 variant**로 병렬 실행. PxDock은 cache-map 재생성 비용 때문에 기존대로 단일 run 유지.
 
 ```mermaid
-flowchart LR
-    PREP["docking_prep_summary.json"] --> LOOP["for seed in\n[42, 101, 202, 303, 404]"]
-    LOOP --> ENV["DOCK_SEED=$seed\nDOCK_OUT_DIR=.../seed_$seed\npython run_vina.py\npython run_autodock_gpu.py"]
-    PREP --> PXD["run_protenix_dock.py\n(single seed, no loop)"]
-    ENV --> OUT1["Vina: 5 × 10 poses = 50\nADG: 5 × 100 runs"]
-    PXD --> OUT2["PxDock: 1 run"]
+flowchart TB
+    PREP["docking_prep_summary.json\n(binding_site_predictions: {cofolding, swinsite, p2rank})"]
+
+    subgraph VARIANTS["6 variants × 5 seeds"]
+        direction LR
+        V_CF["vina_cofolding"]
+        V_SW["vina_swinsite"]
+        V_P2["vina_p2rank"]
+        A_CF["autodock-gpu_cofolding"]
+        A_SW["autodock-gpu_swinsite"]
+        A_P2["autodock-gpu_p2rank"]
+    end
+
+    PREP --> VARIANTS
+    PREP --> PXD["protenix-dock\n(single seed)"]
+
+    VARIANTS --> OUT1["outputs/{variant}/seed_N/docked.{pdbqt,dlg}"]
+    PXD --> OUT2["outputs/protenix_dock/*_out.json"]
+
     style OUT1 fill:#66bb6a,color:#000
     style OUT2 fill:#f48fb1,color:#000
 ```
 
-- Runner scripts read `DOCK_SEED` / `DOCK_OUT_DIR` env vars (set by wrapper)
-- Each seed outputs to separate `seed_N/` subdirectory
-- **Config**: `docking_seeds: [42, 101, 202, 303, 404]`
+- 각 variant는 생성 시점에 `BOX_SOURCE = 'cofolding'|'swinsite'|'p2rank'`가 runner script에 baked-in 됨 (`scripts/run_vina_cofolding.py`, `run_autodock_gpu_swinsite.py`, ...)
+- 런타임에 `summary['binding_site_predictions'][BOX_SOURCE]['center']`를 읽어 box 설정. 해당 predictor가 pocket을 못 찾아 dict에 key가 없으면 **`sys.exit(0)`으로 clean skip** — 다른 variant는 계속 진행. 7hqq 사례에서 SwinSite 미검출 시 `vina_swinsite`/`autodock-gpu_swinsite`가 no-op으로 넘어가고 나머지 4 variant는 정상 실행
+- 변수 환경: Runner scripts read `DOCK_SEED` / `DOCK_OUT_DIR` (wrapper가 seed 루프에서 주입)
+- `docking_prep_summary.json`의 `box_method` 필드는 여전히 1순위 예측기(`cofolding`)를 가리키지만, `binding_site_predictions` dict에 **세 예측 모두 저장**되어 각 variant가 자기 source를 고를 수 있음
+- **타겟당 pose pool**: Track 1 alone 약 50 (Vina 3variant × 5seed × ?poses) + 25 (ADG 3variant × 5seed × ?) + 8 (PxDock) ≈ **~90 기본 Track 1 pose**, cofolding pose 100 + Track 2/3 pose 추가되면 ~250
+- **Design rationale**: cofolding이 잘못된 pocket을 잡으면 Track 1이 완전히 빗나갔던 문제(예: 7hqq 20Å 오차)를 SwinSite/P2Rank가 독립 시그널로 구제. 3개 predictor가 같은 pathology를 공유해도 Track 2/3의 template-anchored docking이 backup
+- **Config**: `docking_seeds: [42, 101, 202, 303, 404]` (variant는 자동, config 불필요)
 
 ```mermaid
 flowchart LR
@@ -411,11 +428,11 @@ flowchart LR
     style PXDOCK fill:#f48fb1,color:#000
 ```
 
-| Tool | Type | 소요 시간 | venv | Output (per docking seed) |
-|------|------|----------|------|--------|
-| Vina | Python API | ~3s | `.venvs/protenix-dock` | `outputs/vina/seed_<seed>/docked.pdbqt` |
-| AutoDock-GPU | CUDA binary | ~10s | `.local/bin/` | `outputs/autodock_gpu/seed_<seed>/docking.dlg` |
-| Protenix-Dock | CPU force field | ~5-30min | `.venvs/protenix-dock` | `outputs/protenix_dock/*_out.json` (single run, no seed loop) |
+| Tool | Variants | Type | 소요 시간/seed | venv | Output |
+|------|----------|------|--------|------|--------|
+| Vina | `vina_{cofolding,swinsite,p2rank}` | Python API (CPU) | ~3s | `.venvs/protenix-dock` | `outputs/vina_<source>/seed_<seed>/docked.pdbqt` |
+| AutoDock-GPU | `autodock-gpu_{cofolding,swinsite,p2rank}` | CUDA binary | ~10s | `.local/bin/` | `outputs/autodock_gpu_<source>/seed_<seed>/docking.dlg` |
+| Protenix-Dock | (single, no fan-out) | CPU force field | ~5-30min | `.venvs/protenix-dock` | `outputs/protenix_dock/*_out.json` |
 
 - 모든 tool은 `docking_prep_summary.json`에서 receptor/ligand/box를 runtime에 읽음
 - AutoDock-GPU 래퍼는 추가로 **런타임에 ligand pdbqt를 파싱**해서 `ligand_types`와 grid map을 동적으로 구성 — F/Cl/Br/P/I/Si 등 비표준 원자 타입도 자동 대응 (adapter 시점에는 하드코딩된 기본값을 쓰지 않음)
@@ -605,7 +622,9 @@ flowchart TB
 ```
 
 - **Script**: `scripts/run_post_analysis.py` (GPU node에서 실행)
-- **venv**: `.venvs/pred` (torch 2.4 + dgl 2.4 + openbabel + rdkit)
+- **venv**: `.venvs/pred` (torch 2.4 + dgl 2.4 + openbabel + rdkit) — **sm_90/sm_100 (H100, Blackwell 6000pro) kernel 미포함**이므로 `heavy` partition에서 돌리면 `no kernel image for execution` 에러 → `test`/`6000ada`만 사용 권장 (scheduling 레벨에서 partition 지정)
+- **Variant-aware 자동 발견**: `find_ligand_files`가 `outputs/vina_*/seed_*` / `outputs/autodock_gpu_*/seed_*` 를 glob으로 스캔 → `vina_cofolding`, `vina_swinsite`, `vina_p2rank`, `autodock_gpu_cofolding`, ... 각각 독립 tool key로 staging. TSV도 `ba_pred_vina_cofolding.tsv` 식으로 분리
+- **BA-Pred vs RMSD-Pred 이름 규칙 정규화**: BA-Pred는 SDF 레코드의 `_Name`을 그대로 씀, RMSD-Pred는 `_Name`에 record index를 한 번 더 붙임(`cofold_af3_0_0`). `compute_submission_scores.aggregate::_canonicalize`가 pose name을 part 단위로 walk down하면서 staged 파일이 존재하는 최장 prefix 찾아 단일 record-index 형태로 축소 → BA/RMSD 두 TSV가 canonical key에서 1-1 join되도록 복구
 - **Pose 수집 규칙**:
   - multi-seed docking 결과(`vina`, `autodock_gpu`)는 각 seed 파일을 `outputs/analysis/poses/{tool}_seed_{N}.{ext}`로 유니크 stem으로 복사. BA-Pred/RMSD-Pred의 `{basename}_{idx}` pose 명명 규칙 때문에 stem이 유니크해야 TSV row가 seed별로 분리됨
   - 각 staged 파일에 대해 meeko `mk_export.py`로 `.sdf` 복제본도 생성 → downstream `make_casp_submission.py`가 pose를 레코드 인덱스로 정확히 꺼낼 수 있음
@@ -678,7 +697,8 @@ CASP LG 포맷은 MODEL 1..5까지 허용. 단순 top-5 선택 시 매우 유사
 - **Primary 기준이 pRMSD로 변경**된 이유: LSCORE는 threshold 기반 sigmoid-like 확률이라 0.95–0.99 구간이 포화되고 변별력이 약함. pRMSD는 연속 회귀 값이라 단일 Å 수준의 차이를 보존 → diverse top-5에서 더 좋은 spread 확보. LSCORE는 여전히 LG MODEL 헤더에 그대로 기록됨 (표시/컴파일러 호환 목적).
 - Heavy-atom RMSD: RDKit `CalcRMS` (symmetry-aware, sanitized mol, same receptor frame이므로 alignment 불필요)
 - Pose 파일 해상: `pose_name` (`{stem}_{record_idx}`)에서 역산 → `outputs/analysis/poses/{stem}.sdf`의 정확한 레코드 (`_resolve_pose_file` + `_split_pose_name`)
-- 후보 pool: docking 툴(`vina/autodock_gpu/protenix_dock/template/lig_align`) + cofolding aligned 포즈(`cofold_boltz2/boltz2x/protenix/af3`)
+- 후보 pool (Track 1 3-variant fan-out 반영): `vina_{cofolding,swinsite,p2rank}`, `autodock_gpu_{cofolding,swinsite,p2rank}`, `protenix_dock`, `template`, `lig_align`, `cofold_{boltz2,boltz2x,protenix,af3}` — 타겟당 약 200-250 pose
+- **MDL title 정책**: `pose_to_mdl`가 `title=pose.pose_name`을 인자로 받아 `mol.SetProp("_Name", title)` 후 `MolToMolBlock` 작성. RDKit의 기본 타이틀 `"     RDKit          3D"`로 떨어지던 옛 동작이 제거되어 LG 파일의 MDL 첫 줄에 pose source(`vina_p2rank_seed_202_5`, `cofold_protenix_17` 등)가 그대로 기록됨. evaluator가 LIGAND 다음 non-control 줄을 pose name으로 읽기 때문에 이 변경이 없으면 `MODEL N RDKit 3D lig_rmsd=None`으로 나옴
 - **Config**: `--top-k 5 --diversity-rmsd 2.0` (CLI args)
 
 ### Step 7-2: LG Format Assembly
@@ -756,6 +776,15 @@ python scripts/make_casp_submission.py \
 ### Wrapper Integration
 
 Post-analysis and CASP submission are fully integrated into the wrapper script, so running `prepare-wrapper` + `sbatch` auto-executes **all 8 stages** end-to-end.
+
+**GPU 할당 stamp**: wrapper 시작 직후 아래 블록이 자동 실행되어 log 맨 앞에 어느 노드/GPU가 할당됐는지 기록 — CUDA kernel compat 문제를 사후에 노드별로 판독하기 쉽게 함.
+
+```bash
+echo "--- GPU allocation ---"
+echo "SLURM_NODELIST=${SLURM_NODELIST}  SLURM_JOB_ID=${SLURM_JOB_ID}"
+nvidia-smi --query-gpu=name,compute_cap,driver_version,memory.total --format=csv,noheader
+echo "----------------------"
+```
 
 Config knobs:
 ```yaml
@@ -869,8 +898,8 @@ Wrapper pipeline에서 stage 사이에 자동 삽입되는 bridge step 목록.
 | Boltz MSA → AF3 | Boltz → AF3 (cofolding 내부) | `bridge_boltz_msa_to_af3.py` | MSA CSV → A3M + AF3 JSON 패치 |
 | Template Filter | template-search-sequence 직후 | `run_template_filter.py` | Tanimoto + MCS scoring (+ 옵션: `--max-deposition-date`로 time-split) |
 | **Frame Alignment** | **cofolding 직후** | **`align_cofolding_outputs.py`** | **모든 CIF → 공통 좌표계 Kabsch 정렬 (`_aligned.cif`)** |
-| Docking Prep | alignment → docking 사이 | `prepare_docking_inputs.py` | 자동 모델 선택 (`_aligned.cif` 우선) + binding site (cofolding > SwinSite > P2Rank) + 파일 변환 |
-| Multi-track Docking | docking 직후 (조건부) | `run_multi_track_docking.py` | Track 2 + Track 3 실행 |
+| Docking Prep | alignment → docking 사이 | `prepare_docking_inputs.py` | 자동 모델 선택 (`_aligned.cif` 우선) + **세 binding-site predictor 전부 수집** (cofolding centroid + SwinSite + P2Rank) → summary.json `binding_site_predictions` dict에 저장. 이전엔 priority로 한 개만 골랐지만 이제 Track 1 fan-out이 모두 소비 + 파일 변환 |
+| Multi-track Docking | docking 직후 (조건부) | `run_multi_track_docking.py` | Track 2 + Track 3 실행. `prepare_template_docking.py`의 `cif_to_receptor_pdb`는 RCSB CIF의 multi-char chain id(`AAA` 등)를 단일 letter로 정규화(PDB column 위반 방지), `extract_template_ligand_sdf`도 동일 정규화 |
 | Ion Placement | multi-track 직후 (조건부) | `collect_template_ions.py` | template alignment → ion 위치 수집 |
 | Score Aggregation | post-analysis 후 | `compute_submission_scores.py` | BA/RMSD/Boltz 집계 + **diversity-aware top-5 selection** |
 | CASP Submission | 최종 | `make_casp_submission.py` | LG format .lg 파일 생성 (**multi-MODEL 1..5**) |
@@ -902,6 +931,10 @@ Wrapper pipeline에서 stage 사이에 자동 삽입되는 bridge step 목록.
 | `experiments/novel2025_test/` | 499 / 543 (RCSB 2025-01-01 이후 non-redundant) | 시간 분할 held-out 벤치 | `template_search_sequence.max_deposition_date: "2025-01-01"` — template leakage 차단 |
 
 `novel2025_test`는 `max_deposition_date` + RCSB non-redundant 인덱스를 결합해 "2025년 이후에만 공개된 구조"를 타겟팅하고, template 검색은 pre-2025 PDB로 제한한다. 자세한 입력 컬럼 매핑과 ligand 선정 규칙은 `experiments/novel2025_test/README.md` 참조.
+
+**Partition 제약**: `heavy` (gpu1, H100 + Blackwell 6000pro)는 **사용 금지**. 이유: `.venvs/pred`의 dgl 2.4 / torch 2.4 빌드가 sm_90/sm_100 kernel을 포함하지 않아 BA-Pred/RMSD-Pred 실행 시 `no kernel image for execution on the device` 에러로 즉시 종료. Task는 exit 0으로 끝나 보이지만 post-analysis TSV가 비어 있어 `make_casp_submission.py`가 `No poses selected`로 실패. → `novel2025_config.yaml::slurm.partition` 및 `run_array.sbatch.sh`의 `#SBATCH --partition`을 **`6000ada`로만** 고정 (gpu3/gpu4). Protenix(torch 2.7 + CUDA 12.6)도 동일 kernel compat 이슈로 heavy에서 seed별 retry 발생 → 전체 런타임 +15분 손실.
+
+**Build-time SMILES 파서 (`build_inputs.py::_smart_split_smiles`)**: RCSB index TSV가 `|`를 (a) 다중-리간드 separator, (b) HEM 같은 분자 내 segment separator(`[Fe]5|6|...`) 둘 다로 쓰는 기형 포맷이라 naive `split("|")` 시 HEM-carrying 타겟 16개 YAML이 깨진 SMILES 조각으로 채워져 AF3 `ValueError: Unable to make RDKit Mol from SMILES`로 죽음. 헬퍼는 `|`로 쪼갠 후 RDKit `MolFromSmiles`로 각 chunk를 validate → invalid chunk를 greedy-concat하여 valid SMILES로 재조립. CCD 개수를 ground truth로 써서 불일치 시 naive split fallback.
 
 ---
 
