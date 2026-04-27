@@ -7,22 +7,41 @@ novel2025_test (489 타겟) 위에서의 ablation 결과 전부.
 ## TL;DR
 
 여러 후보 (RRF, cluster, cascaded, …) 를 ablation 한 결과
-**`lscore_top5_diverse` 가 명확한 winner**:
+**`lscore_top5_diverse` 가 명확한 winner**.
 
-| ranker (full 489) | n   | top-1 < 2 Å | best-5 < 2 Å |
-|-------------------|----:|------------:|-------------:|
-| **`lscore_top5_diverse`** ⭐ | 419 | 113 (27.0 %) | **177 (42.2 %)** |
-| `cascaded_top5`            | 403 | 104 (25.8 %) | 157 (39.0 %) |
-| `cascaded` (top-1 only)    | 403 | 104 (25.8 %) | 104 (25.8 %) |
-| `legacy_pRMSD` (현 prod)   | 416 |  97 (23.3 %) |  97 (23.3 %) |
-| `lscore` baseline (top-1)  | 419 | 113 (27.0 %) | 113 (27.0 %) |
+**Uniform-denominator 검증 (v4)** — 모든 ranker 가 동일 470 타겟 위에서 비교:
 
-(`n` 차이는 ranker 마다 fallback 경로가 달라 일부 타겟에서 pose lookup 이 실패했기
-때문이다 — 평가에는 본인이 픽한 타겟만 들어간다. 분모 차이는 SR 비교에 작은 노이즈만
-준다.)
+| ranker                   | n   | top-1 < 2 Å | best-5 < 2 Å |
+|--------------------------|----:|------------:|-------------:|
+| **`lscore_top5_diverse`** ⭐ | 470 | 112 (23.8 %) | **182 (38.7 %)** |
+| `cascaded_top5`              | 470 | 112 (23.8 %) | 172 (36.6 %) |
+| `cascaded` (top-1 only)      | 470 | 112 (23.8 %) | 112 (23.8 %) |
+| `lscore` baseline (top-1)    | 470 | 112 (23.8 %) | 112 (23.8 %) |
+| `legacy_pRMSD` (현 prod)     | 470 |  99 (21.1 %) |  99 (21.1 %) |
 
-→ legacy 대비 **+18.9 %p best-5**, oracle (58.7 %) 까지의 갭을
-33.5 %p → 16.5 %p 로 절반 회수.
+→ legacy 대비 **+17.6 %p best-5**, oracle (58.7 %) 까지의 갭 33.5 → ~20 %p 회수.
+
+**Per-zone (`lscore_top5_diverse` best-5):**
+- novel: 38.2 % (n=68)
+- remote: **50.9 %** (n=112)
+- related: 34.1 % (n=290)
+
+### 분모 = 470 의 의미
+원래 truth map 은 497 타겟. validator 가 모든 ranker 의 top-1 lookup 이 성공한
+**교집합** 만 카운트:
+- 27 타겟이 lookup 실패로 drop
+  - 대부분: cofold dedup mismatch 또는 lig_align "Conformer_N_Rank_M_K" 의
+    pose_name 불일치 (CSV 가 일부 dedup 전 단계 entry 보유)
+  - 모든 ranker 가 동일하게 영향 받아 ranker-간 비교에는 noise 없음
+
+### 데이터 fix 이력 (v3 → v4)
+- v3 (n=419, lscore_top5 = 42.2 %): `_resolve_pose_file` 가 `protenix_dock_L`
+  pose 의 SDF 못 찾아서 score_per_metric.py 가 pxdock 행을 CSV 에 안 씀.
+  validator 가 cascaded 의 pxdock 픽 lookup 실패시켜 70 타겟 drop.
+- v4 (n=470, lscore_top5 = 38.7 %): pose_file 버그 수정 + `supplement_pxdock.py`
+  로 380 타겟 / 5656 pxdock 행 보충 + intersection 로직 추가.
+- v4 의 SR 가 v3 보다 약간 낮은 이유: intersection 분모가 더 컴 (419 → 470)
+  + 추가된 27 dropped 타겟 들이 평균보다 약간 어렵.
 
 ## Algorithm
 

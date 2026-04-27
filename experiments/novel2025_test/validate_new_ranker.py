@@ -174,26 +174,50 @@ def main():
         # Per-target shared mol cache: pose mols loaded once across rankers
         # (saves 3-5x SDMolSupplier calls when multiple rankers need coords).
         mol_cache: dict = {}
+
+        # First pass: run all rankers, collect picks. We'll only commit to
+        # results if EVERY ranker's top-1 has a successful truth lookup —
+        # this keeps the denominator identical across rankers so SR is
+        # comparable on the same target set. A target where any ranker's
+        # top-1 fails lookup is added to ``lookup_fails`` and dropped from
+        # all rankers.
+        per_ranker_pick: dict[str, tuple[list[PoseScore], float | None]] = {}
+        any_lookup_fail = False
         for rid, fn in rankers:
             try:
                 picks = fn(poses, mol_cache)
             except Exception as e:
-                print(f"  [{target}/{rid}] failed: {e}")
-                continue
+                print(f"  [{target}/{rid}] failed: {e}", flush=True)
+                any_lookup_fail = True
+                break
             if not picks or picks[0] is None:
-                continue
+                # Some rankers may legitimately return empty (no candidate
+                # with required score type). Treat as missing → drop target
+                # for fair comparison.
+                any_lookup_fail = True
+                break
             top1_t = lookup_true_rmsd(truth, target, picks[0])
-            best5 = None
-            for p in picks:
+            if top1_t is None:
+                print(f"  [{target}/{rid}] truth lookup miss: src={picks[0].source!r} name={picks[0].pose_name!r}", flush=True)
+                any_lookup_fail = True
+                break
+            per_ranker_pick[rid] = (picks, top1_t)
+
+        if any_lookup_fail:
+            fails.append(target)
+            continue
+
+        # Commit: every ranker has a valid top-1. Compute best-of-5 best.
+        for rid, (picks, top1_t) in per_ranker_pick.items():
+            best5 = top1_t  # top-1 is always among the top-5 candidates
+            for p in picks[1:]:
                 if p is None:
                     continue
                 t = lookup_true_rmsd(truth, target, p)
                 if t is None:
                     continue
-                if best5 is None or t < best5:
+                if t < best5:
                     best5 = t
-            if top1_t is None:
-                continue
             results[rid].setdefault(zone, []).append((top1_t, best5))
 
         # Periodic JSON checkpoint — survives if process dies mid-batch.

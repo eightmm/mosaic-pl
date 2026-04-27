@@ -601,10 +601,23 @@ def _resolve_pose_file(run_dir: Path, tool: str, pose_name: str) -> Path | None:
         if c.exists():
             return c
 
-    # Protenix-Dock multi-record SDF (one file, many poses)
-    pxdock_sdf = run_dir / "outputs" / "protenix_dock" / "poses.sdf"
-    if tool == "protenix_dock" and pxdock_sdf.exists():
-        return pxdock_sdf
+    # Protenix-Dock multi-record SDF (one file, many poses).
+    # Multi-ligand refactor renames the tool key to ``protenix_dock_{lig_id}``
+    # (e.g. ``protenix_dock_L``, ``protenix_dock_L2``); each ligand has its
+    # own ``poses_{lig_id}.sdf``. Legacy single-ligand layout used the bare
+    # ``protenix_dock`` key + ``poses.sdf``.
+    if tool.startswith("protenix_dock"):
+        pxdock_dir = run_dir / "outputs" / "protenix_dock"
+        # Multi-ligand: poses_L.sdf, poses_L2.sdf
+        if tool != "protenix_dock":
+            lig_id = tool[len("protenix_dock_"):]
+            multi = pxdock_dir / f"poses_{lig_id}.sdf"
+            if multi.exists():
+                return multi
+        # Legacy / fallback: poses.sdf
+        legacy_pxdock = pxdock_dir / "poses.sdf"
+        if legacy_pxdock.exists():
+            return legacy_pxdock
 
     # Legacy flat layouts (single-seed pipelines before multi-seed refactor)
     legacy = [

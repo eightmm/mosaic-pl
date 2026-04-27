@@ -1,0 +1,81 @@
+targets in truth map: 497
+  [20/497] elapsed=10s eta=242s
+  [40/497] elapsed=19s eta=217s
+  [7hsa/cascaded] truth lookup miss: src='template_8p8k_lig_align_L' name='Conformer_148_Rank_3_2'
+  [7hsf/legacy_pRMSD] truth lookup miss: src='template_8p8k_lig_align_L' name='Conformer_453_Rank_2_1'
+  [80/497] elapsed=39s eta=203s
+  [7ht0/cascaded] truth lookup miss: src='template_8p8k_lig_align_L' name='Conformer_253_Rank_1_0'
+  [100/497] elapsed=48s eta=190s
+  [7htr/lscore] truth lookup miss: src='template_8p8k_lig_align_L' name='Conformer_217_Rank_3_2'
+  [7hu2/cascaded] truth lookup miss: src='template_8p8k_lig_align_L' name='Conformer_317_Rank_4_3'
+  [120/497] elapsed=57s eta=180s
+  [7hu5/legacy_pRMSD] truth lookup miss: src='template_8qs0_lig_align_L' name='Conformer_339_Rank_4_3'
+  [7hu8/lscore] truth lookup miss: src='template_8p8k_lig_align_L' name='Conformer_338_Rank_2_1'
+  [7hub/lscore] truth lookup miss: src='template_8p8k_lig_align_L' name='Conformer_141_Rank_2_1'
+  [140/497] elapsed=74s eta=190s
+  [160/497] elapsed=91s eta=191s
+  [180/497] elapsed=102s eta=180s
+  [200/497] elapsed=110s eta=164s
+  [9eia/cascaded] truth lookup miss: src='template_6c1w_lig_align_L' name='Conformer_8_Rank_4_3'
+  [9emt/lscore] truth lookup miss: src='cofold_protenix' name='cofold_protenix_0'
+  [220/497] elapsed=132s eta=166s
+  [9fw1/cascaded] truth lookup miss: src='template_8wdw_lig_align_L' name='Conformer_251_Rank_2_1'
+  [9g45/cascaded] truth lookup miss: src='template_6xui_lig_align_L' name='Conformer_443_Rank_1_0'
+  [9g46/cascaded] truth lookup miss: src='template_6xui_lig_align_L' name='Conformer_443_Rank_1_0'
+  [9g4h/cascaded] truth lookup miss: src='template_6xui_lig_align_L' name='Conformer_443_Rank_1_0'
+  [240/497] elapsed=139s eta=149s
+  [260/497] elapsed=150s eta=137s
+  [9hjy/cascaded] truth lookup miss: src='template_3h7d_lig_align_L' name='Conformer_252_Rank_5_4'
+  [280/497] elapsed=163s eta=126s
+  [300/497] elapsed=180s eta=118s
+  [9j7m/lscore] truth lookup miss: src='cofold_protenix_L2' name='cofold_protenix_L2_15'
+  [320/497] elapsed=188s eta=104s
+  [9jzf/cascaded] truth lookup miss: src='template_3oab_lig_align_L' name='Conformer_341_Rank_2_1'
+  [340/497] elapsed=197s eta=91s
+  [360/497] elapsed=203s eta=77s
+  [380/497] elapsed=210s eta=65s
+  [9mgt/lscore] truth lookup miss: src='cofold_boltz2' name='cofold_boltz2_0'
+  [9mh5/lscore] truth lookup miss: src='vina_swinsite' name='vina_swinsite_seed_202_2'
+  [9mro/cascaded] truth lookup miss: src='template_3ejx_lig_align_L' name='Conformer_499_Rank_1_0'
+  [9mrp/cascaded] truth lookup miss: src='template_2gke_lig_align_L' name='Conformer_499_Rank_1_0'
+  [400/497] elapsed=217s eta=53s
+  [420/497] elapsed=224s eta=41s
+  [9q3k/lscore] truth lookup miss: src='cofold_protenix' name='cofold_protenix_2'
+  [440/497] elapsed=229s eta=30s
+  [9r07/lscore] truth lookup miss: src='cofold_protenix_L2' name='cofold_protenix_L2_6'
+  [9r7a/lscore] truth lookup miss: src='cofold_protenix_L' name='cofold_protenix_L_0'
+  [9s3a/cascaded] truth lookup miss: src='template_4chs_lig_align_L' name='Conformer_403_Rank_2_1'
+  [9s90/cascaded] truth lookup miss: src='template_4lsx_lig_align_L' name='Conformer_317_Rank_1_0'
+  [480/497] elapsed=242s eta=9s
+  [9whf/lscore] truth lookup miss: src='vina_swinsite_L' name='vina_swinsite_L_seed_101_4'
+
+fails: 27 (skipped — no run dir or empty)
+
+=== Per-ranker top-1 / best-5 success rate ===
+  ranker          zone         n   top1<2Å   best5<2Å   top1_med   best5_med
+  ----------------------------------------------------------------------------
+  lscore          novel       68    17(25.0%)    17(25.0%)       5.73        5.73
+  lscore          remote     112    29(25.9%)    29(25.9%)       4.62        4.62
+  lscore          related    290    66(22.8%)    66(22.8%)       6.58        6.58
+  lscore          TOTAL      470   112(23.8%)   112(23.8%)       5.99        5.99
+
+  lscore_top5     novel       68    17(25.0%)    26(38.2%)       5.73        2.99
+  lscore_top5     remote     112    29(25.9%)    57(50.9%)       4.62        1.98
+  lscore_top5     related    290    66(22.8%)    99(34.1%)       6.58        3.86
+  lscore_top5     TOTAL      470   112(23.8%)   182(38.7%)       5.99        2.99
+
+  legacy_pRMSD    novel       68    16(23.5%)    16(23.5%)       6.88        6.88
+  legacy_pRMSD    remote     112    28(25.0%)    28(25.0%)       4.62        4.62
+  legacy_pRMSD    related    290    55(19.0%)    55(19.0%)       7.44        7.44
+  legacy_pRMSD    TOTAL      470    99(21.1%)    99(21.1%)       6.62        6.62
+
+  cascaded        novel       68    17(25.0%)    17(25.0%)       5.73        5.73
+  cascaded        remote     112    29(25.9%)    29(25.9%)       4.62        4.62
+  cascaded        related    290    66(22.8%)    66(22.8%)       6.58        6.58
+  cascaded        TOTAL      470   112(23.8%)   112(23.8%)       5.99        5.99
+
+  cascaded_top5   novel       68    17(25.0%)    25(36.8%)       5.73        3.43
+  cascaded_top5   remote     112    29(25.9%)    53(47.3%)       4.62        2.10
+  cascaded_top5   related    290    66(22.8%)    94(32.4%)       6.58        4.09
+  cascaded_top5   TOTAL      470   112(23.8%)   172(36.6%)       5.99        3.34
+
