@@ -26,13 +26,23 @@ from pathlib import Path
 
 @dataclass
 class PoseScore:
-    source: str              # e.g. "vina", "autodock_gpu/seed_42", "template/1cgh/vina"
+    source: str              # e.g. "vina_cofolding_L", "autodock_gpu_swinsite_L2"
     pose_file: Path
-    pose_name: str           # e.g. "docked_0"
+    pose_name: str           # e.g. "vina_cofolding_L_seed_42_3"
     ba_pred_pkd: float | None = None
     rmsd_pred: float | None = None
     rmsd_gt_2a_prob: float | None = None
     docking_score: float | None = None  # kcal/mol
+    ligand_id: str | None = None   # "L", "L2", ... — derived from source tool key
+    # Cofold confidence (per-pose for cofold sources; docking-anchor cofold's
+    # value for vina/adg/pxdock; ``None`` for template poses).
+    iptm: float | None = None
+    ptm: float | None = None
+    plddt: float | None = None
+    conf: float | None = None
+    # Boltz per-pose affinity (cofold-Boltz poses only).
+    boltz_aff_log_kd_nM: float | None = None
+    boltz_binder_prob: float | None = None
 
     @property
     def lscore(self) -> float | None:
@@ -59,7 +69,251 @@ class PoseScore:
             "rmsd_gt_2a_prob": self.rmsd_gt_2a_prob,
             "lscore": self.lscore,
             "log_kd_nM": self.log_kd_nM,
+            "ligand_id": self.ligand_id,
+            "iptm": self.iptm,
+            "ptm": self.ptm,
+            "plddt": self.plddt,
+            "conf": self.conf,
+            "boltz_aff_log_kd_nM": self.boltz_aff_log_kd_nM,
+            "boltz_binder_prob": self.boltz_binder_prob,
         }
+
+
+def _infer_ligand_id(tool: str, known_ligand_ids: list[str] | None = None) -> str | None:
+    """Infer ligand id from a tool key.
+
+    The multi-ligand refactor appends ``_{lig_id}`` to every tool key
+    (``vina_cofolding_L``, ``cofold_boltz2_L2``, ``template_1abc_vina_L``).
+    Match the longest known ligand id at the end of the tool string to
+    disambiguate ``L`` vs ``L2`` suffixes.
+    """
+    if not known_ligand_ids:
+        return None
+    # Match longest first (L2 should win over L on "cofold_boltz2_L2").
+    for lig_id in sorted(known_ligand_ids, key=len, reverse=True):
+        if tool == lig_id or tool.endswith(f"_{lig_id}"):
+            return lig_id
+    return None
+
+
+def _discover_ligand_ids_from_summary(run_dir: Path) -> list[str]:
+    """Read ligand ids from ``inputs/docking/docking_prep_summary.json``."""
+    summary = run_dir / "inputs" / "docking" / "docking_prep_summary.json"
+    if not summary.exists():
+        return []
+    try:
+        data = json.loads(summary.read_text())
+    except Exception:
+        return []
+    return [str(lig.get("id")) for lig in (data.get("ligands") or []) if lig.get("id")]
+
+
+# ---------- Cofold confidence loading ----------
+#
+# Each cofold model writes one CIF per (seed × diffusion_sample) and a sibling
+# confidence/affinity JSON. ``run_post_analysis.py`` stages those CIFs into
+# ``analysis/poses/cofold_{model}_{lig}_{n}.sdf`` in ``sorted(rglob("*_aligned.cif"))``
+# order, so ``n`` is the index into that sorted list. We rebuild the same
+# list here to map (model, n) → confidence dict.
+
+_COFOLD_MODEL_SUBDIRS = {
+    "boltz2": "boltz2",
+    "boltz2x": "boltz2x",
+    "protenix": "protenix",
+    "af3": "alphafold3",
+}
+
+# Source-prefix → cofold model short name (matches `_stage_cofolding_poses`).
+_COFOLD_SOURCE_PREFIXES = {
+    "cofold_boltz2_": "boltz2",
+    "cofold_boltz2x_": "boltz2x",
+    "cofold_protenix_": "protenix",
+    "cofold_af3_": "af3",
+}
+
+
+def _read_json_safe(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return None
+
+
+def _confidence_for_cif(cif: Path, model: str) -> dict | None:
+    """Return ``{iptm, ptm, plddt, conf}`` for a single cofold CIF.
+
+    pLDDT is normalized to the [0, 100] scale (Boltz returns [0,1] → ×100;
+    Protenix already on [0,100]; AF3 has no aggregate plddt).
+    """
+    if model in ("boltz2", "boltz2x"):
+        i = cif.stem.replace("_aligned", "").rsplit("_model_", 1)[-1]
+        d = _read_json_safe(cif.parent / f"confidence_boltz_input_model_{i}.json")
+        if d is None:
+            return None
+        plddt = d.get("complex_plddt")
+        return {
+            "iptm": d.get("iptm"),
+            "ptm": d.get("ptm"),
+            "plddt": (plddt * 100.0) if plddt is not None else None,
+            "conf": d.get("confidence_score"),
+        }
+    if model == "protenix":
+        stem = cif.stem.replace("_aligned", "")
+        if "_sample_" not in stem:
+            return None
+        prefix, _sep, idx = stem.rpartition("_sample_")
+        d = _read_json_safe(cif.parent / f"{prefix}_summary_confidence_sample_{idx}.json")
+        if d is None:
+            return None
+        return {
+            "iptm": d.get("iptm"),
+            "ptm": d.get("ptm"),
+            "plddt": d.get("plddt"),
+            "conf": d.get("ranking_score"),
+        }
+    if model == "alphafold3":
+        stem = cif.stem.replace("_aligned", "")
+        conf_json = cif.parent / f"{stem}_summary_confidences.json"
+        if not conf_json.exists():
+            cand = list(cif.parent.glob("*_summary_confidences.json"))
+            if cand:
+                conf_json = cand[0]
+        d = _read_json_safe(conf_json)
+        if d is None:
+            return None
+        return {
+            "iptm": d.get("iptm"),
+            "ptm": d.get("ptm"),
+            "plddt": None,
+            "conf": d.get("ranking_score"),
+        }
+    return None
+
+
+def _build_cofold_confidence_map(run_dir: Path) -> dict[str, list[dict | None]]:
+    """``{model_short: [conf_per_pose_idx]}`` matching the staging order."""
+    out: dict[str, list[dict | None]] = {}
+    for short, subdir in _COFOLD_MODEL_SUBDIRS.items():
+        cifs = sorted((run_dir / "outputs" / subdir).rglob("*_aligned.cif"))
+        out[short] = [_confidence_for_cif(c, subdir) for c in cifs]
+    return out
+
+
+def _build_boltz_pose_affinity(run_dir: Path) -> dict[tuple[str, int], dict]:
+    """``{(model_short, pose_idx): {value, binder_prob}}`` for Boltz cofold poses.
+
+    Per-pose affinity comes from the sibling ``affinity_*.json`` (key
+    ``affinity_pred_value``) or sample-numbered variants ``affinity_pred_value{i}``
+    co-located with the same ``predictions/`` subdir.
+    """
+    out: dict[tuple[str, int], dict] = {}
+    for short, subdir in (("boltz2", "boltz2"), ("boltz2x", "boltz2x")):
+        cifs = sorted((run_dir / "outputs" / subdir).rglob("*_aligned.cif"))
+        for n, cif in enumerate(cifs):
+            i = cif.stem.replace("_aligned", "").rsplit("_model_", 1)[-1]
+            try:
+                model_idx = int(i)
+            except Exception:
+                continue
+            aff_json = next(cif.parent.glob("affinity_*.json"), None)
+            if aff_json is None:
+                continue
+            d = _read_json_safe(aff_json)
+            if d is None:
+                continue
+            val_k = f"affinity_pred_value{model_idx}" if model_idx > 0 else "affinity_pred_value"
+            prob_k = f"affinity_probability_binary{model_idx}" if model_idx > 0 else "affinity_probability_binary"
+            val = d.get(val_k, d.get("affinity_pred_value"))
+            prob = d.get(prob_k, d.get("affinity_probability_binary"))
+            if val is None or prob is None:
+                continue
+            out[(short, n)] = {"value": float(val), "binder_prob": float(prob)}
+    return out
+
+
+def _docking_anchor_confidence(run_dir: Path) -> dict | None:
+    """Confidence of the cofold structure used as docking anchor (constant across docked poses)."""
+    summary = run_dir / "inputs" / "docking" / "docking_prep_summary.json"
+    if not summary.exists():
+        return None
+    d = _read_json_safe(summary)
+    if d is None:
+        return None
+    cif_path = d.get("cofolding_structure")
+    model = d.get("cofolding_model")
+    if not cif_path or not model:
+        return None
+    p = Path(cif_path)
+    if not p.exists():
+        return None
+    return _confidence_for_cif(p, model if model != "af3" else "alphafold3")
+
+
+def _cofold_pose_idx(pose_name: str, model_short: str, ligand_id: str | None) -> int | None:
+    """Recover ``n`` from a staged cofold pose name.
+
+    Staging name is ``cofold_{model}_{lig}_{n}`` (or legacy ``cofold_{model}_{n}``);
+    RMSD-Pred appends ``_{record_idx}`` which ``_canonicalize`` collapses to one
+    record token. The first numeric token after the source prefix is ``n``.
+    """
+    candidates = [f"cofold_{model_short}_{ligand_id}_", f"cofold_{model_short}_"] if ligand_id else [f"cofold_{model_short}_"]
+    for prefix in candidates:
+        if pose_name.startswith(prefix):
+            tail = pose_name[len(prefix):].split("_")
+            if tail and tail[0].isdigit():
+                return int(tail[0])
+    return None
+
+
+def _attach_pose_confidence(
+    run_dir: Path,
+    pose_scores: list[PoseScore],
+) -> None:
+    """Populate iptm/ptm/plddt/conf and Boltz pose affinity in-place.
+
+    - cofold_{model}_* poses get per-pose values from the staging-order maps.
+    - Non-cofold poses (vina/adg/pxdock) inherit the docking-anchor cofold's
+      values (constant — useful as a "model confidence" prior, NOT for ranking
+      among docked poses since it doesn't vary).
+    - Template poses get nothing.
+    """
+    cofold_conf = _build_cofold_confidence_map(run_dir)
+    boltz_aff = _build_boltz_pose_affinity(run_dir)
+    anchor = _docking_anchor_confidence(run_dir)
+
+    for p in pose_scores:
+        # Identify cofold model from source prefix.
+        model_short = None
+        for prefix, m in _COFOLD_SOURCE_PREFIXES.items():
+            if p.source.startswith(prefix) or p.source == prefix.rstrip("_"):
+                model_short = m
+                break
+
+        if model_short is not None:
+            n = _cofold_pose_idx(p.pose_name, model_short, p.ligand_id)
+            if n is not None:
+                conf_list = cofold_conf.get(model_short) or []
+                if 0 <= n < len(conf_list) and conf_list[n] is not None:
+                    c = conf_list[n]
+                    p.iptm = c.get("iptm")
+                    p.ptm = c.get("ptm")
+                    p.plddt = c.get("plddt")
+                    p.conf = c.get("conf")
+                if model_short in ("boltz2", "boltz2x"):
+                    aff = boltz_aff.get((model_short, n))
+                    if aff:
+                        p.boltz_aff_log_kd_nM = aff["value"] + 3.0  # log10(IC50 μM) → log10(Kd nM)
+                        p.boltz_binder_prob = aff["binder_prob"]
+            continue
+
+        # Non-cofold pose → inherit docking anchor (constant, but populated for downstream).
+        if p.source.startswith("template_"):
+            continue
+        if anchor is not None:
+            p.iptm = anchor.get("iptm")
+            p.ptm = anchor.get("ptm")
+            p.plddt = anchor.get("plddt")
+            p.conf = anchor.get("conf")
 
 
 @dataclass
@@ -190,7 +444,10 @@ def collect_boltz_affinities(run_dir: Path) -> list[BoltzAffinity]:
     return results
 
 
-def collect_pose_scores(run_dir: Path) -> list[PoseScore]:
+def collect_pose_scores(
+    run_dir: Path,
+    known_ligand_ids: list[str] | None = None,
+) -> list[PoseScore]:
     """Collect all pose scores from BA-Pred and RMSD-Pred TSVs.
 
     Each PoseScore is resolved to the concrete staged file that contains that
@@ -199,7 +456,13 @@ def collect_pose_scores(run_dir: Path) -> list[PoseScore]:
     original pose source, e.g. ``vina_seed_42.sdf``) and BA-Pred/RMSD-Pred
     name poses as ``{stem}_{record_index}``, so the pose_name alone is enough
     to recover both the file and the record.
+
+    ``known_ligand_ids`` (optional): when provided, each PoseScore gets its
+    ``ligand_id`` populated by matching the tool key suffix. Without this,
+    ``ligand_id`` stays ``None`` and downstream per-ligand grouping is a no-op.
     """
+    if known_ligand_ids is None:
+        known_ligand_ids = _discover_ligand_ids_from_summary(run_dir)
     analysis_dir = run_dir / "outputs" / "analysis"
     if not analysis_dir.exists():
         return []
@@ -252,6 +515,7 @@ def collect_pose_scores(run_dir: Path) -> list[PoseScore]:
         for k, v in raw_rmsd.items():
             rmsd_data.setdefault(_canonicalize(k), v)
 
+        tool_ligand_id = _infer_ligand_id(tool, known_ligand_ids)
         all_names = set(ba_data.keys()) | set(rmsd_data.keys())
         for name in sorted(all_names):
             ba = ba_data.get(name)
@@ -264,9 +528,46 @@ def collect_pose_scores(run_dir: Path) -> list[PoseScore]:
                 ba_pred_pkd=ba,
                 rmsd_pred=rmsd_info[0],
                 rmsd_gt_2a_prob=rmsd_info[1],
+                ligand_id=tool_ligand_id,
             ))
 
+    # Dedup legacy (pre multi-ligand refactor) entries: when both ``tool`` and
+    # ``tool_{lig_id}`` exist, the bare-stem key duplicates the same SDFs and
+    # would double-count the run (and inflate consensus self-matches in the new
+    # ranker). Keep only the ``_{lig_id}``-suffixed variant when available.
+    if known_ligand_ids:
+        sources = {p.source for p in pose_scores}
+        suffixed_stems: set[str] = set()
+        for s in sources:
+            for lig_id in known_ligand_ids:
+                if s.endswith(f"_{lig_id}"):
+                    suffixed_stems.add(s[: -(len(lig_id) + 1)])
+        pose_scores = [p for p in pose_scores if p.source not in suffixed_stems]
+
+    _attach_pose_confidence(run_dir, pose_scores)
     return pose_scores
+
+
+def poses_by_ligand(
+    pose_scores: list[PoseScore],
+    known_ligand_ids: list[str] | None = None,
+) -> dict[str, list[PoseScore]]:
+    """Partition pose_scores by ligand_id.
+
+    Returns ``{lig_id: [PoseScore, ...]}`` for every id in ``known_ligand_ids``
+    (missing ids map to empty lists). PoseScores with no ligand_id are bucketed
+    under the first known id (backwards-compat path for legacy single-ligand
+    pose files without the ``_{id}`` suffix).
+    """
+    if known_ligand_ids is None:
+        known_ligand_ids = []
+    out: dict[str, list[PoseScore]] = {lig: [] for lig in known_ligand_ids}
+    primary = known_ligand_ids[0] if known_ligand_ids else "L"
+    out.setdefault(primary, [])
+    for p in pose_scores:
+        lig = p.ligand_id or primary
+        out.setdefault(lig, []).append(p)
+    return out
 
 
 def _split_pose_name(pose_name: str) -> tuple[str, int | None]:
@@ -318,8 +619,254 @@ def _resolve_pose_file(run_dir: Path, tool: str, pose_name: str) -> Path | None:
     return None
 
 
+# ---------- RRF + consensus pose ranker ----------
+#
+# Motivation: a single scorer (lscore, plddt, iptm, ...) tops out around 24 %
+# top-1 native-rate on novel2025, while the oracle ceiling is ~59 %. Most of
+# the gap is "right pose exists but no scorer finds it consistently". RRF
+# combines several independently-trained / independently-derived scorers, then
+# a cross-family consensus modifier nudges toward poses that *also* show up in
+# other tracks (validated: N_fam_consensus ≥ 4 → 62 % native; ≥ 7 → 89 %).
+#
+# Design choices
+# - K = 60 (canonical RRF hyperparameter; not tuned here).
+# - pLDDT is normalized within each cofold model via percentile-rank, so
+#   boltz2x's lower absolute pLDDT range doesn't unfairly penalise it.
+# - Cofold-only scorers contribute 0 for non-cofold poses, giving cofold
+#   poses a small natural advantage (matches the empirical hit-rate gap).
+# - Consensus support is computed in the cofold/docking receptor frame using
+#   the staged SDFs (no re-alignment): pairs are pre-filtered by centroid
+#   distance, surviving pairs get full RDKit RMS. Cross-family only.
+# - lig_align bonus: template_lig_align is the highest-recall track (24.3 %)
+#   but no scorer picks its hits; small additive boost recovers some.
+
+import math
+from collections import defaultdict
+
+
+def _source_family(src: str) -> str:
+    if src.startswith("cofold_boltz2x_"):  return "cofold_boltz2x"
+    if src.startswith("cofold_boltz2_"):   return "cofold_boltz2"
+    if src.startswith("cofold_protenix_"): return "cofold_protenix"
+    if src.startswith("cofold_af3_"):      return "cofold_af3"
+    if src.startswith("vina_cofolding"):       return "vina_cofold"
+    if src.startswith("vina_p2rank"):          return "vina_p2rank"
+    if src.startswith("vina_swinsite"):        return "vina_swinsite"
+    if src.startswith("autodock_gpu_cofolding"): return "adg_cofold"
+    if src.startswith("autodock_gpu_p2rank"):    return "adg_p2rank"
+    if src.startswith("autodock_gpu_swinsite"):  return "adg_swinsite"
+    if src.startswith("protenix_dock"):          return "pxdock"
+    if "template_" in src and "_lig_align_" in src: return "template_lig_align"
+    if "template_" in src and "_vina_" in src:      return "template_vina"
+    if "template_" in src and "_adg_"  in src:      return "template_adg"
+    return src
+
+
+def _is_cofold(p: PoseScore) -> bool:
+    return any(p.source.startswith(pre) for pre in _COFOLD_SOURCE_PREFIXES)
+
+
+def _cofold_model_short(p: PoseScore) -> str | None:
+    for prefix, m in _COFOLD_SOURCE_PREFIXES.items():
+        if p.source.startswith(prefix):
+            return m
+    return None
+
+
+def _is_lig_align(p: PoseScore) -> bool:
+    return "template_" in p.source and "_lig_align_" in p.source
+
+
+def _rrf_score(poses: list[PoseScore], k: int = 60) -> dict[int, float]:
+    """RRF over {lscore, plddt(percentile-normalized), iptm, ptm, conf}.
+
+    Returns ``{id(pose) → rrf_score}``. Scorers' pose pools differ:
+
+    - lscore: all poses (every pose has RMSD-Pred output)
+    - plddt: cofold poses only, ranked WITHIN each cofold model so absolute
+      scale differences (Boltz [0..1]×100 vs Protenix [0..100]) don't matter
+    - iptm / ptm / conf: cofold poses only (degenerate elsewhere — docked
+      poses inherit the constant docking-anchor value)
+    """
+    scores: dict[int, float] = {id(p): 0.0 for p in poses}
+
+    def _accumulate(ranked: list[PoseScore]):
+        for r, p in enumerate(ranked):
+            scores[id(p)] += 1.0 / (k + r + 1)
+
+    # 1) lscore — all poses, descending
+    _accumulate(sorted(
+        [p for p in poses if p.lscore is not None],
+        key=lambda q: -q.lscore,
+    ))
+
+    cofold_poses = [p for p in poses if _is_cofold(p)]
+
+    # 2) plddt — within-model rank to neutralize scale handicap
+    by_model: dict[str | None, list[PoseScore]] = defaultdict(list)
+    for p in cofold_poses:
+        if p.plddt is not None:
+            by_model[_cofold_model_short(p)].append(p)
+    for ps in by_model.values():
+        _accumulate(sorted(ps, key=lambda q: -q.plddt))
+
+    # 3) iptm / ptm / conf — global rank within cofold pool
+    for attr in ("iptm", "ptm", "conf"):
+        ranked = sorted(
+            [p for p in cofold_poses if getattr(p, attr) is not None],
+            key=lambda q: -getattr(q, attr),
+        )
+        _accumulate(ranked)
+
+    return scores
+
+
+def _pose_coord_array(mol):
+    """Heavy-atom coords as ``(N, 3)`` numpy array, or ``None`` if mol invalid."""
+    import numpy as np  # local — keep top-level imports unchanged
+    if mol is None:
+        return None
+    try:
+        conf = mol.GetConformer()
+        coords = np.empty((mol.GetNumAtoms(), 3), dtype=np.float64)
+        for i in range(mol.GetNumAtoms()):
+            pt = conf.GetAtomPosition(i)
+            coords[i] = (pt.x, pt.y, pt.z)
+        return coords
+    except Exception:
+        return None
+
+
+def _atom_index_rmsd(a, b) -> float | None:
+    """Direct atom-index heavy-atom RMSD between two ``(N, 3)`` arrays.
+
+    Same atom count required. No symmetry correction — for the consensus
+    check we only need "approximately the same pose"; a few hundred ms of
+    CalcRMS substructure-matching per pair is too expensive at batch scale.
+    Atom orderings may differ across docking tools but the typical noise
+    (~0.5 Å) is well below the 2 Å consensus threshold.
+    """
+    if a is None or b is None or a.shape != b.shape:
+        return None
+    import numpy as np
+    return float(np.sqrt(((a - b) ** 2).sum(axis=1).mean()))
+
+
+def _consensus_support(
+    poses: list[PoseScore],
+    threshold: float = 2.0,
+    centroid_slack: float | None = None,
+    mol_cache: dict | None = None,
+) -> dict[int, int]:
+    """For each pose, count cross-family poses within ``threshold`` Å.
+
+    Per-family staging produces SDFs in a single common receptor frame
+    (cofold and docked poses live in their respective cofold/anchor frame;
+    template poses are pre-aligned to the cofold frame by the staging step),
+    so we don't re-align — heavy-atom RMSD is the raw positional difference.
+
+    Centroid pre-filter (default ``threshold + 1 Å``) skips obvious non-pairs.
+    Heavy-atom RMSD via numpy (no symmetry correction — cheap, see
+    ``_atom_index_rmsd``).
+    """
+    if centroid_slack is None:
+        centroid_slack = threshold + 1.0
+    if mol_cache is None:
+        mol_cache = {}
+
+    import numpy as np
+    coords_arr: dict[int, "np.ndarray"] = {}
+    centroids: dict[int, "np.ndarray"] = {}
+    for p in poses:
+        mol = _load_pose_mol(p, mol_cache)
+        arr = _pose_coord_array(mol)
+        if arr is None:
+            continue
+        coords_arr[id(p)] = arr
+        centroids[id(p)] = arr.mean(axis=0)
+
+    fams = {id(p): _source_family(p.source) for p in poses}
+    support = {id(p): 0 for p in poses}
+
+    pids = list(coords_arr.keys())
+    n = len(pids)
+    for i in range(n):
+        pid_i = pids[i]
+        ai = coords_arr[pid_i]; ci = centroids[pid_i]
+        fi = fams[pid_i]; n_atoms_i = ai.shape[0]
+        for j in range(i + 1, n):
+            pid_j = pids[j]
+            if fams[pid_j] == fi:
+                continue
+            aj = coords_arr[pid_j]
+            if aj.shape[0] != n_atoms_i:
+                continue
+            cj = centroids[pid_j]
+            d = ci - cj
+            if abs(d[0]) > centroid_slack or abs(d[1]) > centroid_slack or abs(d[2]) > centroid_slack:
+                continue
+            r = float(np.sqrt(((ai - aj) ** 2).sum(axis=1).mean()))
+            if r < threshold:
+                support[pid_i] += 1
+                support[pid_j] += 1
+    return support
+
+
+def _final_ranker_score(
+    poses: list[PoseScore],
+    consensus_threshold: float = 2.0,
+    consensus_weight: float = 0.1,
+    lig_align_bonus: float = 0.2,
+    mol_cache: dict | None = None,
+) -> dict[int, float]:
+    """Combined RRF × consensus modifier × lig_align bonus.
+
+    final(i) = RRF(i) · (1 + consensus_weight · log(1 + support(i))) + bonus(i)
+
+    bonus(i) = ``lig_align_bonus`` × lscore(i) if pose is template_lig_align
+    (recovers some of the high-recall lig_align hits that no scorer picks).
+    """
+    if mol_cache is None:
+        mol_cache = {}
+    rrf = _rrf_score(poses)
+    support = _consensus_support(poses, threshold=consensus_threshold, mol_cache=mol_cache)
+    out: dict[int, float] = {}
+    for p in poses:
+        s = rrf.get(id(p), 0.0)
+        sup = support.get(id(p), 0)
+        s *= 1.0 + consensus_weight * math.log1p(sup)
+        if _is_lig_align(p) and p.lscore is not None:
+            s += lig_align_bonus * p.lscore
+        out[id(p)] = s
+    return out
+
+
 def select_best_pose(poses: list[PoseScore]) -> PoseScore | None:
-    """Pick the pose with smallest predicted pRMSD (tie-break: highest LSCORE)."""
+    """Pick the highest-scoring pose under RRF × consensus × lig_align ranker.
+
+    Falls back to BA-Pred pKd descending if no pose has any rankable scorer
+    output (extreme partial-data case — every BA-Pred-only fallback is itself
+    noisy and should not be relied upon).
+    """
+    if not poses:
+        return None
+    mol_cache: dict = {}
+    final = _final_ranker_score(poses, mol_cache=mol_cache)
+    rankable = [p for p in poses if final.get(id(p), 0.0) > 0.0]
+    if rankable:
+        return max(rankable, key=lambda p: final[id(p)])
+    scored = [p for p in poses if p.ba_pred_pkd is not None]
+    if scored:
+        return max(scored, key=lambda p: p.ba_pred_pkd or 0.0)
+    return poses[0]
+
+
+def select_best_pose_pRMSD_legacy(poses: list[PoseScore]) -> PoseScore | None:
+    """Legacy ranker (pre-RRF): smallest pRMSD, lscore tie-break, ba_pred fallback.
+
+    Kept callable for ablation. The default ``select_best_pose`` uses the RRF +
+    consensus ranker.
+    """
     primary = [p for p in poses if p.rmsd_pred is not None]
     if primary:
         return min(
@@ -428,80 +975,56 @@ def select_diverse_top_k(
     k: int = 5,
     rmsd_threshold: float = 2.0,
 ) -> list[PoseScore]:
-    """Greedy diversity-aware top-k selection.
+    """Greedy top-k under RRF + consensus + lig_align bonus, with ≥ ``rmsd_threshold``
+    heavy-atom RMSD diversity between picks.
 
     Algorithm:
-        1. Keep only poses with a usable LSCORE.
-        2. Sort by LSCORE descending.
-        3. Start with the top-1 pose.
-        4. Walk the sorted list; accept the next candidate only if its
+        1. Score every pose with the combined ranker (``_final_ranker_score``).
+        2. Sort by combined score descending.
+        3. Walk the sorted list; accept the next candidate only if its
            heavy-atom RMSD to every already-selected pose is ``>= rmsd_threshold``.
-        5. Stop when ``k`` poses are selected or no candidate satisfies the
-           constraint.
+        4. Stop at ``k`` selections or when no candidate satisfies diversity.
 
     If fewer than ``k`` diverse poses exist, the list is shorter than ``k``.
 
-    Ordering priority:
-        1. RMSD-Pred ``pRMSD`` ascending (primary — smaller predicted pose RMSD
-           to the native frame is better).
-        2. ``LSCORE`` descending as tie-break (equivalent to ``prob_gt_2A``
-           ascending).
-        3. If neither is available, fall back to BA-Pred ``pKd`` descending.
-
-    LSCORE is still written into the LG MODEL header as the "0..1 confidence"
-    readout — only the selection ordering is driven by pRMSD.
+    Falls back to BA-Pred pKd descending if the combined ranker is degenerate
+    for every pose (no scorer output anywhere) — a partial-data corner case.
     """
-    if k <= 0:
+    if k <= 0 or not poses:
         return []
 
-    # Tier 1: poses with a real pRMSD value.
-    primary = [p for p in poses if p.rmsd_pred is not None]
-    if primary:
-        ordered = sorted(
-            primary,
-            key=lambda p: (
-                p.rmsd_pred,                                  # smaller pRMSD first
-                -(p.lscore if p.lscore is not None else 0.0), # larger LSCORE first
-            ),
-        )
+    mol_cache: dict = {}
+    final = _final_ranker_score(poses, mol_cache=mol_cache)
+    rankable = [p for p in poses if final.get(id(p), 0.0) > 0.0]
+    if rankable:
+        ordered = sorted(rankable, key=lambda p: -final[id(p)])
     else:
-        # Tier 2: no pRMSD anywhere → fall back to BA-Pred pKd descending so a
-        # submission can still be produced from partial data.
         scored = [p for p in poses if p.ba_pred_pkd is not None]
         if not scored:
             return poses[:k]
         ordered = sorted(scored, key=lambda p: p.ba_pred_pkd or 0.0, reverse=True)
 
-    mol_cache: dict = {}
     selected: list[PoseScore] = []
     selected_mols: list = []
 
     for cand in ordered:
         cand_mol = _load_pose_mol(cand, mol_cache)
-        # If we cannot load a mol for diversity checking, still allow the first
-        # pick so we never return an empty list when data exists.
         if not selected:
             selected.append(cand)
             selected_mols.append(cand_mol)
             if len(selected) == k:
                 break
             continue
-
         if cand_mol is None:
-            # Cannot verify diversity, skip defensively.
             continue
-
         too_close = False
         for prev_mol in selected_mols:
             if prev_mol is None:
                 continue
             r = _pose_pair_rmsd(cand_mol, prev_mol)
-            if r is None:
-                continue
-            if r < rmsd_threshold:
+            if r is not None and r < rmsd_threshold:
                 too_close = True
                 break
-
         if not too_close:
             selected.append(cand)
             selected_mols.append(cand_mol)

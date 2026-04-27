@@ -29,6 +29,11 @@ experiments/logs/
 slurm-*.out
 slurm-*.err
 
+# Per-target evaluation work artifacts (regenerated from runs)
+experiments/**/_eval_work/
+experiments/**/_per_metric_work/
+experiments/**/_validate_*.log
+
 # OS
 .DS_Store
 

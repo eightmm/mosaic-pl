@@ -1,0 +1,66 @@
+Per-scorer evaluation over 489 targets
+Total per-pose rows: 262356
+
+  scorer       label                   zone        n  top1<2  best5<2  top1<1  med_t1  med_b5
+  -------------------------------------------------------------------------------------------
+  rmsd_pred    Lower pRMSD             novel      68      16       21       5    6.88    5.50
+  rmsd_pred    Lower pRMSD             remote    113      28       36      18    4.27    2.99
+  rmsd_pred    Lower pRMSD             related   308      67       81      27    7.23    5.68
+  rmsd_pred    Lower pRMSD             TOTAL     489     111      138      50    6.42    4.92
+
+  scorer       label                   zone        n  top1<2  best5<2  top1<1  med_t1  med_b5
+  -------------------------------------------------------------------------------------------
+  lscore       Higher LSCORE           novel      68      17       21       4    5.73    4.92
+  lscore       Higher LSCORE           remote    113      30       41      16    4.23    3.03
+  lscore       Higher LSCORE           related   308      76       90      35    6.60    5.46
+  lscore       Higher LSCORE           TOTAL     489     123      152      55    5.81    4.67
+
+  scorer       label                   zone        n  top1<2  best5<2  top1<1  med_t1  med_b5
+  -------------------------------------------------------------------------------------------
+  ba_pred      Higher pKd              novel      68      11       14       2    8.85    5.67
+  ba_pred      Higher pKd              remote    113      12       22       5    7.25    5.42
+  ba_pred      Higher pKd              related   308      27       47      10    9.61    6.94
+  ba_pred      Higher pKd              TOTAL     489      50       83      17    8.85    6.47
+
+  scorer       label                   zone        n  top1<2  best5<2  top1<1  med_t1  med_b5
+  -------------------------------------------------------------------------------------------
+  iptm         Higher ipTM             novel      68      12       16       3    9.99    7.39
+  iptm         Higher ipTM             remote    113      35       44      15    3.65    2.74
+  iptm         Higher ipTM             related   308      77       93      36    6.04    4.95
+  iptm         Higher ipTM             TOTAL     489     124      153      54    5.77    4.28
+
+  scorer       label                   zone        n  top1<2  best5<2  top1<1  med_t1  med_b5
+  -------------------------------------------------------------------------------------------
+  ptm          Higher pTM              novel      68      12       16       3    9.99    7.34
+  ptm          Higher pTM              remote    113      33       42      13    3.90    2.77
+  ptm          Higher pTM              related   308      81      104      30    5.69    4.61
+  ptm          Higher pTM              TOTAL     489     126      162      46    5.51    4.07
+
+  scorer       label                   zone        n  top1<2  best5<2  top1<1  med_t1  med_b5
+  -------------------------------------------------------------------------------------------
+  plddt        Higher pLDDT            novel      68      12       16       3    9.84    7.34
+  plddt        Higher pLDDT            remote    113      36       49      14    3.47    2.67
+  plddt        Higher pLDDT            related   308      88       96      30    5.77    4.69
+  plddt        Higher pLDDT            TOTAL     489     136      161      47    5.25    3.94
+
+  scorer       label                   zone        n  top1<2  best5<2  top1<1  med_t1  med_b5
+  -------------------------------------------------------------------------------------------
+  conf         Higher conf score       novel      68      12       16       3    9.99    7.44
+  conf         Higher conf score       remote    113      30       43      14    4.11    2.59
+  conf         Higher conf score       related   308      82       95      35    6.04    4.62
+  conf         Higher conf score       TOTAL     489     124      154      52    5.83    4.21
+
+  scorer       label                   zone        n  top1<2  best5<2  top1<1  med_t1  med_b5
+  -------------------------------------------------------------------------------------------
+  boltz_aff    Lower log10(Kd_nM)      novel      68      12       16       3    9.84    7.22
+  boltz_aff    Lower log10(Kd_nM)      remote    113      34       44      12    3.76    2.79
+  boltz_aff    Lower log10(Kd_nM)      related   308      71       84      27    6.84    4.88
+  boltz_aff    Lower log10(Kd_nM)      TOTAL     489     117      144      42    6.28    4.32
+
+  scorer       label                   zone        n  top1<2  best5<2  top1<1  med_t1  med_b5
+  -------------------------------------------------------------------------------------------
+  oracle       Lowest TRUE RMSD        novel      68      37       37      18    1.93    1.93
+  oracle       Lowest TRUE RMSD        remote    113      86       86      54    1.03    1.03
+  oracle       Lowest TRUE RMSD        related   308     164      164     100    1.79    1.79
+  oracle       Lowest TRUE RMSD        TOTAL     489     287      287     172    1.57    1.57
+
