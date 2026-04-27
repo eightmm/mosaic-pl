@@ -22,13 +22,21 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 REPO = ROOT.parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
+import json
 
 from compute_submission_scores import (  # noqa: E402
     PoseScore,
     collect_pose_scores,
     select_best_pose,
     select_best_pose_pRMSD_legacy,
+    select_best_pose_cluster,
+    select_best_pose_cascaded,
+    select_top_k_cluster,
+    select_top_k_cluster_by,
+    select_top_k_cascaded,
     select_diverse_top_k,
+    _load_pose_mol,
+    _pose_pair_rmsd,
 )
 
 CSV_PATH = ROOT / "per_pose_scores.csv"
@@ -74,6 +82,40 @@ def lscore_top1(poses: list[PoseScore]) -> PoseScore | None:
     return max(cand, key=lambda p: p.lscore)
 
 
+def lscore_top5_diverse(
+    poses: list[PoseScore], k: int = 5, rmsd_threshold: float = 2.0,
+    mol_cache: dict | None = None,
+) -> list[PoseScore]:
+    """Fair best-5 baseline: lscore-ordered with ≥ rmsd_threshold heavy-atom diversity."""
+    cand = [p for p in poses if p.lscore is not None]
+    if not cand:
+        return []
+    cand.sort(key=lambda p: -p.lscore)
+    if mol_cache is None:
+        mol_cache = {}
+    selected: list[PoseScore] = []
+    selected_mols: list = []
+    for c in cand:
+        m = _load_pose_mol(c, mol_cache)
+        if not selected:
+            selected.append(c); selected_mols.append(m)
+            if len(selected) == k: break
+            continue
+        if m is None:
+            continue
+        too_close = False
+        for prev in selected_mols:
+            if prev is None: continue
+            r = _pose_pair_rmsd(m, prev)
+            if r is not None and r < rmsd_threshold:
+                too_close = True
+                break
+        if not too_close:
+            selected.append(c); selected_mols.append(m)
+            if len(selected) == k: break
+    return selected
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser()
@@ -93,11 +135,19 @@ def main():
         print(f"limit={args.limit}: {len(targets)} targets")
 
     # ablation rankers
+    def _wrap1(fn):
+        return lambda poses: ([fn(poses)] if fn(poses) else [])
+
+    # mol_cache shared per-target across all rankers (saves 3-5x mol load).
+    # Each lambda receives (poses, mol_cache); _wrap1 ignores mol_cache.
+    # Cluster ranker dropped — already shown to lose in stride=10 ablation
+    # (cluster_sum 30.6%/40.8% vs lscore_top5 37.2%/44.2%) and 3x more expensive.
     rankers = [
-        ("lscore",        lambda poses: [lscore_top1(poses)] if lscore_top1(poses) else []),
-        ("legacy_pRMSD",  lambda poses: [select_best_pose_pRMSD_legacy(poses)] if select_best_pose_pRMSD_legacy(poses) else []),
-        ("new_top1",      lambda poses: [select_best_pose(poses)] if select_best_pose(poses) else []),
-        ("new_top5",      lambda poses: select_diverse_top_k(poses, k=5)),
+        ("lscore",          lambda poses, mc: ([lscore_top1(poses)] if lscore_top1(poses) else [])),
+        ("lscore_top5",     lambda poses, mc: lscore_top5_diverse(poses, k=5, mol_cache=mc)),
+        ("legacy_pRMSD",    lambda poses, mc: ([select_best_pose_pRMSD_legacy(poses)] if select_best_pose_pRMSD_legacy(poses) else [])),
+        ("cascaded",        lambda poses, mc: ([select_best_pose_cascaded(poses)] if select_best_pose_cascaded(poses) else [])),
+        ("cascaded_top5",   lambda poses, mc: select_top_k_cascaded(poses, k=5, mol_cache=mc)),
     ]
 
     # results[ranker_id][zone] = [(top1_rmsd, best5_rmsd or None), ...]
@@ -121,9 +171,12 @@ def main():
             continue
 
         zone = zones.get(target, "?")
+        # Per-target shared mol cache: pose mols loaded once across rankers
+        # (saves 3-5x SDMolSupplier calls when multiple rankers need coords).
+        mol_cache: dict = {}
         for rid, fn in rankers:
             try:
-                picks = fn(poses)
+                picks = fn(poses, mol_cache)
             except Exception as e:
                 print(f"  [{target}/{rid}] failed: {e}")
                 continue
@@ -142,6 +195,17 @@ def main():
             if top1_t is None:
                 continue
             results[rid].setdefault(zone, []).append((top1_t, best5))
+
+        # Periodic JSON checkpoint — survives if process dies mid-batch.
+        if i % 50 == 0:
+            import json as _json
+            ckpt = ROOT / "_validate_full489_ckpt.json"
+            ROOT.mkdir(parents=True, exist_ok=True)
+            ckpt.write_text(_json.dumps({
+                "i": i, "n": len(targets),
+                "results": {rid: {z: rs for z, rs in zs.items()} for rid, zs in results.items()},
+                "fails": fails,
+            }))
 
         if i % 20 == 0:
             elapsed = time.time() - t_start

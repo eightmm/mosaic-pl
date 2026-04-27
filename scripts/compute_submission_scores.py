@@ -841,6 +841,341 @@ def _final_ranker_score(
     return out
 
 
+# ---------- Cluster-then-pick ranker (option A) ----------
+#
+# Aggregate first, then rank: cluster all poses by 2 Å heavy-atom RMSD into
+# basins, score each basin by max(lscore) × log(1 + n_families), pick the
+# best basin, then pick the lowest-pRMSD member as representative.
+#
+# Why this should beat per-pose RRF:
+# - decoy basins (Q3 in validate_consensus.py: 67 % false-positive at the
+#   per-pose consensus level) get filtered because a basin's max_lscore is
+#   typically low when no member is actually native;
+# - top-5 reps come from 5 separate clusters → ≥ 2 Å diversity by construction.
+
+def _build_pose_clusters(
+    poses: list[PoseScore],
+    threshold: float = 2.0,
+    mol_cache: dict | None = None,
+) -> list[list[PoseScore]]:
+    """Single-link cluster poses by heavy-atom RMSD with ``threshold`` link.
+
+    Same coordinate-frame assumption as ``_consensus_support`` (cofold/docking
+    poses live in their own cofold/anchor frame; template poses are pre-aligned
+    in staging). Centroid pre-filter + numpy direct-RMSD (no symmetry — the
+    same SMILES across docking tools may differ in atom ordering by ~ 0.5 Å,
+    well below the 2 Å link distance).
+
+    Returns one list-of-PoseScore per cluster. Poses without loadable coords
+    are dropped from clustering and won't appear in the result.
+    """
+    import numpy as np
+    if mol_cache is None:
+        mol_cache = {}
+
+    arrs: dict[int, "np.ndarray"] = {}
+    centroids: dict[int, "np.ndarray"] = {}
+    valid: list[PoseScore] = []
+    for p in poses:
+        mol = _load_pose_mol(p, mol_cache)
+        arr = _pose_coord_array(mol)
+        if arr is None:
+            continue
+        arrs[id(p)] = arr
+        centroids[id(p)] = arr.mean(axis=0)
+        valid.append(p)
+
+    n = len(valid)
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x: int, y: int) -> None:
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            parent[rx] = ry
+
+    slack = threshold + 1.0
+    for i in range(n):
+        ai = arrs[id(valid[i])]; ci = centroids[id(valid[i])]
+        for j in range(i + 1, n):
+            aj = arrs[id(valid[j])]
+            if aj.shape[0] != ai.shape[0]:
+                continue
+            cj = centroids[id(valid[j])]
+            d = ci - cj
+            if abs(d[0]) > slack or abs(d[1]) > slack or abs(d[2]) > slack:
+                continue
+            r = float(np.sqrt(((ai - aj) ** 2).sum(axis=1).mean()))
+            if r < threshold:
+                union(i, j)
+
+    buckets: dict[int, list[PoseScore]] = defaultdict(list)
+    for i, p in enumerate(valid):
+        buckets[find(i)].append(p)
+    return list(buckets.values())
+
+
+def _cluster_quality(cluster: list[PoseScore]) -> float:
+    """``max(lscore in cluster) × log(1 + n_distinct_families)``.
+
+    Returns 0 when no member has a usable lscore (the cluster cannot be
+    ranked against others; it falls behind any cluster that does).
+    """
+    lscores = [p.lscore for p in cluster if p.lscore is not None]
+    if not lscores:
+        return 0.0
+    n_fam = len({_source_family(p.source) for p in cluster})
+    return max(lscores) * math.log(1 + n_fam)
+
+
+# ---------- Cluster quality variants for ablation ----------
+
+def _cq_size(cluster: list[PoseScore]) -> float:
+    """Pure consensus: cluster size (n_members). No score quality involved."""
+    return float(len(cluster))
+
+
+def _cq_n_fam(cluster: list[PoseScore]) -> float:
+    """Pure cross-family consensus: distinct source families in cluster."""
+    return float(len({_source_family(p.source) for p in cluster}))
+
+
+def _cq_max_lscore(cluster: list[PoseScore]) -> float:
+    """Cluster as diversity filter only — pick by best member's lscore."""
+    lscores = [p.lscore for p in cluster if p.lscore is not None]
+    return max(lscores) if lscores else 0.0
+
+
+def _cq_sum_lscore(cluster: list[PoseScore]) -> float:
+    """Quantity × quality: sum of lscore over members. Both consensus AND quality."""
+    return sum(p.lscore for p in cluster if p.lscore is not None)
+
+
+def _cq_size_x_max_lscore(cluster: list[PoseScore]) -> float:
+    """Product variant: n_members × max_lscore. Like sum but max-quality."""
+    lscores = [p.lscore for p in cluster if p.lscore is not None]
+    if not lscores:
+        return 0.0
+    return len(cluster) * max(lscores)
+
+
+def _select_with_cluster_quality(
+    poses: list[PoseScore],
+    quality_fn,
+    k: int,
+    threshold: float = 2.0,
+    mol_cache: dict | None = None,
+) -> list[PoseScore]:
+    """Generic top-k cluster picker. Reuses _build_pose_clusters + _cluster_representative."""
+    if k <= 0 or not poses:
+        return []
+    if mol_cache is None:
+        mol_cache = {}
+    clusters = _build_pose_clusters(poses, threshold=threshold, mol_cache=mol_cache)
+    if not clusters:
+        cand = [p for p in poses if p.lscore is not None]
+        return sorted(cand, key=lambda p: -(p.lscore or 0.0))[:k] or poses[:k]
+    sorted_clusters = sorted(clusters, key=quality_fn, reverse=True)
+    return [_cluster_representative(c) for c in sorted_clusters[:k]]
+
+
+def select_top_k_cluster_by(
+    poses: list[PoseScore],
+    quality: str = "lscore_x_fam",
+    k: int = 5,
+    threshold: float = 2.0,
+    mol_cache: dict | None = None,
+) -> list[PoseScore]:
+    """Top-k clusters by named quality function.
+
+    Variants:
+      - ``lscore_x_fam`` (default; same as ``select_top_k_cluster``):
+        ``max_lscore × log(1 + n_fam)``
+      - ``size``:           cluster size (pure consensus)
+      - ``n_fam``:          distinct source families (pure cross-family)
+      - ``max_lscore``:     best member's lscore (cluster as diversity-only)
+      - ``sum_lscore``:     sum of lscores (quantity × quality, soft)
+      - ``size_x_lscore``:  n_members × max_lscore (quantity × quality, hard)
+    """
+    fn_map = {
+        "lscore_x_fam":  _cluster_quality,
+        "size":          _cq_size,
+        "n_fam":         _cq_n_fam,
+        "max_lscore":    _cq_max_lscore,
+        "sum_lscore":    _cq_sum_lscore,
+        "size_x_lscore": _cq_size_x_max_lscore,
+    }
+    fn = fn_map.get(quality)
+    if fn is None:
+        raise ValueError(f"Unknown cluster quality: {quality!r} (choose from {sorted(fn_map)})")
+    return _select_with_cluster_quality(poses, fn, k=k, threshold=threshold, mol_cache=mol_cache)
+
+
+def _cluster_representative(cluster: list[PoseScore]) -> PoseScore:
+    """Pick the cluster member to actually submit.
+
+    Order: smallest pRMSD (lscore tie-break) → max lscore → first member.
+    """
+    primary = [p for p in cluster if p.rmsd_pred is not None]
+    if primary:
+        return min(
+            primary,
+            key=lambda p: (p.rmsd_pred, -(p.lscore if p.lscore is not None else 0.0)),
+        )
+    cand = [p for p in cluster if p.lscore is not None]
+    if cand:
+        return max(cand, key=lambda p: p.lscore or 0.0)
+    return cluster[0]
+
+
+def select_best_pose_cluster(
+    poses: list[PoseScore],
+    threshold: float = 2.0,
+    mol_cache: dict | None = None,
+) -> PoseScore | None:
+    """Cluster-then-pick top-1 (option A — see module-level docstring above)."""
+    if not poses:
+        return None
+    if mol_cache is None:
+        mol_cache = {}
+    clusters = _build_pose_clusters(poses, threshold=threshold, mol_cache=mol_cache)
+    if not clusters:
+        cand = [p for p in poses if p.lscore is not None]
+        if cand:
+            return max(cand, key=lambda p: p.lscore or 0.0)
+        return poses[0]
+    best = max(clusters, key=_cluster_quality)
+    return _cluster_representative(best)
+
+
+def select_top_k_cluster(
+    poses: list[PoseScore],
+    k: int = 5,
+    threshold: float = 2.0,
+    mol_cache: dict | None = None,
+) -> list[PoseScore]:
+    """Top-k cluster representatives by cluster_quality.
+
+    Each rep comes from a distinct cluster, so they are ≥ ``threshold`` Å
+    apart by construction — no extra diversity loop needed.
+    """
+    if k <= 0 or not poses:
+        return []
+    if mol_cache is None:
+        mol_cache = {}
+    clusters = _build_pose_clusters(poses, threshold=threshold, mol_cache=mol_cache)
+    if not clusters:
+        cand = [p for p in poses if p.lscore is not None]
+        return sorted(cand, key=lambda p: -(p.lscore or 0.0))[:k] or poses[:k]
+    sorted_clusters = sorted(clusters, key=_cluster_quality, reverse=True)
+    return [_cluster_representative(c) for c in sorted_clusters[:k]]
+
+
+# ---------- Cascaded filter ranker (option B) ----------
+#
+# Conservative ranker: keep lscore as primary signal (single best top-1 SR
+# at 25 %, only beaten by cofold pLDDT which is restricted to cofold pool).
+# Use weak secondaries only inside lscore's top-K neighborhood, so the
+# strong primary signal isn't diluted.
+#
+# Promotion rule for template_lig_align: this track has 24 % family-recall
+# but no scorer picks its hits. If a lig_align candidate sits within
+# `lig_align_margin` of the lscore top, we promote it.
+
+def _lscore_top_k_filter(poses: list[PoseScore], top_k: int) -> list[PoseScore]:
+    cand = [p for p in poses if p.lscore is not None]
+    cand.sort(key=lambda p: -(p.lscore or 0.0))
+    return cand[:top_k]
+
+
+def select_best_pose_cascaded(
+    poses: list[PoseScore],
+    top_k_filter: int = 50,
+    lig_align_margin: float = 0.1,
+) -> PoseScore | None:
+    """Top-1 under cascaded filter (option B — see header above)."""
+    if not poses:
+        return None
+    top = _lscore_top_k_filter(poses, top_k_filter)
+    if not top:
+        ba = [p for p in poses if p.ba_pred_pkd is not None]
+        if ba:
+            return max(ba, key=lambda p: p.ba_pred_pkd or 0.0)
+        return poses[0]
+    top_lscore = top[0].lscore or 0.0
+
+    # Lig_align promotion: in the top-K neighborhood, prefer lig_align if
+    # within margin (Track 3 has the highest family recall but is never
+    # picked by any single scorer).
+    lig_aligns = [p for p in top if _is_lig_align(p) and p.lscore is not None]
+    if lig_aligns:
+        best_la = max(lig_aligns, key=lambda p: p.lscore or 0.0)
+        if top_lscore - (best_la.lscore or 0.0) < lig_align_margin:
+            return best_la
+
+    # pLDDT tie-break: lscore-primary, plddt secondary (cofold only carries plddt).
+    return max(top, key=lambda p: ((p.lscore or 0.0), (p.plddt or 0.0)))
+
+
+def select_top_k_cascaded(
+    poses: list[PoseScore],
+    k: int = 5,
+    top_k_filter: int = 50,
+    lig_align_margin: float = 0.1,
+    rmsd_threshold: float = 2.0,
+    mol_cache: dict | None = None,
+) -> list[PoseScore]:
+    """Top-k under cascaded filter, with ≥ ``rmsd_threshold`` heavy-atom diversity.
+
+    Score order = same lscore-primary / plddt-secondary as ``select_best_pose_cascaded``,
+    plus a +``lig_align_margin`` lscore boost for lig_align poses (so they can
+    appear in the top-5 even if not the absolute best by lscore).
+    """
+    if k <= 0 or not poses:
+        return []
+    if mol_cache is None:
+        mol_cache = {}
+    top = _lscore_top_k_filter(poses, top_k_filter)
+    if not top:
+        ba = [p for p in poses if p.ba_pred_pkd is not None]
+        return sorted(ba, key=lambda p: -(p.ba_pred_pkd or 0.0))[:k] or poses[:k]
+
+    def combined(p: PoseScore) -> tuple:
+        boost = lig_align_margin if _is_lig_align(p) else 0.0
+        return ((p.lscore or 0.0) + boost, (p.plddt or 0.0))
+
+    ordered = sorted(top, key=combined, reverse=True)
+    selected: list[PoseScore] = []
+    selected_mols: list = []
+    for cand in ordered:
+        cand_mol = _load_pose_mol(cand, mol_cache)
+        if not selected:
+            selected.append(cand); selected_mols.append(cand_mol)
+            if len(selected) == k:
+                break
+            continue
+        if cand_mol is None:
+            continue
+        too_close = False
+        for prev in selected_mols:
+            if prev is None:
+                continue
+            r = _pose_pair_rmsd(cand_mol, prev)
+            if r is not None and r < rmsd_threshold:
+                too_close = True
+                break
+        if not too_close:
+            selected.append(cand); selected_mols.append(cand_mol)
+            if len(selected) == k:
+                break
+    return selected
+
+
 def select_best_pose(poses: list[PoseScore]) -> PoseScore | None:
     """Pick the highest-scoring pose under RRF × consensus × lig_align ranker.
 
