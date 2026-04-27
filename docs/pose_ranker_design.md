@@ -249,9 +249,22 @@ per_pose_scores.csv  (true_rmsd 사전 계산, USalign + RDKit symmetric heavy-a
 
 ## Production code path
 
-`select_best_pose(poses)` 와 `select_diverse_top_k(poses, k=5)` 가
-`make_casp_submission.py` 에서 호출됨. 위 ablation 결과를 반영해
-**lscore_top5_diverse 동작** 을 default 로 둔다.
+`make_casp_submission.py` 가 다음 두 함수를 호출:
+- `select_best_pose(poses)` — top-1 pose
+- `select_diverse_top_k(poses, k=5)` — best-of-5 with diversity
+
+**현재 production (96a843b 이후)**:
+- `select_best_pose` = `max(p.lscore)` (BA-Pred fallback)
+- `select_diverse_top_k` = lscore-ordered + ≥ 2 Å heavy-atom diversity (BA-Pred fallback)
+
+**Legacy / ablation entrypoints** (production 변경 시 비교용):
+- `select_best_pose_pRMSD_legacy` — pre-2026-04 prod (smallest pRMSD)
+- `select_best_pose_rrf_legacy` / `select_diverse_top_k_rrf_legacy` — RRF +
+  consensus + lig_align bonus 시도 (실패한 변형)
+- `select_best_pose_cluster` / `select_top_k_cluster_by(quality=...)` — cluster
+  ranker 6 변형
+- `select_best_pose_cascaded` / `select_top_k_cascaded` — cascaded filter
+- `_rrf_score`, `_consensus_support`, `_final_ranker_score` — RRF 내부 helper
 
 ## Open follow-ups
 

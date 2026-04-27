@@ -1190,19 +1190,26 @@ def select_top_k_cascaded(
 
 
 def select_best_pose(poses: list[PoseScore]) -> PoseScore | None:
-    """Pick the highest-scoring pose under RRF × consensus × lig_align ranker.
+    """Pick the pose with highest lscore (RMSD-Pred 1 − P(>2 Å)).
 
-    Falls back to BA-Pred pKd descending if no pose has any rankable scorer
-    output (extreme partial-data case — every BA-Pred-only fallback is itself
-    noisy and should not be relied upon).
+    Production ranker chosen after a full ablation against RRF + consensus,
+    cluster-then-pick (6 quality variants), and cascaded filter on the
+    novel2025 489-target batch — see ``docs/pose_ranker_design.md``.
+
+    lscore is RMSD-Pred's direct prediction of "is this pose < 2 Å from
+    native"; mixing it with indirect proxies (pLDDT / ipTM / pTM / conf /
+    ba_pred / consensus support) consistently underperformed.
+
+    Fallback ladder:
+      1. lscore present anywhere → max(lscore)
+      2. otherwise, max BA-Pred pKd (partial-data corner case, noisy)
+      3. otherwise, first pose
     """
     if not poses:
         return None
-    mol_cache: dict = {}
-    final = _final_ranker_score(poses, mol_cache=mol_cache)
-    rankable = [p for p in poses if final.get(id(p), 0.0) > 0.0]
-    if rankable:
-        return max(rankable, key=lambda p: final[id(p)])
+    cand = [p for p in poses if p.lscore is not None]
+    if cand:
+        return max(cand, key=lambda p: p.lscore or 0.0)
     scored = [p for p in poses if p.ba_pred_pkd is not None]
     if scored:
         return max(scored, key=lambda p: p.ba_pred_pkd or 0.0)
@@ -1210,10 +1217,10 @@ def select_best_pose(poses: list[PoseScore]) -> PoseScore | None:
 
 
 def select_best_pose_pRMSD_legacy(poses: list[PoseScore]) -> PoseScore | None:
-    """Legacy ranker (pre-RRF): smallest pRMSD, lscore tie-break, ba_pred fallback.
+    """Legacy ranker (pre-2026-04 prod): smallest pRMSD, lscore tie-break, ba_pred fallback.
 
-    Kept callable for ablation. The default ``select_best_pose`` uses the RRF +
-    consensus ranker.
+    Kept callable for ablation. The default ``select_best_pose`` is now
+    lscore-based (best in the v4 full-489 ablation; legacy was -2.7 %p top-1).
     """
     primary = [p for p in poses if p.rmsd_pred is not None]
     if primary:
@@ -1232,6 +1239,26 @@ def select_best_pose_pRMSD_legacy(poses: list[PoseScore]) -> PoseScore | None:
             return poses[0] if poses else None
         return max(scored, key=lambda p: p.ba_pred_pkd or 0)
     return max(scored, key=lambda p: p.lscore or 0)
+
+
+def select_best_pose_rrf_legacy(poses: list[PoseScore]) -> PoseScore | None:
+    """Legacy RRF + consensus + lig_align bonus ranker (Apr 2026 attempt).
+
+    Kept callable for ablation. Underperformed lscore on stride=10 sample
+    (22.5 % vs 37 %); see ``docs/pose_ranker_design.md`` Ablation §1 for the
+    failure analysis (cofold-confidence redundancy + decoy-basin false pos).
+    """
+    if not poses:
+        return None
+    mol_cache: dict = {}
+    final = _final_ranker_score(poses, mol_cache=mol_cache)
+    rankable = [p for p in poses if final.get(id(p), 0.0) > 0.0]
+    if rankable:
+        return max(rankable, key=lambda p: final[id(p)])
+    scored = [p for p in poses if p.ba_pred_pkd is not None]
+    if scored:
+        return max(scored, key=lambda p: p.ba_pred_pkd or 0.0)
+    return poses[0]
 
 
 def _load_pose_mol(pose: "PoseScore", mol_cache: dict):
@@ -1323,42 +1350,51 @@ def select_diverse_top_k(
     k: int = 5,
     rmsd_threshold: float = 2.0,
 ) -> list[PoseScore]:
-    """Greedy top-k under RRF + consensus + lig_align bonus, with ≥ ``rmsd_threshold``
-    heavy-atom RMSD diversity between picks.
+    """Greedy top-k by lscore with ≥ ``rmsd_threshold`` heavy-atom RMSD diversity.
+
+    Production ranker chosen after a full ablation against RRF + consensus,
+    cluster-then-pick (6 quality variants), and cascaded filter on the
+    novel2025 489-target batch — see ``docs/pose_ranker_design.md``.
 
     Algorithm:
-        1. Score every pose with the combined ranker (``_final_ranker_score``).
-        2. Sort by combined score descending.
+        1. Sort poses by lscore descending.
+        2. Take the top-1 unconditionally.
         3. Walk the sorted list; accept the next candidate only if its
-           heavy-atom RMSD to every already-selected pose is ``>= rmsd_threshold``.
+           heavy-atom RMSD to every already-selected pose is
+           ``>= rmsd_threshold``.
         4. Stop at ``k`` selections or when no candidate satisfies diversity.
 
     If fewer than ``k`` diverse poses exist, the list is shorter than ``k``.
 
-    Falls back to BA-Pred pKd descending if the combined ranker is degenerate
-    for every pose (no scorer output anywhere) — a partial-data corner case.
+    Falls back to BA-Pred pKd descending if no pose has lscore — a
+    partial-data corner case where RMSD-Pred output is missing entirely.
+
+    Diversity check uses numpy direct heavy-atom RMSD (no symmetry correction
+    — same-SMILES different-conformer pairs across docking tools have
+    consistent enough atom ordering that the sub-Å noise is well below the
+    2 Å diversity threshold). RDKit ``CalcRMS`` was 10× slower in the same
+    setup.
     """
     if k <= 0 or not poses:
         return []
 
-    mol_cache: dict = {}
-    final = _final_ranker_score(poses, mol_cache=mol_cache)
-    rankable = [p for p in poses if final.get(id(p), 0.0) > 0.0]
-    if rankable:
-        ordered = sorted(rankable, key=lambda p: -final[id(p)])
+    cand = [p for p in poses if p.lscore is not None]
+    if cand:
+        ordered = sorted(cand, key=lambda p: -(p.lscore or 0.0))
     else:
         scored = [p for p in poses if p.ba_pred_pkd is not None]
         if not scored:
             return poses[:k]
         ordered = sorted(scored, key=lambda p: p.ba_pred_pkd or 0.0, reverse=True)
 
+    mol_cache: dict = {}
     selected: list[PoseScore] = []
     selected_mols: list = []
 
-    for cand in ordered:
-        cand_mol = _load_pose_mol(cand, mol_cache)
+    for c in ordered:
+        cand_mol = _load_pose_mol(c, mol_cache)
         if not selected:
-            selected.append(cand)
+            selected.append(c)
             selected_mols.append(cand_mol)
             if len(selected) == k:
                 break
@@ -1374,11 +1410,55 @@ def select_diverse_top_k(
                 too_close = True
                 break
         if not too_close:
-            selected.append(cand)
+            selected.append(c)
             selected_mols.append(cand_mol)
             if len(selected) == k:
                 break
 
+    return selected
+
+
+def select_diverse_top_k_rrf_legacy(
+    poses: list[PoseScore],
+    k: int = 5,
+    rmsd_threshold: float = 2.0,
+) -> list[PoseScore]:
+    """Legacy RRF + consensus + lig_align bonus top-k (Apr 2026 attempt).
+
+    Kept callable for ablation. Replaced by ``select_diverse_top_k`` (lscore-
+    primary) after the v4 full-489 ablation showed it lost on best-5 SR.
+    """
+    if k <= 0 or not poses:
+        return []
+    mol_cache: dict = {}
+    final = _final_ranker_score(poses, mol_cache=mol_cache)
+    rankable = [p for p in poses if final.get(id(p), 0.0) > 0.0]
+    if rankable:
+        ordered = sorted(rankable, key=lambda p: -final[id(p)])
+    else:
+        scored = [p for p in poses if p.ba_pred_pkd is not None]
+        if not scored:
+            return poses[:k]
+        ordered = sorted(scored, key=lambda p: p.ba_pred_pkd or 0.0, reverse=True)
+    selected: list[PoseScore] = []
+    selected_mols: list = []
+    for c in ordered:
+        cand_mol = _load_pose_mol(c, mol_cache)
+        if not selected:
+            selected.append(c); selected_mols.append(cand_mol)
+            if len(selected) == k: break
+            continue
+        if cand_mol is None:
+            continue
+        too_close = False
+        for prev_mol in selected_mols:
+            if prev_mol is None: continue
+            r = _pose_pair_rmsd(cand_mol, prev_mol)
+            if r is not None and r < rmsd_threshold:
+                too_close = True; break
+        if not too_close:
+            selected.append(c); selected_mols.append(cand_mol)
+            if len(selected) == k: break
     return selected
 
 
