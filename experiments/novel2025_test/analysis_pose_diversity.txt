@@ -1,0 +1,35 @@
+valid pose rows: 261945
+
+=== Q1. Cofold intra-model pose spread ===
+    (per (target, model) 의 25 pose true_rmsd 분포)
+  family              n_(t,m)  med_n  med_std  med_range  med_min  med_iqr
+  ------------------------------------------------------------------------
+  cofold_boltz2           476     25     0.86       3.32     3.50     0.80
+  cofold_boltz2x          476     25     0.64       2.47     3.38     0.58
+  cofold_protenix         463     25     1.27       4.94     2.63     1.10
+  cofold_af3              476     26     1.46       5.16     2.71     1.04
+
+  * std=0 means all 25 poses identical RMSD; tiny IQR means tightly clustered
+
+  family            n_(t,m)  IQR<1Å  IQR<2Å  range<2Å  range<5Å
+  -----------------------------------------------------------------
+  cofold_boltz2        476    266(56%)    329(69%)    175(37%)    298(63%)
+  cofold_boltz2x       476    291(61%)    346(73%)    207(43%)    313(66%)
+  cofold_protenix      462    226(49%)    301(65%)    137(30%)    237(51%)
+  cofold_af3           476    232(49%)    296(62%)    139(29%)    234(49%)
+
+=== Q2. true_rmsd CDF plot ===
+  → wrote /home/jaemin/project/CASP17/experiments/novel2025_test/analysis_pose_diversity.png
+
+  family               pose_P10 pose_P25 pose_P50 best_P10 best_P25 best_P50
+  ------------------------------------------------------------------------
+  cofold_protenix          1.04     2.16     6.27     0.59     1.05     2.63
+  cofold_af3               1.03     2.23     6.98     0.57     1.10     2.71
+  cofold_boltz2            1.18     2.51     6.91     0.75     1.21     3.50
+  cofold_boltz2x           1.15     2.41     7.01     0.72     1.22     3.38
+  vina_cofold              3.06     5.07     8.06     1.13     1.64     3.57
+  vina_swinsite            3.08     5.08     8.40     1.15     1.59     3.69
+  vina_p2rank              3.23     5.33     8.72     1.19     1.69     4.17
+  adg_cofold               5.44     7.64    10.57     1.37     2.25     4.15
+  template_lig_align       1.52     3.13     6.10     1.02     2.05     4.85
+  pxdock                   1.87     3.72     8.57     1.46     2.93     6.73

@@ -5,30 +5,51 @@
 (lscore / pRMSD / ipTM / pLDDT / …) 만 쓸 때의 천장(top-1 ~30 %) 을 넘기 위한 ROI 검증된 조합이다.
 
 ## Motivation
-novel2025_test 489 타겟에서 단일 스코어러 별 top-1 native-rate (true_rmsd<2Å,
-풀 = 각 스코어러가 의미를 가지는 pose 만 — `per_metric_summary_proper.txt`):
+novel2025_test 489 타겟에서 단일 스코어러 별 top-1 / best-of-5 native-rate
+(true_rmsd<2Å, 풀 = 각 스코어러가 의미를 가지는 pose 만 —
+`per_metric_summary_proper.txt`).
 
-| scorer        | pool                | n   | top-1 < 2 Å |
-|---------------|---------------------|----:|------------:|
-| plddt         | cofold-only         | 479 | 143  (29.9 %) |
-| conf          | cofold-only         | 479 | 141  (29.4 %) |
-| iptm          | cofold-only         | 479 | 134  (28.0 %) |
-| ptm           | cofold-only         | 479 | 130  (27.1 %) |
-| boltz_aff     | cofold-Boltz-only   | 367 |  98  (26.7 %) |
-| lscore        | all                 | 489 | 123  (25.2 %) |
-| rmsd_pred     | all                 | 489 | 111  (22.7 %) |
-| ba_pred       | all                 | 489 |  50  (10.2 %) |
-| **oracle**    | all                 | 489 | **287 (58.7 %)** |
+best-of-5 = 같은 스코어러로 정렬한 상위 5 개 중 가장 작은 true_rmsd 가 < 2 Å
+인 비율 (CASP17 LG 형식이 5 MODEL 까지 허용하므로, 실질적인 "submission 이
+적어도 한 번 native 를 맞춤" 비율).
 
-→ 단일 스코어러 ceiling ~30 % (cofold pLDDT), oracle 천장 ~59 %. 30 %p 차이는
-"올바른 pose 가 풀 안에 있는데 아무 단일 스코어러도 일관되게 못 집는다" 가
-원인.
+| scorer        | pool                | n   | top-1 < 2 Å | best-5 < 2 Å |
+|---------------|---------------------|----:|------------:|------------:|
+| plddt         | cofold-only         | 479 | 143  (29.9 %) | 164  (34.2 %) |
+| conf          | cofold-only         | 479 | 141  (29.4 %) | 163  (34.0 %) |
+| ptm           | cofold-only         | 479 | 130  (27.1 %) | 163  (34.0 %) |
+| iptm          | cofold-only         | 479 | 134  (28.0 %) | 160  (33.4 %) |
+| boltz_aff     | cofold-Boltz-only   | 367 |  98  (26.7 %) | 116  (31.6 %) |
+| lscore        | all                 | 489 | 123  (25.2 %) | 152  (31.1 %) |
+| rmsd_pred     | all                 | 489 | 111  (22.7 %) | 138  (28.2 %) |
+| ba_pred       | all                 | 489 |  50  (10.2 %) |  83  (17.0 %) |
+| **oracle**    | all                 | 489 | **287 (58.7 %)** | 287 (58.7 %) |
+
+→ 단일 스코어러 ceiling top-1 ~30 % / best-5 ~34 % (cofold pLDDT), oracle
+천장 58.7 %. top-1 → best-5 로 가도 단일 스코어러는 +4–5 %p 만 회복 (스코어러
+top 영역 내부의 pose 다양성이 작음). oracle 은 top-1 = best-5 (per-target 가장
+좋은 한 pose 만 보므로 best-of-5 가 동일).
+
+49.3 %p 갭의 의미:
+- 489 - 287 = **202 타겟은 풀 안에 < 2 Å pose 자체가 없음** — generation 단계
+  한계, ranker 로 회수 불가능.
+- 287 - 152 = 135 타겟은 best-of-5(lscore) 에서도 놓치는 회수 가능 분량 →
+  ranker 설계 대상.
 
 > NOTE: cofold-only 스코어러는 cofold pose pool 에서만 의미 있다. 같은 스코어러
 > 를 docking pose 까지 포함한 전체 풀에서 ranking 하면 docking pose 가 상속
 > 받는 docking-anchor 의 constant 값으로 인해 ranking 이 degenerate 한다 (그
 > 결과는 `per_metric_summary.txt` 의 raw 값이고, ranker 설계의 기준은
 > `per_metric_summary_proper.txt`).
+
+### 489 vs 499 의 갭
+원래 input yaml 은 499 타겟. CSV 에 489 만 들어간 이유 (총 10 누락):
+- **8 타겟 SIGALRM 타임아웃** (HEM-class organometallic 에서 RDKit `rdFMCS`
+  무한루프, `score_per_metric.py` 의 180 s per-target timeout 으로 잘림):
+  9emt, 9mel, 9mgt, 9mh5, 9q3k, 9r07, 9r7a, 9whf
+- **2 타겟 submission 미완료** (run 은 끝났지만 `experiments/submissions/{tgt}_input.lg`
+  파일이 생성되지 않음 — `make_casp_submission` 단계 실패): 9cv8, 9dm5
+  → `score_per_metric.py` 가 LG 파일을 iterator 의 시드로 쓰므로 자동 제외.
 
 ## Empirical validation of consensus (Step 3 hypothesis check)
 `experiments/novel2025_test/validate_consensus.py` — δ=1.0 Å 기준 cross-family consensus 강도 vs `min(true_rmsd)` 분포:
