@@ -2,24 +2,33 @@
 
 `scripts/compute_submission_scores.py` 의 `select_best_pose` /
 `select_diverse_top_k` 가 사용하는 비-ML 랭커 설계. 단일 스코어러
-(lscore / pRMSD / ipTM / pLDDT / …) 만 쓸 때의 천장(top-1 ~24%) 을 넘기 위한 ROI 검증된 조합이다.
+(lscore / pRMSD / ipTM / pLDDT / …) 만 쓸 때의 천장(top-1 ~30 %) 을 넘기 위한 ROI 검증된 조합이다.
 
 ## Motivation
-novel2025_test 489 타겟에서 단일 스코어러 별 top-1 native-rate (true_rmsd<2Å):
+novel2025_test 489 타겟에서 단일 스코어러 별 top-1 native-rate (true_rmsd<2Å,
+풀 = 각 스코어러가 의미를 가지는 pose 만 — `per_metric_summary_proper.txt`):
 
-| scorer        | pool                | top-1 |
-|---------------|---------------------|------:|
-| lscore        | all                 | 24.5% |
-| rmsd_pred     | all                 | 22.7% |
-| iptm          | cofold-only         | 15.1% |
-| ptm           | cofold-only         | 17.9% |
-| plddt         | cofold-only         | 17.3% |
-| conf          | cofold-only         | 18.6% |
-| boltz_aff     | cofold-Boltz-only   | 14.8% |
-| ba_pred       | all                 | 10.2% |
-| **oracle**    | all                 | **58.7%** |
+| scorer        | pool                | n   | top-1 < 2 Å |
+|---------------|---------------------|----:|------------:|
+| plddt         | cofold-only         | 479 | 143  (29.9 %) |
+| conf          | cofold-only         | 479 | 141  (29.4 %) |
+| iptm          | cofold-only         | 479 | 134  (28.0 %) |
+| ptm           | cofold-only         | 479 | 130  (27.1 %) |
+| boltz_aff     | cofold-Boltz-only   | 367 |  98  (26.7 %) |
+| lscore        | all                 | 489 | 123  (25.2 %) |
+| rmsd_pred     | all                 | 489 | 111  (22.7 %) |
+| ba_pred       | all                 | 489 |  50  (10.2 %) |
+| **oracle**    | all                 | 489 | **287 (58.7 %)** |
 
-→ 모든 단일 스코어러 < 25 %, oracle 천장 ~59 %. 30+ % 차이는 "올바른 pose 가 풀 안에 있는데 아무 스코어러도 일관되게 못 집는다" 가 원인.
+→ 단일 스코어러 ceiling ~30 % (cofold pLDDT), oracle 천장 ~59 %. 30 %p 차이는
+"올바른 pose 가 풀 안에 있는데 아무 단일 스코어러도 일관되게 못 집는다" 가
+원인.
+
+> NOTE: cofold-only 스코어러는 cofold pose pool 에서만 의미 있다. 같은 스코어러
+> 를 docking pose 까지 포함한 전체 풀에서 ranking 하면 docking pose 가 상속
+> 받는 docking-anchor 의 constant 값으로 인해 ranking 이 degenerate 한다 (그
+> 결과는 `per_metric_summary.txt` 의 raw 값이고, ranker 설계의 기준은
+> `per_metric_summary_proper.txt`).
 
 ## Empirical validation of consensus (Step 3 hypothesis check)
 `experiments/novel2025_test/validate_consensus.py` — δ=1.0 Å 기준 cross-family consensus 강도 vs `min(true_rmsd)` 분포:
