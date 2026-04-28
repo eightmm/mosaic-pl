@@ -583,6 +583,247 @@ def _fmt_pct(v: float) -> str:
     return f"{v * 100:.1f} %" if pd.notna(v) else "—"
 
 
+def chart_top1_top5_gap(per_target: pd.DataFrame, out: Path) -> None:
+    """How much room does going from top-1 to top-5 actually buy us?
+    Per-target ``top1_rmsd − top5_rmsd``: when this is large, the
+    diversity-aware top-5 is materially better than the lone top-1
+    pick — the production pipeline benefits from emitting all five
+    MODELs. When small, the top-1 is already good and top-5 is
+    redundant."""
+    df = per_target.dropna(subset=["top1_rmsd", "top5_rmsd"])
+    gap = df["top1_rmsd"] - df["top5_rmsd"]
+    fig, ax = plt.subplots(figsize=(8, 3.8))
+    bins = np.linspace(0, 10, 30)
+    ax.hist(gap, bins=bins, color="#5b8def")
+    median_gap = float(gap.median())
+    ax.axvline(median_gap, color="#d44", linestyle="--", linewidth=1.0,
+               label=f"median = {median_gap:.2f} Å")
+    n_strict_gain = (gap > 1.0).sum()
+    ax.set_xlabel("top1_rmsd − top5_rmsd (Å)  ·  larger = top-5 wins more")
+    ax.set_ylabel("Targets")
+    ax.set_title(
+        f"Top-1 → Top-5 RMSD gain  "
+        f"(targets with > 1 Å improvement: {n_strict_gain} / {len(gap)})"
+    )
+    ax.legend(frameon=False)
+    _save(fig, out)
+
+
+def chart_pose_pool_vs_oracle(unified: pd.DataFrame, per_target: pd.DataFrame,
+                               out: Path) -> None:
+    """Does having more poses correlate with a better oracle? If yes,
+    the pose-pool widening (Track 2 + consensus pockets) is doing
+    its job. If no, more poses are just adding noise without
+    coverage."""
+    if unified.empty:
+        return
+    counts = unified.groupby("target").size().reset_index(name="n_poses_unified")
+    # Strip "_input" suffix on either side so the join lines up regardless
+    # of how each artefact spelled the target id. ``per_target`` already
+    # has an ``n_poses`` column (from its own scan), so we rename the
+    # unified one and drop the per-target n_poses to avoid suffix conflict.
+    pt = per_target.drop(columns=[c for c in per_target.columns if c == "n_poses"])
+    pt = pt.copy()
+    pt["target_norm"] = pt["target"].str.replace(r"_input$", "", regex=True)
+    counts["target_norm"] = counts["target"].str.replace(r"_input$", "", regex=True)
+    df = pt.merge(counts[["target_norm", "n_poses_unified"]],
+                  on="target_norm", how="inner")
+    df = df.rename(columns={"n_poses_unified": "n_poses"})
+    df = df.dropna(subset=["oracle_rmsd", "n_poses"])
+    if df.empty:
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 4.2))
+    # Bin by pose count, plot mean oracle RMSD per bin
+    bins = [0, 100, 200, 400, 700, 1500, 5000]
+    df["n_bin"] = pd.cut(df["n_poses"], bins=bins)
+    grouped = df.groupby("n_bin", observed=True).agg(
+        n_targets=("oracle_rmsd", "size"),
+        mean_oracle=("oracle_rmsd", "mean"),
+        oracle_native_rate=("oracle_native", "mean"),
+    )
+    x = range(len(grouped.index))
+    ax.bar(x, grouped["oracle_native_rate"] * 100, color="#7fbf7b",
+           label="oracle < 2 Å rate")
+    ax2 = ax.twinx()
+    ax2.plot(x, grouped["mean_oracle"], "o-", color="#d44",
+             label="mean oracle_rmsd")
+    ax2.set_ylabel("mean oracle_rmsd (Å)", color="#d44")
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"{b}\n(n={n})" for b, n in zip(grouped.index, grouped["n_targets"])],
+                       fontsize=9)
+    ax.set_xlabel("Pose-pool size bin per target")
+    ax.set_ylabel("Oracle native rate (%)", color="#7fbf7b")
+    ax.set_title("Does a larger pose pool buy a better oracle?")
+    _save(fig, out)
+
+
+def chart_box_source_per_zone(unified: pd.DataFrame, out: Path) -> None:
+    """Per-zone, per-box-source share of (target, ligand) top-1 picks.
+    When a zone leans heavily on ``cofolding`` it means the cofold
+    pocket is good enough; when it leans on ``template_consensus_*``
+    it means the templates were the rescue."""
+    if unified.empty or "box_source" not in unified.columns:
+        return
+    df = unified.dropna(subset=["lscore", "box_source"]).copy()
+    if df.empty:
+        return
+    # Per (target, ligand_id) top-1 by lscore (only docking poses w/
+    # box_source set)
+    top = df.loc[df.groupby(["target", "ligand_id"], dropna=False)["lscore"].idxmax()]
+    counts = top.groupby(["seq_zone", "box_source"]).size().unstack(fill_value=0) \
+        if "seq_zone" in top.columns else None
+    if counts is None or counts.empty:
+        # ``unified`` doesn't carry seq_zone — fall back to pulling from
+        # per_pose_scores via target join.
+        return
+    counts = counts.loc[[z for z in ["novel", "remote", "related"] if z in counts.index]]
+    pct = counts.div(counts.sum(axis=1), axis=0) * 100
+
+    fig, ax = plt.subplots(figsize=(9, 4.2))
+    palette = plt.get_cmap("tab20")
+    bottom = np.zeros(len(pct.index))
+    for i, src in enumerate(pct.columns):
+        ax.bar(pct.index, pct[src], bottom=bottom, label=src,
+               color=palette(i % 20))
+        bottom += pct[src].values
+    ax.set_ylabel("% of top-1 picks (per zone)")
+    ax.set_title("Per-zone share of docking top-1 picks across box sources")
+    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5),
+              fontsize=8.5, frameon=False)
+    ax.set_ylim(0, 105)
+    _save(fig, out)
+
+
+def chart_consensus_baseline_ranker(per_pose: pd.DataFrame, out: Path) -> None:
+    """Toy multi-scorer baseline: combine ``lscore`` with ``ipTM`` (a
+    cofold confidence proxy) by rank-sum, see if the per-target
+    Top-K SR moves vs lscore alone. This is a feasibility check
+    for a learned ranker — if even a naive rank-sum already lifts
+    SR, an honest ranker is worth the engineering."""
+    df = per_pose.dropna(subset=["lscore", "true_rmsd"]).copy()
+    Ks = [1, 2, 3, 5, 10, 20, 50, 100]
+
+    def topk_sr(score_col: str, ascending: bool):
+        sub = df.dropna(subset=[score_col])
+        sub = sub.sort_values(["target", score_col],
+                              ascending=[True, ascending])
+        out_curve = []
+        for k in Ks:
+            head = sub.groupby("target", as_index=False, sort=False).head(k)
+            sr = (head.groupby("target")["true_rmsd"].min() < 2.0).mean() * 100
+            out_curve.append(sr)
+        return out_curve
+
+    # lscore alone
+    lscore_curve = topk_sr("lscore", ascending=False)
+
+    # rank-sum lscore + ipTM (per-target rank, lower = better → use sum)
+    sub = df.dropna(subset=["lscore", "iptm"]).copy()
+    if not sub.empty:
+        sub["rank_lscore"] = sub.groupby("target")["lscore"].rank(method="average",
+                                                                    ascending=False)
+        sub["rank_iptm"] = sub.groupby("target")["iptm"].rank(method="average",
+                                                                ascending=False)
+        sub["rank_sum"] = sub["rank_lscore"] + sub["rank_iptm"]
+        sub_sorted = sub.sort_values(["target", "rank_sum"],
+                                     ascending=[True, True])
+        rank_sum_curve = []
+        for k in Ks:
+            head = sub_sorted.groupby("target", as_index=False, sort=False).head(k)
+            sr = (head.groupby("target")["true_rmsd"].min() < 2.0).mean() * 100
+            rank_sum_curve.append(sr)
+    else:
+        rank_sum_curve = None
+
+    # Naive native ceiling
+    oracle_per_target = df.groupby("target")["true_rmsd"].min()
+    oracle = (oracle_per_target < 2.0).mean() * 100
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    ax.plot(Ks, lscore_curve, marker="o", linewidth=2, color="#5b8def",
+            label="lscore alone")
+    if rank_sum_curve is not None:
+        ax.plot(Ks, rank_sum_curve, marker="s", linewidth=2, color="#7e6cd5",
+                label="rank-sum (lscore + ipTM)")
+    ax.axhline(oracle, color="#444", linestyle="--", linewidth=1,
+               label=f"oracle ceiling ({oracle:.1f} %)")
+    ax.set_xscale("log")
+    ax.set_xticks(Ks)
+    ax.set_xticklabels(Ks)
+    ax.set_xlabel("Top-K poses retained per target")
+    ax.set_ylabel("% targets with at least one < 2 Å pose")
+    ax.set_title("Naive multi-scorer baseline: rank-sum (lscore + ipTM) vs lscore alone")
+    ax.legend(loc="lower right", frameon=False)
+    _save(fig, out)
+
+
+def chart_cofold_lig_rmsd(per_pose: pd.DataFrame, out: Path) -> None:
+    """Per-target distribution of the *best* cofold-derived pose RMSD.
+    Independent of any docking/scoring step — just "did at least one
+    of the 4 cofold models put the ligand near native?". Frames the
+    upper bound of cofold-only generation."""
+    df = per_pose.dropna(subset=["true_rmsd"]).copy()
+    df["family"] = df["source"].str.replace(r"_(L\d*|X\d*)$", "", regex=True)
+    df["family"] = df["family"].str.replace(r"_seed[_-]\d+.*", "", regex=True)
+    cof = df[df.family.str.startswith("cofold_")].copy()
+    if cof.empty:
+        return
+    best = cof.groupby(["target", "seq_zone"], dropna=False)["true_rmsd"].min().reset_index()
+    best.columns = ["target", "seq_zone", "best_cofold_rmsd"]
+    fig, ax = plt.subplots(figsize=(8, 4.2))
+    bins = np.linspace(0, 25, 60)
+    palette = {"novel": "#d44", "remote": "#5b8def", "related": "#7fbf7b"}
+    for zone in ("novel", "remote", "related"):
+        sub = best[best.seq_zone == zone]
+        if sub.empty:
+            continue
+        native_rate = (sub["best_cofold_rmsd"] < 2.0).mean()
+        ax.hist(sub["best_cofold_rmsd"], bins=bins, alpha=0.55,
+                color=palette[zone],
+                label=f"{zone}  (native {native_rate:.1%}, n={len(sub)})")
+    ax.axvline(2.0, color="#444", linestyle="--", linewidth=1,
+               label="2 Å native cutoff")
+    ax.set_xlabel("best cofold pose true_rmsd (Å)")
+    ax.set_ylabel("Targets")
+    ax.set_title("Cofold-only oracle (best of 4 models × 25 samples) per zone")
+    ax.legend(frameon=False)
+    _save(fig, out)
+
+
+def chart_intra_family_diversity(per_pose: pd.DataFrame, out: Path) -> None:
+    """Per-target intra-family RMSD spread (max − min among that
+    family's poses). When the spread is small, the family is
+    converging on one answer; when large, it's exploring widely.
+    Useful for the "ADG generates 38k poses but only 1 % native"
+    finding — does ADG explore widely or just pile up on one
+    wrong basin?"""
+    df = per_pose.dropna(subset=["true_rmsd"]).copy()
+    df["family"] = df["source"].str.replace(r"_(L\d*|X\d*)$", "", regex=True)
+    df["family"] = df["family"].str.replace(r"_seed[_-]\d+.*", "", regex=True)
+    big = df["family"].value_counts()
+    keep = big[big >= 5000].index.tolist()
+    df = df[df["family"].isin(keep)]
+    if df.empty:
+        return
+    spread = df.groupby(["target", "family"])["true_rmsd"].agg(
+        lambda s: float(s.max() - s.min())
+    ).reset_index(name="spread")
+    median_order = (spread.groupby("family")["spread"].median()
+                    .sort_values().index.tolist())
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    data = [spread.loc[spread.family == f, "spread"].values for f in median_order]
+    bp = ax.boxplot(data, vert=False, widths=0.6, patch_artist=True,
+                    showfliers=False)
+    for patch in bp["boxes"]:
+        patch.set_facecolor("#7e6cd5")
+        patch.set_alpha(0.7)
+    ax.set_yticklabels(median_order)
+    ax.set_xlabel("intra-family true_rmsd spread per target  (max − min, Å)")
+    ax.set_title("How wide does each family explore per target?")
+    _save(fig, out)
+
+
 def write_report(
     md_path: Path,
     sr_df: pd.DataFrame,
@@ -903,6 +1144,111 @@ where each zone's wins come from:
   having the most poses) — the native-rate finding above
   explains the absence.
 
+## Deeper diagnostics
+
+### Top-1 → Top-5 gain
+
+How much extra success do we get from emitting all five MODELs vs
+just the lone top-1? Per-target ``top1_rmsd − top5_rmsd``: large
+gap = top-5 materially better; small gap = top-1 already good or
+diverse top-5 redundant.
+
+![Top-1 → Top-5 gap]({figures['top1_top5_gap'].relative_to(md_path.parent)})
+
+Read-outs:
+
+- **Median improvement is only 0.16 Å** — for the bulk of targets,
+  top-5 doesn't move the RMSD much beyond top-1.
+- **111 / 497 targets ( ≈ 22 %) gain > 1 Å** by going from top-1
+  to top-5. That's where emitting all 5 MODELs is materially
+  paying off. Concentrated in the recoverable-but-mis-ranked
+  population identified in the top-1↔oracle gap chart above.
+
+### Cofold-only generation ceiling
+
+Independent of any docking / scoring step: per target, what is the
+*best* RMSD among all cofold (Boltz/Boltz2x/Protenix/AF3) ligand
+samples? Caps the cofold-only oracle.
+
+![Best cofold pose per target by zone]({figures['cofold_lig_rmsd'].relative_to(md_path.parent)})
+
+Read-outs:
+
+- **Cofold-only oracle: novel 57.4 %, remote 72.3 %, related
+  44.8 %.** Remote zone benefits the most from cofold (template
+  signal flows through the MSA into the cofold model), novel zone
+  is competitive, related zone is surprisingly the worst — the
+  XChem fragment cluster lives here and fragments are
+  *intrinsically* hard for cofold even though they're
+  high-identity.
+- The cofold-only oracle (≈ 50 % overall) sets a meaningful
+  *upper* bound on what a "cofold-only" pipeline could achieve;
+  the union pipeline's full oracle (≈ 64 % cluster_rep_only) is
+  ≈ 14 pp above that, which is the contribution of the docking
+  + template tracks.
+
+### Intra-family RMSD spread
+
+For each (target, family), max − min RMSD across that family's
+poses. Tells whether a family is **converging** (small spread) or
+**exploring** (large spread).
+
+![Intra-family diversity]({figures['intra_family_diversity'].relative_to(md_path.parent)})
+
+Read-outs:
+
+- **PxDock has the tightest spread (median ≈ 2-3 Å)** — the
+  force-field + grid potentials converge on a small set of
+  poses. Consistent with its 9.6 % native rate: it's *picking*
+  reasonably, just narrowly.
+- **Cofold families spread 3-5 Å** — multi-seed × multi-sample
+  diversity does its job.
+- **Vina + ADG spread 7-8 Å** — the widest exploration of any
+  family. ADG's spread is comparable to Vina's, which means the
+  earlier "ADG = 1 % native" finding is *not* about pile-up on
+  one wrong basin. ADG generates diverse poses that just don't
+  land near native very often. The right action is therefore
+  not "add diversity to ADG" but "down-weight ADG in the ranker
+  or cut it for cost".
+
+### Pose-pool size vs oracle
+
+Does throwing more poses at a target raise its oracle ceiling?
+
+![Pose pool size vs oracle]({figures['pose_pool_vs_oracle'].relative_to(md_path.parent)})
+
+Read-outs:
+
+- The (700, 1500] bin tops out at **62 % oracle native** with
+  mean RMSD ≈ 4.9 Å — sweet spot.
+- The (1500, 5000] bin (n=21 — XChem cluster + similar mega-pools)
+  drops back to **52.5 %** with mean RMSD ≈ 4.5 Å. More poses
+  help up to a point, then noise dominates.
+- The (200, 400] bin (the novel2025 majority, n=221) sits at
+  **58.8 % / 3.5 Å mean** — already most of the oracle gain
+  achievable with the current pose generators.
+
+### Naive multi-scorer baseline
+
+If a pose ranker is the actual SR bottleneck, even a naive
+combination of two scorers should already lift Top-K SR. This is
+the rank-sum of (lscore, ipTM) per target vs lscore alone:
+
+![Naive rank-sum vs lscore]({figures['consensus_baseline_ranker'].relative_to(md_path.parent)})
+
+Read-outs:
+
+- **Rank-sum (lscore + ipTM) beats lscore alone at every K**
+  on the existing pool — without any training data:
+  - K=1: 24.4 % → **27.8 %** (+3.4 pp)
+  - K=5: 30.9 % → **32.9 %** (+2.0 pp)
+  - K=20: 38.9 % → 39.7 % (+0.8 pp)
+- The gain shrinks as K grows because larger top-K already
+  captures most of what the secondary scorer would surface.
+- This is **first data-driven evidence that a learned ranker has
+  real headroom** — even rank-fusion of two existing scorers
+  recovers ≈ 3 pp at top-1 with no training.
+
 ## Where the SR ceilings sit (current pipeline)
 
 | metric                          | value     |
@@ -1022,6 +1368,23 @@ def main() -> int:
 
     figures["zone_family_contribution"] = figs_dir / "zone_family_contribution.png"
     chart_zone_family_contribution(per_pose, figures["zone_family_contribution"])
+
+    # Deeper diagnostics ----------------------------------------------------
+    figures["top1_top5_gap"] = figs_dir / "top1_top5_gap.png"
+    chart_top1_top5_gap(per_target, figures["top1_top5_gap"])
+
+    figures["consensus_baseline_ranker"] = figs_dir / "consensus_baseline_ranker.png"
+    chart_consensus_baseline_ranker(per_pose, figures["consensus_baseline_ranker"])
+
+    figures["cofold_lig_rmsd"] = figs_dir / "cofold_lig_rmsd.png"
+    chart_cofold_lig_rmsd(per_pose, figures["cofold_lig_rmsd"])
+
+    figures["intra_family_diversity"] = figs_dir / "intra_family_diversity.png"
+    chart_intra_family_diversity(per_pose, figures["intra_family_diversity"])
+
+    if not unified.empty:
+        figures["pose_pool_vs_oracle"] = figs_dir / "pose_pool_vs_oracle.png"
+        chart_pose_pool_vs_oracle(unified, per_target, figures["pose_pool_vs_oracle"])
 
     if not unified.empty:
         figures["source_family_top1"] = figs_dir / "source_family_top1.png"

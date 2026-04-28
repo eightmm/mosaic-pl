@@ -55,6 +55,7 @@ def run_template_docking_prep(
     rcsb_db: Path | None = None,
     max_templates: int = 3,
     cofold_ref_cif: Path | None = None,
+    cofold_lig_anchor: list[float] | None = None,
 ) -> list[dict]:
     """Run prepare_template_docking.py and return template summaries."""
     script = Path(__file__).resolve().parent / "prepare_template_docking.py"
@@ -68,6 +69,11 @@ def run_template_docking_prep(
     ]
     if cofold_ref_cif is not None:
         cmd += ["--cofold-ref-cif", str(cofold_ref_cif)]
+    if cofold_lig_anchor is not None:
+        cmd += ["--cofold-lig-anchor",
+                f"{cofold_lig_anchor[0]}",
+                f"{cofold_lig_anchor[1]}",
+                f"{cofold_lig_anchor[2]}"]
     print(f"  Running: {' '.join(cmd)}")
     result = subprocess.run(cmd, text=True, capture_output=True)
     print(result.stdout)
@@ -445,6 +451,7 @@ def main() -> int:
     # uses; otherwise the eval transform (cofold→crystal) misplaces every
     # Track 2 pose by ~20 Å.
     cofold_ref_cif: Path | None = None
+    cofold_lig_anchor: list[float] | None = None
     prep_summary = run_dir / "inputs" / "docking" / "docking_prep_summary.json"
     if prep_summary.exists():
         try:
@@ -452,8 +459,18 @@ def main() -> int:
             cof_path = data.get("cofolding_structure")
             if cof_path and Path(cof_path).exists():
                 cofold_ref_cif = Path(cof_path)
+            # Track 1's box_method == "cofolding" gives us the cofold
+            # ligand centroid; on multimers that's the chain we want
+            # Track 2 to dock against too.
+            bs = (data.get("binding_site_predictions") or {}).get("cofolding") or {}
+            anchor = bs.get("center") or (data.get("box_center")
+                                          if data.get("box_method") == "cofolding"
+                                          else None)
+            if anchor and len(anchor) == 3:
+                cofold_lig_anchor = [float(v) for v in anchor]
         except Exception:
             cofold_ref_cif = None
+            cofold_lig_anchor = None
     if cofold_ref_cif is None:
         # Fallback: first aligned cofold cif we can find.
         candidates = sorted((run_dir / "outputs").rglob("*_aligned.cif"))
@@ -461,6 +478,8 @@ def main() -> int:
             cofold_ref_cif = candidates[0]
     if cofold_ref_cif is not None:
         print(f"  cofold reference: {cofold_ref_cif}")
+        if cofold_lig_anchor is not None:
+            print(f"  cofold ligand anchor (chain pick): {cofold_lig_anchor}")
     else:
         print("  WARNING: no cofold reference found; Track 2 outputs will "
               "stay in template frame (eval will be wrong)")
@@ -473,6 +492,7 @@ def main() -> int:
         rcsb_db=args.rcsb_db,
         max_templates=args.max_templates,
         cofold_ref_cif=cofold_ref_cif,
+        cofold_lig_anchor=cofold_lig_anchor,
     )
     if not templates:
         print("Template docking prep produced no templates.")

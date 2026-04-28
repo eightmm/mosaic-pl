@@ -98,22 +98,44 @@ def extract_cif(cif_path: Path, output_dir: Path) -> Path:
     return output
 
 
-def extract_ligand_center(cif_path: Path, ligand_ccd: str) -> list[float] | None:
-    """Extract ligand center coordinates from CIF using gemmi."""
+def extract_ligand_center(
+    cif_path: Path, ligand_ccd: str,
+    prefer_near: list[float] | None = None,
+) -> list[float] | None:
+    """Return one ligand instance's heavy-atom centroid.
+
+    Multimeric templates routinely have the same CCD bound to multiple
+    chains (8qrt is a homotetramer with 4 × WP2). Naive
+    averaging-across-instances drops the box on the *centroid of all
+    binding sites at once*, which is roughly the structural centre of
+    the protein and not a binding pocket at all — Vina then docks into
+    the protein interior. Pick a single instance instead, optionally
+    biased toward ``prefer_near`` (e.g. the cofold-ligand position
+    after the template→cofold transform) so we end up at the same
+    pocket the cofold model picked.
+    """
     import gemmi
+    import numpy as np
+
     structure = gemmi.read_structure(str(cif_path))
-    coords = []
+    instances: list[np.ndarray] = []
     for model in structure:
         for chain in model:
             for residue in chain:
-                if residue.name == ligand_ccd:
-                    for atom in residue:
-                        coords.append([atom.pos.x, atom.pos.y, atom.pos.z])
-    if not coords:
+                if residue.name != ligand_ccd:
+                    continue
+                atom_coords = [(a.pos.x, a.pos.y, a.pos.z) for a in residue]
+                if atom_coords:
+                    instances.append(np.array(atom_coords).mean(axis=0))
+        break  # first model only — match docking convention
+    if not instances:
         return None
-    import numpy as np
-    arr = np.array(coords)
-    return arr.mean(axis=0).tolist()
+    if prefer_near is not None:
+        anchor = np.asarray(prefer_near, dtype=float)
+        best = min(instances, key=lambda c: float(np.linalg.norm(c - anchor)))
+        return best.tolist()
+    # No preference → first instance (chain order). Better than averaging.
+    return instances[0].tolist()
 
 
 def extract_template_ligand_sdf(cif_path: Path, ligand_ccd: str, output_sdf: Path) -> Path | None:
@@ -355,6 +377,17 @@ def main() -> int:
              "frame and downstream RMSD evaluation against the cofold-frame "
              "crystal pose returns garbage (~23 Å mean error)."
     )
+    parser.add_argument(
+        "--cofold-lig-anchor", type=float, nargs=3, default=None,
+        metavar=("X", "Y", "Z"),
+        help="Cofold-predicted ligand centroid (x y z). When set, "
+             "templates with multiple ligand instances (homo-tetramers, "
+             "etc.) pick the instance closest to this anchor as the "
+             "docking-box centre. Without this, the first-chain "
+             "instance is used (much better than the previous "
+             "average-of-all-instances behaviour, but still arbitrary "
+             "for multimers)."
+    )
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -419,14 +452,20 @@ def main() -> int:
                 else:
                     print("  WARNING: failed to rewrite CIF in cofold frame")
 
-        # Extract ligand center for docking box
+        # Extract ligand center for docking box. When the cofold ligand
+        # anchor is provided, the closest instance wins (= same binding
+        # site the cofold model picked) — critical for multimers where
+        # the symmetric copies sit on opposite faces of the protein and
+        # an "average" centroid is structural-centre noise.
         center = None
         template_ligand_ccd = None
         for ccd_code in ligand_codes:
             ccd_code = ccd_code.strip()
             if not ccd_code:
                 continue
-            center = extract_ligand_center(cif, ccd_code)
+            center = extract_ligand_center(
+                cif, ccd_code, prefer_near=args.cofold_lig_anchor
+            )
             if center:
                 template_ligand_ccd = ccd_code
                 break

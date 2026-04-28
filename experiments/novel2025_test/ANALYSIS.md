@@ -280,6 +280,111 @@ where each zone's wins come from:
   having the most poses) — the native-rate finding above
   explains the absence.
 
+## Deeper diagnostics
+
+### Top-1 → Top-5 gain
+
+How much extra success do we get from emitting all five MODELs vs
+just the lone top-1? Per-target ``top1_rmsd − top5_rmsd``: large
+gap = top-5 materially better; small gap = top-1 already good or
+diverse top-5 redundant.
+
+![Top-1 → Top-5 gap](figures/top1_top5_gap.png)
+
+Read-outs:
+
+- **Median improvement is only 0.16 Å** — for the bulk of targets,
+  top-5 doesn't move the RMSD much beyond top-1.
+- **111 / 497 targets ( ≈ 22 %) gain > 1 Å** by going from top-1
+  to top-5. That's where emitting all 5 MODELs is materially
+  paying off. Concentrated in the recoverable-but-mis-ranked
+  population identified in the top-1↔oracle gap chart above.
+
+### Cofold-only generation ceiling
+
+Independent of any docking / scoring step: per target, what is the
+*best* RMSD among all cofold (Boltz/Boltz2x/Protenix/AF3) ligand
+samples? Caps the cofold-only oracle.
+
+![Best cofold pose per target by zone](figures/cofold_lig_rmsd.png)
+
+Read-outs:
+
+- **Cofold-only oracle: novel 57.4 %, remote 72.3 %, related
+  44.8 %.** Remote zone benefits the most from cofold (template
+  signal flows through the MSA into the cofold model), novel zone
+  is competitive, related zone is surprisingly the worst — the
+  XChem fragment cluster lives here and fragments are
+  *intrinsically* hard for cofold even though they're
+  high-identity.
+- The cofold-only oracle (≈ 50 % overall) sets a meaningful
+  *upper* bound on what a "cofold-only" pipeline could achieve;
+  the union pipeline's full oracle (≈ 64 % cluster_rep_only) is
+  ≈ 14 pp above that, which is the contribution of the docking
+  + template tracks.
+
+### Intra-family RMSD spread
+
+For each (target, family), max − min RMSD across that family's
+poses. Tells whether a family is **converging** (small spread) or
+**exploring** (large spread).
+
+![Intra-family diversity](figures/intra_family_diversity.png)
+
+Read-outs:
+
+- **PxDock has the tightest spread (median ≈ 2-3 Å)** — the
+  force-field + grid potentials converge on a small set of
+  poses. Consistent with its 9.6 % native rate: it's *picking*
+  reasonably, just narrowly.
+- **Cofold families spread 3-5 Å** — multi-seed × multi-sample
+  diversity does its job.
+- **Vina + ADG spread 7-8 Å** — the widest exploration of any
+  family. ADG's spread is comparable to Vina's, which means the
+  earlier "ADG = 1 % native" finding is *not* about pile-up on
+  one wrong basin. ADG generates diverse poses that just don't
+  land near native very often. The right action is therefore
+  not "add diversity to ADG" but "down-weight ADG in the ranker
+  or cut it for cost".
+
+### Pose-pool size vs oracle
+
+Does throwing more poses at a target raise its oracle ceiling?
+
+![Pose pool size vs oracle](figures/pose_pool_vs_oracle.png)
+
+Read-outs:
+
+- The (700, 1500] bin tops out at **62 % oracle native** with
+  mean RMSD ≈ 4.9 Å — sweet spot.
+- The (1500, 5000] bin (n=21 — XChem cluster + similar mega-pools)
+  drops back to **52.5 %** with mean RMSD ≈ 4.5 Å. More poses
+  help up to a point, then noise dominates.
+- The (200, 400] bin (the novel2025 majority, n=221) sits at
+  **58.8 % / 3.5 Å mean** — already most of the oracle gain
+  achievable with the current pose generators.
+
+### Naive multi-scorer baseline
+
+If a pose ranker is the actual SR bottleneck, even a naive
+combination of two scorers should already lift Top-K SR. This is
+the rank-sum of (lscore, ipTM) per target vs lscore alone:
+
+![Naive rank-sum vs lscore](figures/consensus_baseline_ranker.png)
+
+Read-outs:
+
+- **Rank-sum (lscore + ipTM) beats lscore alone at every K**
+  on the existing pool — without any training data:
+  - K=1: 24.4 % → **27.8 %** (+3.4 pp)
+  - K=5: 30.9 % → **32.9 %** (+2.0 pp)
+  - K=20: 38.9 % → 39.7 % (+0.8 pp)
+- The gain shrinks as K grows because larger top-K already
+  captures most of what the secondary scorer would surface.
+- This is **first data-driven evidence that a learned ranker has
+  real headroom** — even rank-fusion of two existing scorers
+  recovers ≈ 3 pp at top-1 with no training.
+
 ## Where the SR ceilings sit (current pipeline)
 
 | metric                          | value     |
