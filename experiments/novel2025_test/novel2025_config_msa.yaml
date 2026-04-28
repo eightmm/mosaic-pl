@@ -25,7 +25,7 @@ template_search_structure:
   binary: .local/bin/foldseek
   database_path: data/search_dbs/structure/rcsb_structDB
   query_from_cofolding: true
-  query_model_priority: [alphafold3, boltz, protenix]
+  query_model_priority: [alphafold3, boltz2x, boltz2, protenix]
   sensitivity: 9.5
   max_hits: 2000
   alignment_type: 1
@@ -55,6 +55,7 @@ protenix:
   enabled: true
   binary: .venvs/protenix/bin/protenix
   model_name: protenix_base_default_v1.0.0
+  kalign_binary_path: .local/bin/kalign
   use_msa: true              # Protenix fetches its own MSA (msa_server_mode: protenix)
   dtype: bf16
   trimul_kernel: cuequivariance

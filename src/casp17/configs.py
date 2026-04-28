@@ -675,7 +675,7 @@ class TemplateSearchStructureConfig:
     query_structure_path: str | None = None
     query_from_cofolding: bool = False
     query_model_priority: list[str] = field(
-        default_factory=lambda: ["alphafold3", "boltz", "protenix"]
+        default_factory=lambda: ["alphafold3", "boltz2x", "boltz2", "protenix"]
     )
     sensitivity: float = 9.5
     max_hits: int = 2000
@@ -708,7 +708,7 @@ class TemplateSearchStructureConfig:
             ),
             query_from_cofolding=_to_bool(data.get("query_from_cofolding"), False),
             query_model_priority=[
-                str(item) for item in data.get("query_model_priority", ["alphafold3", "boltz", "protenix"])
+                str(item) for item in data.get("query_model_priority", ["alphafold3", "boltz2x", "boltz2", "protenix"])
             ],
             sensitivity=float(data.get("sensitivity", 9.5)),
             max_hits=int(data.get("max_hits", 2000)),
@@ -974,7 +974,7 @@ class RunnerConfig:
             invalid_models = [
                 model_name
                 for model_name in self.template_search_structure.query_model_priority
-                if model_name not in {"alphafold3", "boltz", "protenix"}
+                if model_name not in {"alphafold3", "boltz", "boltz2", "boltz2x", "protenix"}
             ]
             if invalid_models:
                 raise ValueError(
