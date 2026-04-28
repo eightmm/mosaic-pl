@@ -43,6 +43,59 @@ novel2025_test (489 타겟) 위에서의 ablation 결과 전부.
 - v4 의 SR 가 v3 보다 약간 낮은 이유: intersection 분모가 더 컴 (419 → 470)
   + 추가된 27 dropped 타겟 들이 평균보다 약간 어렵.
 
+## Sequence redundancy and cluster-aware re-evaluation
+
+novel2025 의 499 input 은 **246 unique 단백질** 에 불과 (mmseqs `easy-cluster
+--min-seq-id 1.0 -c 0.9` 기준). 단일 130-member 클러스터 (`9s4h_input` 대표,
+멤버 = `7hqq…7hr*` XChem fragment screen 시리즈) 가 데이터셋의 26 % 를 차지
+하기 때문에 **per-target average 는 그 한 enzyme 에 의해 6-8 %p 끌어내려짐**.
+
+`scripts/analyze_sr_by_cluster.py` 가 정의한 세 aggregation 정책 위에서
+재계산 (existing `per_pose_scores.csv`, 261 k poses / 497 targets, top-5 는
+diversity-free `max-lscore top-5` approximation):
+
+|                            |    n |   Top-1 |   Top-5 |  Oracle |
+|----------------------------|-----:|--------:|--------:|--------:|
+| `per_target` (현 baseline) |  497 |  24.5 % |  31.0 % |  57.1 % |
+| `cluster_rep_only` @ 100%  |  244 |  30.7 % |  39.8 % |  63.5 % |
+| `cluster_rep_only` @ 95%   |  229 |  31.4 % |  41.0 % |  63.3 % |
+| `cluster_rep_only` @ 30%   |  207 |  31.9 % |  41.1 % |  63.3 % |
+| `cluster_any` @ 100%       |  244 |  34.8 % |  45.1 % |  68.0 % |
+| `cluster_any` @ 30%        |  207 |  36.7 % |  47.3 % |  69.1 % |
+| `cluster_mean` @ 100%      |  244 |  30.1 % |  39.6 % |  64.0 % |
+
+**결론**:
+
+1. **biased 와 unbiased 의 차이가 6-8 %p**. XChem cluster 의 fragment 들은
+   small/low-affinity 라서 SR 이 평균보다 낮고, 그 130 entries 가 per-target
+   평균을 끌어내림. 보고 시 `cluster_rep_only @ 100%` (Top-1 30.7 %, Best-5
+   39.8 %, Oracle 63.5 %) 가 더 공정한 헤드라인.
+2. **Top-1 ↔ Oracle 갭 ≈ 33 %p 가 aggregation/threshold 에 무관**. 즉
+   "scoring bottleneck" 의 크기는 cluster 어떻게 묶든 일정. 풀에 정답
+   pose 가 ~63 % 있는데 picker 는 ~31 % 만 선택.
+3. **Threshold 변동 영향 미미** (244 → 207, -15 %): novel2025 의
+   multi-member cluster 들은 거의 동일 단백질 (mutant 차이 작음) → 100 %
+   identity 로도 충분히 dedup.
+4. **Per-zone (`cluster_rep_only @ 100 %`)**: novel 30.6 / 59.2 %, related
+   32.7 / 58.2 %, remote 28.2 / 72.9 %. **Oracle 의 zone 격차** (remote 최고)
+   는 template-coverage 신호; **Top-1 격차는 평탄** → scoring 은 zone 무관
+   하게 동일하게 깨짐.
+
+### 출력 (`experiments/novel2025_test/`)
+- `cluster_targets_{100,095,070,050,030}.csv` — target → cluster_rep + cluster_size
+- `sr_per_target.csv` — 497 타겟 × {top1/top5/oracle rmsd + native bool + zone}
+- `sr_by_cluster.csv` — long-format SR (192 행: policy × zone × threshold × metric)
+
+### Implications for ranker work
+- **본 문서의 Single-scorer ceiling 표 (n=489 per-target) 의 oracle 58.7 %**
+  는 biased per-target 분모. cluster-rep 기준으로 환산하면 **63.5 %** 가
+  실제 풀 천장. ranker 가 당장 회수해야 할 갭은 33 %p, 더 풀어야 할 천장은
+  37 %p (= 1 - 0.635 + 1 - 0.307).
+- best-5 = 38.7 % (per_target) 가 cluster-rep 기준으로는 **39.8 %** 로 거의
+  변동 없음 — 즉 lscore_top5_diverse 는 XChem cluster 안에서도 다른 cluster
+  들과 비슷한 비율로 작동. **현 ranker 의 한계는 cluster 의존이 아니라
+  scorer 자체의 한계.**
+
 ## Algorithm
 
 ```python
@@ -235,7 +288,10 @@ per_pose_scores.csv  (true_rmsd 사전 계산, USalign + RDKit symmetric heavy-a
         ├─ validate_consensus.py          →  consensus 가설 검증
         ├─ analyze_pose_diversity.py      →  intra-model spread + family CDF
         ├─ cluster_ablation.py            →  cluster scoring 6 변형 (target 당 1번 cluster)
-        └─ validate_new_ranker.py         →  ranker 끼리 직접 비교 (top-1 / best-5 SR)
+        ├─ validate_new_ranker.py         →  ranker 끼리 직접 비교 (top-1 / best-5 SR)
+        ├─ scripts/cluster_novel2025_targets.py   →  mmseqs sequence-cluster (5 thresholds)
+        └─ scripts/analyze_sr_by_cluster.py       →  per_target / cluster_rep_only /
+                                                     cluster_any / cluster_mean SR
 ```
 
 각 스크립트는 stride 옵션으로 sample 검증 또는 full batch 둘 다 가능.
