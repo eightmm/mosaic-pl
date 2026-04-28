@@ -720,6 +720,77 @@ class TemplateSearchStructureConfig:
 
 
 @dataclass(slots=True)
+class MSAPipelineConfig:
+    """Unified MSA + template generation via AF3's data pipeline.
+
+    When ``enabled``, the wrapper inserts a CPU-only stage that runs
+    ``run_alphafold.py --run_data_pipeline=true --run_inference=false``
+    against the prepared AF3 input JSON. The resulting ``*_data.json``
+    contains ``unpairedMsa`` / ``pairedMsa`` / ``templates`` fields
+    populated by jackhmmer + hmmsearch on the local AF3 database.
+
+    A subsequent bridge (``bridge_distribute_msa_templates.py``)
+    extracts those features into shared A3M files + a list of template
+    mmCIF paths, then patches the Boltz YAML and Protenix JSON so all
+    three cofolding tools consume the same MSA + template set instead
+    of each tool fetching its own from ColabFold.
+
+    Disabled by default (``enabled=False``) — when off, the existing
+    Boltz-MSA-server path stays in place and the Boltz→AF3/Protenix
+    bridges fill in the gap.
+    """
+
+    enabled: bool = False
+    db_dir: str = "/home/jaemin/DB/AlphaFold3"
+    # Overrides for HMMER binaries; None = let AF3 ``shutil.which`` pick
+    # up whatever is in PATH (we install to ``.local/bin`` so PATH is
+    # already set in the wrapper).
+    jackhmmer_binary_path: str | None = None
+    hmmsearch_binary_path: str | None = None
+    hmmbuild_binary_path: str | None = None
+    nhmmer_binary_path: str | None = None
+    hmmalign_binary_path: str | None = None
+    # Template date filter (time-split benchmarks). Mirrors AF3's
+    # ``--max_template_date`` flag; defaults to 2021-09-30 inside AF3
+    # (matches the paper) but we usually want to override per benchmark.
+    max_template_date: str | None = None
+    n_cpu: int = 8
+    # Cap how many template mmCIF entries get propagated to Boltz/
+    # Protenix. AF3 itself uses up to 4 templates by default; matching
+    # that here keeps the inputs uniform across the three models.
+    max_templates: int = 4
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "MSAPipelineConfig":
+        if data is None:
+            return cls()
+        return cls(
+            enabled=_to_bool(data.get("enabled"), False),
+            db_dir=str(data.get("db_dir", "/home/jaemin/DB/AlphaFold3")),
+            jackhmmer_binary_path=_optional_string(
+                data.get("jackhmmer_binary_path"), "msa_pipeline.jackhmmer_binary_path"
+            ),
+            hmmsearch_binary_path=_optional_string(
+                data.get("hmmsearch_binary_path"), "msa_pipeline.hmmsearch_binary_path"
+            ),
+            hmmbuild_binary_path=_optional_string(
+                data.get("hmmbuild_binary_path"), "msa_pipeline.hmmbuild_binary_path"
+            ),
+            nhmmer_binary_path=_optional_string(
+                data.get("nhmmer_binary_path"), "msa_pipeline.nhmmer_binary_path"
+            ),
+            hmmalign_binary_path=_optional_string(
+                data.get("hmmalign_binary_path"), "msa_pipeline.hmmalign_binary_path"
+            ),
+            max_template_date=_optional_string(
+                data.get("max_template_date"), "msa_pipeline.max_template_date"
+            ),
+            n_cpu=int(data.get("n_cpu", 8)),
+            max_templates=int(data.get("max_templates", 4)),
+        )
+
+
+@dataclass(slots=True)
 class PostAnalysisConfig:
     enabled: bool = True
     device: str = "cuda"
@@ -772,6 +843,7 @@ class RunnerConfig:
     template_search_structure: TemplateSearchStructureConfig = field(
         default_factory=TemplateSearchStructureConfig
     )
+    msa_pipeline: MSAPipelineConfig = field(default_factory=MSAPipelineConfig)
     slurm: SlurmConfig = field(default_factory=SlurmConfig)
     post_analysis: PostAnalysisConfig = field(default_factory=PostAnalysisConfig)
     submission: SubmissionConfig = field(default_factory=SubmissionConfig)
@@ -804,6 +876,7 @@ class RunnerConfig:
             template_search_structure=TemplateSearchStructureConfig.from_dict(
                 data.get("template_search_structure")
             ),
+            msa_pipeline=MSAPipelineConfig.from_dict(data.get("msa_pipeline")),
             slurm=SlurmConfig.from_dict(data.get("slurm")),
             post_analysis=PostAnalysisConfig.from_dict(data.get("post_analysis")),
             submission=SubmissionConfig.from_dict(data.get("submission")),

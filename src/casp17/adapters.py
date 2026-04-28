@@ -115,7 +115,12 @@ def _build_boltz_command(
     _append_option(command, "--affinity_checkpoint", config.boltz.affinity_checkpoint)
     _append_option(command, "--max_parallel_samples", config.boltz.max_parallel_samples)
     _append_option(command, "--step_scale", config.boltz.step_scale)
-    if _needs_boltz_msa_server(common) or config.boltz.use_msa_server:
+    # If the unified MSA bridge is enabled, the bridge writes ``msa: <a3m>``
+    # paths into the Boltz YAML and disables ``use_msa_server`` there. The
+    # CLI flag is omitted accordingly so Boltz never falls back to ColabFold
+    # silently when the local MSA file path is the one we want it to honour.
+    use_msa_server = (_needs_boltz_msa_server(common) or config.boltz.use_msa_server) and not config.msa_pipeline.enabled
+    if use_msa_server:
         command.append("--use_msa_server")
     _append_option(command, "--msa_server_url", config.boltz.msa_server_url)
     _append_option(command, "--msa_pairing_strategy", config.boltz.msa_pairing_strategy)
@@ -328,7 +333,11 @@ def prepare_protenix(
         "--dtype",
         config.protenix.dtype,
         "--use_msa",
-        str(config.protenix.use_msa or use_msa).lower(),
+        # Force on when the unified MSA bridge is wired — the bridge writes
+        # ``unpairedMsaPath`` into the protein chain at runtime, but adapter
+        # prep runs BEFORE the bridge, so the ``use_msa`` heuristic above
+        # would otherwise see an empty JSON and emit ``--use_msa false``.
+        str(config.protenix.use_msa or use_msa or config.msa_pipeline.enabled).lower(),
         "--use_default_params",
         str(config.protenix.use_default_params).lower(),
         "--trimul_kernel",
@@ -342,9 +351,16 @@ def prepare_protenix(
         "--enable_tf32",
         str(config.protenix.enable_tf32).lower(),
         "--msa_server_mode",
-        config.protenix.msa_server_mode,
+        # When the unified MSA bridge is on, override server mode to ``none``
+        # so Protenix uses the patched ``unpairedMsaPath`` instead of fetching
+        # a parallel MSA from the Protenix MSA server.
+        ("none" if config.msa_pipeline.enabled else config.protenix.msa_server_mode),
         "--use_template",
-        str(config.protenix.use_template or template_applied).lower(),
+        # Same reason as ``--use_msa``: the unified MSA bridge writes
+        # ``templatesPath`` into the protein chain at runtime, after this
+        # command line is baked in. Force on so Protenix actually reads
+        # the patched ``templatesPath``.
+        str(config.protenix.use_template or template_applied or config.msa_pipeline.enabled).lower(),
         "--use_rna_msa",
         str(config.protenix.use_rna_msa or use_rna_msa).lower(),
         "--use_seeds_in_json",
@@ -524,12 +540,18 @@ def prepare_alphafold3(
     af3_script = str(repo_root / config.alphafold3.script)
     af3_venv = Path(af3_python).parent.parent
     nv_lib_glob = str(af3_venv / "lib" / "python*" / "site-packages" / "nvidia" / "*" / "lib")
+    # When the unified MSA pipeline is enabled, the wrapper bridge already
+    # ran AF3's data pipeline once and dropped the augmented JSON in place
+    # of ``input_path``. Force inference-only here so AF3 doesn't redo
+    # jackhmmer + hmmsearch when the populated MSA + templates are right
+    # there in the input file.
+    af3_run_data = config.alphafold3.run_data_pipeline and not config.msa_pipeline.enabled
     af3_cmd_args = [
         af3_python,
         af3_script,
         f"--json_path={input_path}",
         f"--output_dir={output_dir}",
-        f"--run_data_pipeline={'true' if config.alphafold3.run_data_pipeline else 'false'}",
+        f"--run_data_pipeline={'true' if af3_run_data else 'false'}",
         f"--run_inference={'true' if config.alphafold3.run_inference else 'false'}",
     ]
     if config.alphafold3.model_dir:

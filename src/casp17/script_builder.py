@@ -313,6 +313,7 @@ def build_wrapper_shell_script(
     filter_script = repo_root / "scripts" / "run_template_filter.py"
     pockets_script = repo_root / "scripts" / "extract_template_pockets.py"
     cluster_script = repo_root / "scripts" / "cluster_template_pockets.py"
+    msa_distribute_script = repo_root / "scripts" / "bridge_distribute_msa_templates.py"
     multi_track_script = repo_root / "scripts" / "run_multi_track_docking.py"
     ion_script = repo_root / "scripts" / "collect_template_ions.py"
     post_analysis_script = repo_root / "scripts" / "run_post_analysis.py"
@@ -395,9 +396,84 @@ def build_wrapper_shell_script(
                 "",
             ])
 
+    def _emit_msa_pipeline_bridge(run_dir: Path) -> None:
+        """Run AF3's data pipeline (jackhmmer + hmmsearch + templates),
+        then distribute the MSA + template list to Boltz / Protenix /
+        AF3 inputs so all three cofolding tools share the exact same
+        homologs and templates instead of each fetching its own.
+
+        This is the single CPU-only stage that replaces the
+        ``Boltz fetches → bridge into the others`` chain. Cost is
+        ~30-60 min/target on the SLURM 12h budget, swallowed by the
+        existing wrapper job.
+        """
+        msa_cfg = config.msa_pipeline
+        af3_python = repo_root / config.alphafold3.python_bin
+        af3_script = repo_root / config.alphafold3.script
+        af3_venv = af3_python.parent.parent
+        nv_lib_glob = str(af3_venv / "lib" / "python*" / "site-packages" / "nvidia" / "*" / "lib")
+        msa_input_json = run_dir / "inputs" / "alphafold3_input.json"
+        msa_output_dir = run_dir / "outputs" / "msa_pipeline"
+        msa_output_dir.mkdir(parents=True, exist_ok=True)
+
+        cmd_parts = [
+            shlex.quote(str(af3_python)),
+            shlex.quote(str(af3_script)),
+            f"--json_path={shlex.quote(str(msa_input_json))}",
+            f"--output_dir={shlex.quote(str(msa_output_dir))}",
+            "--run_data_pipeline=true",
+            "--run_inference=false",
+            f"--db_dir={shlex.quote(msa_cfg.db_dir)}",
+            f"--jackhmmer_n_cpu={msa_cfg.n_cpu}",
+            f"--nhmmer_n_cpu={msa_cfg.n_cpu}",
+        ]
+        # Optional binary path overrides. Default is whatever ``shutil.which``
+        # picks up from PATH (we add ``.local/bin`` at the top of the wrapper),
+        # so leave None ⇒ omit flag.
+        for opt, val in (
+            ("--jackhmmer_binary_path", msa_cfg.jackhmmer_binary_path),
+            ("--hmmsearch_binary_path", msa_cfg.hmmsearch_binary_path),
+            ("--hmmbuild_binary_path", msa_cfg.hmmbuild_binary_path),
+            ("--nhmmer_binary_path", msa_cfg.nhmmer_binary_path),
+            ("--hmmalign_binary_path", msa_cfg.hmmalign_binary_path),
+        ):
+            if val:
+                cmd_parts.append(f"{opt}={shlex.quote(val)}")
+        if msa_cfg.max_template_date:
+            cmd_parts.append(f"--max_template_date={shlex.quote(msa_cfg.max_template_date)}")
+
+        lines.extend([
+            'echo ""',
+            'echo "================================================================"',
+            'echo "  BRIDGE: AF3 data pipeline (jackhmmer + hmmsearch + templates)"',
+            'echo "================================================================"',
+            f'for _nv_lib in {nv_lib_glob}; do export LD_LIBRARY_PATH="$_nv_lib:${{LD_LIBRARY_PATH:-}}"; done',
+            f"{' '.join(cmd_parts)} || echo '  (msa pipeline failed, continuing — Boltz/Protenix/AF3 will use whatever fallback they have)'",
+            "",
+            'echo "----------------------------------------------------------------"',
+            'echo "  BRIDGE: Distributing MSA + templates to Boltz / Protenix / AF3"',
+            'echo "----------------------------------------------------------------"',
+            f"{shlex.quote(str(hub_python))} {shlex.quote(str(msa_distribute_script))} "
+            f"--run-dir {shlex.quote(str(run_dir))} "
+            f"--max-templates {msa_cfg.max_templates}"
+            f" || echo '  (distribute failed, continuing)'",
+            "",
+        ])
+
     template_bridges_done = False
+    msa_bridges_done = False
     cofold_done = False
     for stage_name, script_path in stage_scripts:
+        # Pre-cofolding bridge: AF3 data pipeline + distribute MSA/templates.
+        # Runs once before whichever cofolding stage fires first; both Boltz
+        # and Protenix consume the patched inputs from disk.
+        if (
+            stage_name == "cofolding"
+            and config.msa_pipeline.enabled
+            and not msa_bridges_done
+        ):
+            _emit_msa_pipeline_bridge(script_path.parent.parent)
+            msa_bridges_done = True
         # Pre-docking bridges. Order matters: template artifacts (filter +
         # pockets + cluster) must come BEFORE docking-prep so the prep step
         # can register template_consensus_* sources for vina/adg/pxdock.
