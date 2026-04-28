@@ -678,7 +678,7 @@ class TemplateSearchStructureConfig:
         default_factory=lambda: ["alphafold3", "boltz", "protenix"]
     )
     sensitivity: float = 9.5
-    max_hits: int = 500
+    max_hits: int = 2000
     alignment_type: int = 1
     threads: int = 8
     extra_args: list[str] = field(default_factory=list)
@@ -711,7 +711,7 @@ class TemplateSearchStructureConfig:
                 str(item) for item in data.get("query_model_priority", ["alphafold3", "boltz", "protenix"])
             ],
             sensitivity=float(data.get("sensitivity", 9.5)),
-            max_hits=int(data.get("max_hits", 500)),
+            max_hits=int(data.get("max_hits", 2000)),
             alignment_type=int(data.get("alignment_type", 1)),
             threads=int(data.get("threads", 8)),
             extra_args=[str(arg) for arg in data.get("extra_args", [])],

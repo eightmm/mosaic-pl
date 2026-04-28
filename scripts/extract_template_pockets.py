@@ -173,12 +173,16 @@ def main() -> int:
     parser.add_argument(
         "--max-templates",
         type=int,
-        default=100,
-        help="Cap how many top-evidence templates we align — bounds wall time "
-             "(~1s/template via gemmi CA superposition). Filter sort already "
-             "puts both-source + high TM-score hits first, so the cap acts on "
-             "the tail. With foldseek max_hits=500 and qtmscore_min=0.5, the "
-             "post-filter pool is typically 50-300 hits; 100 keeps the bulk.",
+        default=500,
+        help="Cap how many top-evidence templates USalign aligns. Bounds "
+             "wall time at ~3-5 s/template; 500 ≈ 25-40 min/target — "
+             "comfortable inside the SLURM 12h budget. The motivation for "
+             "going wide is that template gathering is the actual game: "
+             "USalign rejects bad-fold candidates fast (TM < min-tmscore), "
+             "so the marginal cost of extra candidates beyond the same-fold "
+             "tail is small. With foldseek max_hits=2000 the post-filter "
+             "pool typically has 100-1500 unique hits; 500 keeps the bulk "
+             "of credible same-fold candidates.",
     )
     # The single authoritative quality gate on the union template pool.
     # Since USalign aligns every selected template, its TM-score is the

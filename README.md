@@ -229,7 +229,7 @@ hits = filter_hits_with_ligands(
 
 3 단계로 자동 실행:
 1. **Union filter** (`run_template_filter.py`) — mmseqs ∪ foldseek dedup, ligand annotation. **MCS 게이트 없음**. foldseek 의 qtmscore 는 estimate 라 pre-filter 안 함 (default `qtmscore_min=0`); 모든 hit 이 다음 단계로 흘러가 USalign 이 진짜 TM 으로 결정.
-2. **Pocket extraction** (`extract_template_pockets.py`) — top `--max-templates 100` (default) hit 을 **USalign** 으로 cofold model 에 align (structure-based). actual TM-score < `--min-tmscore` (default 0.5 = canonical same-fold) 면 drop. bound candidate ligand heavy-atom centroid → `template_pockets.json`.
+2. **Pocket extraction** (`extract_template_pockets.py`) — top `--max-templates 500` (default) hit 을 **USalign** 으로 cofold model 에 align (structure-based). actual TM-score < `--min-tmscore` (default 0.5 = canonical same-fold) 면 drop. bound candidate ligand heavy-atom centroid → `template_pockets.json`. ~25-40 min/타겟 (USalign × 500).
 3. **Pocket clustering** (`cluster_template_pockets.py`) — single-link clustering 5 Å, weight = `(in_mmseqs + in_foldseek) + max(alignment_tmscore, qtmscore, pident/100)`. Top-K (default 5) → `template_pocket_clusters.json`. 각 cluster centroid 가 다음 단계에서 binding-site source 로 등록됨.
 
 **Threshold 정리**:
@@ -476,7 +476,7 @@ template_search_structure:
   query_from_cofolding: true                  # query auto-resolved from cofold cif
   query_model_priority: [alphafold3, boltz, protenix]
   sensitivity: 9.5
-  max_hits: 500                               # wide recall — foldseek has no native id/cov gate
+  max_hits: 2000                              # wide recall — foldseek has no native id/cov gate
   qtmscore_min: 0.0                           # 0 = disabled; USalign actual TM is the real gate
 
 vina:

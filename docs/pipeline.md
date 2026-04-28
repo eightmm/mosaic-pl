@@ -106,7 +106,7 @@ flowchart LR
 
 - **Tool**: `foldseek easy-search` against `data/search_dbs/structure/rcsb_structDB`
 - **Query 자동 선택**: `template_search_structure.query_from_cofolding=true` + `query_model_priority=[alphafold3, boltz, protenix]` — 첫 번째로 발견되는 cif 사용. Stage 의존성 검증 (`_validate_stage_dependencies`) 이 cofold 보다 먼저 도는 순서를 차단함.
-- **Parameter**: `--alignment-type 1` (3Di+AA), `-s 9.5`, `--max-seqs 500`, `--format-output query,target,evalue,bits,alntmscore,qtmscore,ttmscore,prob` (8-col)
+- **Parameter**: `--alignment-type 1` (3Di+AA), `-s 9.5`, `--max-seqs 2000`, `--format-output query,target,evalue,bits,alntmscore,qtmscore,ttmscore,prob` (8-col)
 - **명시적 quality cut 없음** (mmseqs 의 `min-seq-id 0.3` / `-c 0.7` 같은 게이트가 foldseek 에는 native 로 없음) → recall 우선. 후단 (Step 1-3 union filter) 에서 `qtmscore_min` floor 적용.
 - **Output**: `outputs/template_search_structure/foldseek_hits.tsv`
 - **소요 시간**: ~30 s ~ 2 min/타겟 (DB 크기에 따라)
@@ -154,7 +154,7 @@ flowchart LR
 - **Alignment 도구**: `casp17.usalign.run_usalign` — `.local/bin/USalign` 호출. 구조 기반 (TM-align algorithm) 이라 foldseek 이 hit 을 찾은 logic 과 동일한 view. distant homolog 도 정확히 align (gemmi 는 sequence-anchored 라서 같은 fold 라도 sequence 멀면 matched residue <50 으로 떨어져 RMSD 15+ Å 로 폭발 → ligand centroid 가 엉뚱한 위치로 transform 됨; USalign 은 그 문제 없음).
 - **CIF 입력 직접 받음** (USalign 이 mmCIF/PDB auto-detect). RCSB 의 .cif.gz → `extract_cif` 로 풀어 `_extract_work/` 캐시한 다음 USalign 에 그대로 넘김.
 - **Per-record 출력 필드** (`PocketPoint`): `template_pdb_id`, `template_chain`, `ligand_ccd`, `ligand_chain`, `ligand_n_heavy`, `centroid_(x|y|z)` (cofold frame), `alignment_tmscore` (USalign reference-normalized), `alignment_rmsd` (aligned region only), `in_mmseqs`, `in_foldseek`, `pident`, `qtmscore`, `best_tanimoto`, `best_mcs_coverage`.
-- **`--max-templates 100`** (default): hits>500 케이스에서 wall time 보호. filter 의 evidence sort 덕분에 both-source / 높은 TM-score / 높은 pident 가 우선 align 됨. USalign ~3-5 s/template × 100 ≈ 5-8 min/타겟 — SLURM 12h 안에서 무시 가능.
+- **`--max-templates 500`** (default): template 모으기가 실제 게임이라는 관점에서 넓은 pool. USalign ~3-5 s/template × 500 ≈ 25-40 min/타겟 — SLURM 12h 안에서 충분 (cofolding 30 min + docking 30 min + 나머지 buffer). filter 의 evidence sort 덕분에 both-source / 높은 TM-score / 높은 pident 가 우선 align. 보통 단백질에서 TM≥0.5 통과하는 template 가 50-300 개라 500 너머는 거의 USalign reject — sweet spot.
 - **Alignment quality 게이트** (`--min-tmscore 0.4`, default): USalign 은 거의 항상 수렴하지만 corrupt CIF / chain-only-overlap 등 엣지 케이스 대비. 0.4 는 canonical 0.5 보다 약간 낮춰서 foldseek `qtmscore_min=0.5` 통과한 hit 을 이중 penalise 하지 않음. 검증: 101m (myoglobin) 을 가짜 qtm=0.72 으로 inject → 실제 USalign tm <0.4 (myoglobin vs 7htl 진짜 다른 fold) → drop. 같은-fold 진짜 homolog (8qrt, 78% pident): USalign tm=0.89, rmsd 1.21 Å → 통과.
 - **Multi-chain handling**: USalign 은 globally optimal chain matching 사용 (gemmi 는 chain A→A 고정). 호모테트라머 케이스에서 chain permutation 차이로 centroid 좌표가 달라질 수 있으나, **clustering (5 Å cutoff) 단계에서 같은 consensus pocket 으로 수렴**. 검증: 7htl (homotetramer) 에서 gemmi vs USalign 결과 top-2 cluster centroid 가 모두 (4.7-4.8, -2.0±0.5, 13-14) 와 (27, -7~-8, -21) 로 동일.
 - **Output**: `outputs/template_pockets/template_pockets.json`. 각 row 는 한 ligand-instance pocket point (homotetramer 라면 4개 binding site → 4 record). `n_low_quality_align` 필드에 게이트로 drop 된 갯수, `alignment_tool="USalign"` summary 필드에 수단 기록.

@@ -27,7 +27,7 @@ template_search_structure:
   query_from_cofolding: true
   query_model_priority: [alphafold3, boltz, protenix]
   sensitivity: 9.5
-  max_hits: 500
+  max_hits: 2000
   alignment_type: 1
   threads: 8
   # Foldseek's *estimated* qtmscore is left as a sort hint only — the
