@@ -678,10 +678,18 @@ class TemplateSearchStructureConfig:
         default_factory=lambda: ["alphafold3", "boltz", "protenix"]
     )
     sensitivity: float = 9.5
-    max_hits: int = 200
+    max_hits: int = 500
     alignment_type: int = 1
     threads: int = 8
     extra_args: list[str] = field(default_factory=list)
+    # TM-score floor for foldseek-only hits (mmseqs hits bypass this since
+    # they already have an explicit identity + coverage gate). 0.5 is the
+    # canonical Zhang/Skolnick "same fold" line — below that, fold identity
+    # is no longer reliable, which violates the binding-site-equivalence
+    # premise of pocket extraction. Use ``max(qtmscore, ttmscore)`` so a
+    # small template covering a query domain (high qtm) and a big template
+    # whose domain is our query (high ttm) both qualify.
+    qtmscore_min: float = 0.5
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "TemplateSearchStructureConfig":
@@ -702,10 +710,11 @@ class TemplateSearchStructureConfig:
                 str(item) for item in data.get("query_model_priority", ["alphafold3", "boltz", "protenix"])
             ],
             sensitivity=float(data.get("sensitivity", 9.5)),
-            max_hits=int(data.get("max_hits", 200)),
+            max_hits=int(data.get("max_hits", 500)),
             alignment_type=int(data.get("alignment_type", 1)),
             threads=int(data.get("threads", 8)),
             extra_args=[str(arg) for arg in data.get("extra_args", [])],
+            qtmscore_min=float(data.get("qtmscore_min", 0.5)),
         )
 
 

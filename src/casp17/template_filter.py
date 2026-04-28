@@ -223,6 +223,7 @@ def filter_hits_with_ligands(
     output_path: Path | None = None,
     max_deposition_date: str | None = None,
     foldseek_tsv: Path | None = None,
+    foldseek_qtmscore_min: float = 0.0,
 ) -> list[TemplateHit]:
     """Union-merge template hits from MMseqs2 + Foldseek and annotate with ligand info.
 
@@ -241,6 +242,12 @@ def filter_hits_with_ligands(
             its hits are unioned with the mmseqs list keyed on ``(pdb_id,
             chain_id)``. Foldseek-only hits expose ``qtmscore`` etc. as the
             primary structural-similarity signal (pident=0 for those).
+        foldseek_qtmscore_min: TM-score floor applied to **foldseek-only** hits
+            (mmseqs hits and dual-source hits bypass it). Compares against
+            ``max(qtmscore, ttmscore)`` so a small template covering a query
+            domain (high qtm) and a big template whose domain is our query
+            (high ttm) both qualify. Default 0.0 = no gate; set ≥ 0.5 to
+            enforce same-fold (canonical Zhang/Skolnick threshold).
 
     Returns:
         List of TemplateHit with ligand information and similarity scores,
@@ -258,8 +265,21 @@ def filter_hits_with_ligands(
     raw_hits: list[dict[str, str]] = []
     if hits_tsv is not None and Path(hits_tsv).exists():
         raw_hits.extend(parse_mmseqs_hits(hits_tsv))
+    foldseek_dropped = 0
     if foldseek_tsv is not None and Path(foldseek_tsv).exists():
-        raw_hits.extend(parse_foldseek_hits(foldseek_tsv))
+        for hit in parse_foldseek_hits(foldseek_tsv):
+            if foldseek_qtmscore_min > 0.0:
+                qtm = _safe_float(hit.get("qtmscore", "0"))
+                ttm = _safe_float(hit.get("ttmscore", "0"))
+                if max(qtm, ttm) < foldseek_qtmscore_min:
+                    foldseek_dropped += 1
+                    continue
+            raw_hits.append(hit)
+    if foldseek_dropped:
+        print(
+            f"  foldseek-floor: dropped {foldseek_dropped} hit(s) below "
+            f"max(qtmscore, ttmscore) >= {foldseek_qtmscore_min}"
+        )
 
     # Union-merge by (pdb_id, chain_id). When both sources hit the same chain
     # we keep both sets of metrics on a single TemplateHit so the consumer can

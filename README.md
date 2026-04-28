@@ -210,6 +210,7 @@ srun --partition=6000ada --gres=gpu:1 \
 **1b · Structure (Foldseek)** — `easy-search` against `data/search_dbs/structure/rcsb_structDB`
 - Query 자동 선택: cofolding 결과 (`query_from_cofolding=true`, priority `[alphafold3, boltz, protenix]`)
 - Stage 의존성 검증이 cofold 보다 먼저 도는 순서를 자동 차단
+- `--max-seqs 500` (recall 우선 — mmseqs 와 달리 native 한 identity/coverage cut 없음)
 - Output: `outputs/template_search_structure/foldseek_hits.tsv`
 
 **1c · Template bridges (auto, after both searches)**
@@ -227,11 +228,13 @@ hits = filter_hits_with_ligands(
 ```
 
 3 단계로 자동 실행:
-1. **Union filter** (`run_template_filter.py`) — mmseqs ∪ foldseek dedup, ligand annotation. **MCS 게이트 없음**.
-2. **Pocket extraction** (`extract_template_pockets.py`) — 각 hit 을 `gemmi` CA superposition 으로 cofold model 에 align, bound candidate ligand heavy-atom centroid 추출 → `template_pockets.json` (flat per-instance list).
+1. **Union filter** (`run_template_filter.py`) — mmseqs ∪ foldseek dedup, ligand annotation. **MCS 게이트 없음**. **Foldseek-only hit 에 한해** `max(qtmscore, ttmscore) ≥ qtmscore_min` floor 적용 (default 0.5 = Zhang/Skolnick "same fold"). mmseqs hit 과 dual-source hit 은 우회.
+2. **Pocket extraction** (`extract_template_pockets.py`) — top `--max-templates 100` (default) hit 을 `gemmi` CA superposition 으로 cofold model 에 align, bound candidate ligand heavy-atom centroid 추출 → `template_pockets.json`.
 3. **Pocket clustering** (`cluster_template_pockets.py`) — single-link clustering 5 Å, weight = `(in_mmseqs + in_foldseek) + max(qtmscore, pident/100)`. Top-K (default 5) → `template_pocket_clusters.json`. 각 cluster centroid 가 다음 단계에서 binding-site source 로 등록됨.
 
-**MCS threshold** (`template_search_sequence.mcs_threshold`, default `0.5`) — **Track 3 (lig-align) 만** gating.
+**Threshold 정리**:
+- `template_search_structure.qtmscore_min` (default `0.5`) — foldseek-only hit 의 fold-similarity 게이트
+- `template_search_sequence.mcs_threshold` (default `0.5`) — **Track 3 (lig-align) 만** gating
 
 ### Stage 2: Co-folding
 
@@ -472,7 +475,8 @@ template_search_structure:
   query_from_cofolding: true                  # query auto-resolved from cofold cif
   query_model_priority: [alphafold3, boltz, protenix]
   sensitivity: 9.5
-  max_hits: 200
+  max_hits: 500                               # wide recall — foldseek has no native id/cov gate
+  qtmscore_min: 0.5                           # same-fold floor for foldseek-only hits
 
 vina:
   enabled: true            # fans out into 6 variants per binding-site source

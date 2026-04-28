@@ -351,6 +351,9 @@ def build_wrapper_shell_script(
             filter_cmd += f" --hits-tsv {shlex.quote(str(mmseqs_tsv))}"
         if has_template_search_struct:
             filter_cmd += f" --foldseek-tsv {shlex.quote(str(foldseek_tsv))}"
+            qtm_min = config.template_search_structure.qtmscore_min
+            if qtm_min > 0.0:
+                filter_cmd += f" --foldseek-qtmscore-min {qtm_min}"
         if ts_cfg.max_deposition_date:
             filter_cmd += f" --max-deposition-date {shlex.quote(ts_cfg.max_deposition_date)}"
         lines.extend([

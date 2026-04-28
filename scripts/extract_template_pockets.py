@@ -160,10 +160,12 @@ def main() -> int:
     parser.add_argument(
         "--max-templates",
         type=int,
-        default=50,
-        help="Cap how many top-evidence templates we align — keeps wall time "
-             "bounded on hits>200 targets. Filter sort already puts both-source "
-             "+ high TM-score hits first.",
+        default=100,
+        help="Cap how many top-evidence templates we align — bounds wall time "
+             "(~1s/template via gemmi CA superposition). Filter sort already "
+             "puts both-source + high TM-score hits first, so the cap acts on "
+             "the tail. With foldseek max_hits=500 and qtmscore_min=0.5, the "
+             "post-filter pool is typically 50-300 hits; 100 keeps the bulk.",
     )
     parser.add_argument("--output-dir", type=Path, default=None)
     args = parser.parse_args()

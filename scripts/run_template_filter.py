@@ -65,6 +65,15 @@ def main() -> int:
         help="Drop template hits whose RCSB deposition_date is on or after this "
              "ISO date (YYYY-MM-DD). Used for time-split benchmarks.",
     )
+    parser.add_argument(
+        "--foldseek-qtmscore-min",
+        type=float,
+        default=0.0,
+        help="TM-score floor for foldseek-only hits (compared against "
+             "max(qtmscore, ttmscore)). 0.0 = no gate; 0.5 = canonical "
+             "Zhang/Skolnick same-fold threshold. mmseqs hits and dual-source "
+             "hits bypass this filter.",
+    )
     args = parser.parse_args()
 
     if args.hits_tsv is None and args.foldseek_tsv is None:
@@ -94,6 +103,7 @@ def main() -> int:
         target_smiles=target_smiles,
         output_path=args.output_tsv,
         max_deposition_date=args.max_deposition_date,
+        foldseek_qtmscore_min=args.foldseek_qtmscore_min,
     )
     n_both = sum(1 for h in results if h.in_mmseqs and h.in_foldseek)
     n_seq = sum(1 for h in results if h.in_mmseqs and not h.in_foldseek)

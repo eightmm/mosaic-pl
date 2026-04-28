@@ -106,7 +106,8 @@ flowchart LR
 
 - **Tool**: `foldseek easy-search` against `data/search_dbs/structure/rcsb_structDB`
 - **Query 자동 선택**: `template_search_structure.query_from_cofolding=true` + `query_model_priority=[alphafold3, boltz, protenix]` — 첫 번째로 발견되는 cif 사용. Stage 의존성 검증 (`_validate_stage_dependencies`) 이 cofold 보다 먼저 도는 순서를 차단함.
-- **Parameter**: `--alignment-type 1` (3Di+AA), `-s 9.5`, `--max-seqs 200`, `--format-output query,target,evalue,bits,alntmscore,qtmscore,ttmscore,prob` (8-col)
+- **Parameter**: `--alignment-type 1` (3Di+AA), `-s 9.5`, `--max-seqs 500`, `--format-output query,target,evalue,bits,alntmscore,qtmscore,ttmscore,prob` (8-col)
+- **명시적 quality cut 없음** (mmseqs 의 `min-seq-id 0.3` / `-c 0.7` 같은 게이트가 foldseek 에는 native 로 없음) → recall 우선. 후단 (Step 1-3 union filter) 에서 `qtmscore_min` floor 적용.
 - **Output**: `outputs/template_search_structure/foldseek_hits.tsv`
 - **소요 시간**: ~30 s ~ 2 min/타겟 (DB 크기에 따라)
 
@@ -128,10 +129,11 @@ flowchart LR
 - **Module**: `src/casp17/template_filter.py` (`parse_mmseqs_hits`, `parse_foldseek_hits`, `filter_hits_with_ligands`)
 - **Logic**:
   1. 두 TSV 를 파싱해 source 태깅 (`source: mmseqs` / `source: foldseek`)
-  2. `(pdb_id, chain_id)` 키로 dedup → 한 row 가 mmseqs+foldseek 모두에 등장하면 두 metric 다 보존 (`in_mmseqs=1, in_foldseek=1`)
-  3. 각 PDB 에서 `rcsb_index.db` candidate ligand (`is_candidate=1`, `ligand_type ∈ {small_molecule, cofactor, metabolite, nucleotide_like, peptide_like}`) 조회
-  4. Target SMILES vs template ligand: **Tanimoto** (Morgan FP, r=2, 2048 bits) + **MCS coverage** (`rdFMCS`, timeout=5s) — **저장만 하고 필터링에 쓰지 않음**
-  5. Sort key: `(in_mmseqs+in_foldseek 합계 ↓, qtmscore ↓, pident ↓, n_ligands ↓, tanimoto ↓, mcs ↓)` — both-source + 높은 구조/서열 유사도가 상위
+  2. **Foldseek-only floor** (선택): foldseek hit 에 한해 `max(qtmscore, ttmscore) >= foldseek_qtmscore_min` 통과한 것만 union 에 들어감. default 0.5 = Zhang/Skolnick "same fold" 임계. mmseqs hit 은 이미 `≥30% id + ≥70% cov` 통과했으므로 우회 (qtm=0 이어도 OK).
+  3. `(pdb_id, chain_id)` 키로 dedup → 한 row 가 mmseqs+foldseek 모두에 등장하면 두 metric 다 보존 (`in_mmseqs=1, in_foldseek=1`). dual-source hit 은 floor 와 무관하게 통과 (mmseqs 가 이미 통과시켰으므로).
+  4. 각 PDB 에서 `rcsb_index.db` candidate ligand (`is_candidate=1`, `ligand_type ∈ {small_molecule, cofactor, metabolite, nucleotide_like, peptide_like}`) 조회
+  5. Target SMILES vs template ligand: **Tanimoto** (Morgan FP, r=2, 2048 bits) + **MCS coverage** (`rdFMCS`, timeout=5s) — **저장만 하고 필터링에 쓰지 않음**
+  6. Sort key: `(in_mmseqs+in_foldseek 합계 ↓, qtmscore ↓, pident ↓, n_ligands ↓, tanimoto ↓, mcs ↓)` — both-source + 높은 구조/서열 유사도가 상위
 - **Output**: `outputs/template_search_sequence/filtered_hits.tsv` (기존 14 컬럼 + `in_mmseqs, in_foldseek, qtmscore, ttmscore, alntmscore, prob` 6 컬럼 append; 옛 consumer 들도 그대로 동작)
 - **MCS 게이트는 여기서 발동하지 않음**. Track 3 (lig-MCS-align) 만 `mcs ≥ template_search_sequence.mcs_threshold` (default 0.5) 검사.
 - **Time-split 필터링** (옵션): `template_search_sequence.max_deposition_date: "YYYY-MM-DD"` — held-out 벤치(예: `experiments/novel2025_test`)에서 template leakage 차단. CLI: `scripts/run_template_filter.py --max-deposition-date 2025-01-01`
