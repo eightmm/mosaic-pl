@@ -167,8 +167,11 @@ def main() -> int:
     parser.add_argument(
         "--top-k",
         type=int,
-        default=5,
-        help="Emit at most K clusters (sorted by evidence_score desc).",
+        default=10,
+        help="Emit at most K clusters (sorted by evidence_score desc). "
+             "Default 10 matches the docking-prep consensus slot count "
+             "(prepare_docking_inputs registers up to 10 sources, "
+             "filtering singletons via n_members floor).",
     )
     parser.add_argument("--output-json", type=Path, default=None)
     args = parser.parse_args()

@@ -518,7 +518,8 @@ def _extract_cofolding_ligand_centroid(cif_path: Path) -> list[float] | None:
         return None
 
 
-TEMPLATE_CONSENSUS_TOP_K = 3
+TEMPLATE_CONSENSUS_TOP_K = 10
+TEMPLATE_CONSENSUS_MIN_MEMBERS = 2
 TEMPLATE_CONSENSUS_BOX_SIZE = [22.5, 22.5, 22.5]
 
 
@@ -529,6 +530,13 @@ def _add_template_consensus_sources(
     """Read template_pocket_clusters.json (if produced upstream) and inject the
     top-K consensus pocket centroids as ``template_consensus_N`` entries in
     ``binding_site_results``. Each entry is ``(center, size, metadata)``.
+
+    Single-template clusters (``n_members < TEMPLATE_CONSENSUS_MIN_MEMBERS``)
+    are skipped because a binding site supported by only one structure has
+    no consensus signal and is more likely to be an alternate/spurious site
+    than the target's actual pocket. Real target binding sites typically
+    show up in many of the same-fold templates and dominate the
+    ``n_members`` ranking.
 
     Returns the list of source names that were added (in priority order).
     Silently no-ops when the cluster JSON is missing — keeps the script
@@ -546,11 +554,18 @@ def _add_template_consensus_sources(
         return []
     clusters = data.get("clusters") or []
     added: list[str] = []
-    for i, cl in enumerate(clusters[:TEMPLATE_CONSENSUS_TOP_K], 1):
+    rank = 0
+    for cl in clusters:
         centroid = cl.get("centroid")
         if not centroid or len(centroid) != 3:
             continue
-        src_name = f"template_consensus_{i}"
+        n_members = int(cl.get("n_members") or 0)
+        if n_members < TEMPLATE_CONSENSUS_MIN_MEMBERS:
+            continue
+        rank += 1
+        if rank > TEMPLATE_CONSENSUS_TOP_K:
+            break
+        src_name = f"template_consensus_{rank}"
         meta = {
             "n_members": cl.get("n_members"),
             "n_unique_pdb": cl.get("n_unique_pdb"),
@@ -559,6 +574,7 @@ def _add_template_consensus_sources(
             "in_both_sources": cl.get("in_both_sources"),
             "in_mmseqs_only": cl.get("in_mmseqs_only"),
             "in_foldseek_only": cl.get("in_foldseek_only"),
+            "best_alignment_tmscore": cl.get("best_alignment_tmscore"),
             "best_qtmscore": cl.get("best_qtmscore"),
             "best_pident": cl.get("best_pident"),
         }

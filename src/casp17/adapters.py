@@ -756,11 +756,22 @@ _DOCKING_BOX_SOURCES = (
     # Template-consensus pockets (top-K from spatial cluster of bound-ligand
     # centroids across all mmseqs+foldseek union hits). Each source maps to
     # one cluster centroid; runtime exits cleanly when prep_summary lacks
-    # the entry, so a target with no template hits behaves like the old
-    # 3-source flow.
+    # the entry, so targets with fewer credible clusters behave gracefully
+    # (most consensus variants quick-exit). Set to 10 because realistic
+    # protein structures rarely have more than that many distinct credible
+    # binding pockets; ``prepare_docking_inputs`` filters out singleton
+    # clusters (n_members<2) before assigning these slots so noise sites
+    # never reach the docking variants.
     "template_consensus_1",
     "template_consensus_2",
     "template_consensus_3",
+    "template_consensus_4",
+    "template_consensus_5",
+    "template_consensus_6",
+    "template_consensus_7",
+    "template_consensus_8",
+    "template_consensus_9",
+    "template_consensus_10",
 )
 
 
