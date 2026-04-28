@@ -167,6 +167,32 @@ def main() -> int:
              "the tail. With foldseek max_hits=500 and qtmscore_min=0.5, the "
              "post-filter pool is typically 50-300 hits; 100 keeps the bulk.",
     )
+    # Alignment quality gates. ``gemmi.calculate_superposition`` does
+    # *sequence-anchored* CA superposition: it aligns sequences first and
+    # only superposes the matched residues. For foldseek-only hits where
+    # the query and template share fold but not sequence, the matched
+    # residue count collapses and the resulting transform misplaces
+    # ligand centroids by tens of Å. Drop these so the pocket pool stays
+    # trustworthy. Defaults are loose: a real same-fold homolog easily
+    # gets <= 5 Å CA RMSD and >= 50 matched residues.
+    parser.add_argument(
+        "--max-alignment-rmsd",
+        type=float,
+        default=5.0,
+        help="Drop a template if its post-superposition CA RMSD exceeds "
+             "this value. Default 5.0 Å — same-fold homologs usually "
+             "land at 1-3 Å; > 5 Å indicates gemmi's sequence-anchored "
+             "alignment failed and the transform is unreliable.",
+    )
+    parser.add_argument(
+        "--min-aligned-residues",
+        type=int,
+        default=50,
+        help="Drop a template if fewer than this many residues survived "
+             "sequence alignment. Default 50 — covers small domain "
+             "matches but rejects the cases where only a few CAs anchor "
+             "the transform.",
+    )
     parser.add_argument("--output-dir", type=Path, default=None)
     args = parser.parse_args()
 
@@ -202,6 +228,7 @@ def main() -> int:
     n_aligned = 0
     n_failed_cif = 0
     n_failed_align = 0
+    n_low_quality_align = 0
     t0 = time.time()
 
     for i, row in enumerate(rows, 1):
@@ -225,6 +252,13 @@ def main() -> int:
         rmsd, n_res, transform = align_template_to_reference(cif, reference_cif)
         if transform is None:
             n_failed_align += 1
+            continue
+        # Quality gate: the gemmi superposition can succeed (transform != None)
+        # but with a tiny matched-residue set, producing a bogus rigid body
+        # that pushes ligand centroids tens of Å off the actual pocket. Drop
+        # these so consensus clustering doesn't get poisoned.
+        if rmsd > args.max_alignment_rmsd or n_res < args.min_aligned_residues:
+            n_low_quality_align += 1
             continue
         n_aligned += 1
 
@@ -262,12 +296,18 @@ def main() -> int:
         "n_templates_aligned": n_aligned,
         "n_failed_cif": n_failed_cif,
         "n_failed_align": n_failed_align,
+        "n_low_quality_align": n_low_quality_align,
+        "max_alignment_rmsd": args.max_alignment_rmsd,
+        "min_aligned_residues": args.min_aligned_residues,
         "n_pockets": len(pockets),
         "pockets": [asdict(p) for p in pockets],
     }
     out_path = output_dir / "template_pockets.json"
     out_path.write_text(json.dumps(summary, indent=2))
-    print(f"[pockets] wrote {len(pockets)} pockets from {n_aligned}/{len(rows)} aligned templates → {out_path}")
+    print(
+        f"[pockets] wrote {len(pockets)} pockets from {n_aligned}/{len(rows)} aligned templates "
+        f"(low-quality dropped: {n_low_quality_align}, rmsd>{args.max_alignment_rmsd}Å or aligned<{args.min_aligned_residues} residues) → {out_path}"
+    )
     return 0
 
 

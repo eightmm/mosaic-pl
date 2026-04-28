@@ -153,8 +153,9 @@ flowchart LR
 - **Script**: `scripts/extract_template_pockets.py`
 - **Reuses**: `collect_template_ions.py` 의 `find_template_cif`, `extract_cif`, `align_template_to_reference`, `transform_position`, `find_best_cofolding_structure` — 한 align 경로를 ion placement + pocket extraction 양쪽이 공유.
 - **Per-record 출력 필드** (`PocketPoint`): `template_pdb_id`, `template_chain`, `ligand_ccd`, `ligand_chain`, `ligand_n_heavy`, `centroid_(x|y|z)` (cofold frame), `alignment_rmsd`, `aligned_residues`, `in_mmseqs`, `in_foldseek`, `pident`, `qtmscore`, `best_tanimoto`, `best_mcs_coverage`.
-- **`--max-templates 50`** (default): hits>200 케이스에서 wall time 보호. filter 의 evidence sort 덕분에 both-source / 높은 TM-score / 높은 pident 가 우선 align 됨.
-- **Output**: `outputs/template_pockets/template_pockets.json`. 각 row 는 한 ligand-instance pocket point (homotetramer 라면 4개 binding site → 4 record).
+- **`--max-templates 100`** (default): hits>500 케이스에서 wall time 보호. filter 의 evidence sort 덕분에 both-source / 높은 TM-score / 높은 pident 가 우선 align 됨.
+- **Alignment quality 게이트** (`--max-alignment-rmsd 5.0`, `--min-aligned-residues 50`): `gemmi.calculate_superposition` 은 *sequence-anchored* (Needleman–Wunsch + matched-CA Kabsch). foldseek-only hit 이 fold 만 닮고 sequence 가 다르면 matched residue 가 30개 미만으로 떨어지고 RMSD 가 15+ Å 로 폭발 → ligand centroid 가 잘못된 위치로 transform 됨. 두 게이트가 그런 케이스를 drop. 같은-fold 진짜 homolog 는 보통 1-3 Å, 200+ residues 라 통과. 검증: 101m (myoglobin) 을 가짜 foldseek-only hit 으로 inject 했을 때 rmsd 16.7 Å, 34 residues → 정확히 drop 됨.
+- **Output**: `outputs/template_pockets/template_pockets.json`. 각 row 는 한 ligand-instance pocket point (homotetramer 라면 4개 binding site → 4 record). `n_low_quality_align` 필드에 게이트로 drop 된 갯수 기록.
 
 ### Step 1-5: Pocket Clustering (Top-K Consensus)
 
