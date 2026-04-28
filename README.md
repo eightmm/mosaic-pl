@@ -1,7 +1,7 @@
 # CASP17 Protein-Ligand Hub
 
 Unified Python workspace for CASP17 protein-ligand structure prediction and docking pipelines.
-Orchestrates external ML models (Boltz2/2x, Protenix v2, AlphaFold3), template search (MMseqs2, Foldseek), binding site prediction (P2Rank, SwinSite), docking (Vina, AutoDock-GPU, Protenix-Dock), and post-analysis (BA-Pred, RMSD-Pred).
+Orchestrates external ML models (Boltz2/2x, Protenix v2, AlphaFold3), **union template search (MMseqs2 + Foldseek)** with cross-source pocket consensus, binding site prediction (P2Rank, SwinSite, **template-consensus pockets**), docking (Vina, AutoDock-GPU, Protenix-Dock), and post-analysis (BA-Pred, RMSD-Pred).
 
 ## Full Pipeline Overview
 
@@ -10,56 +10,58 @@ Orchestrates external ML models (Boltz2/2x, Protenix v2, AlphaFold3), template s
 │  INPUT: protein sequence + ligand SMILES (unified YAML)        │
 └─────────────────┬───────────────────────────────────────────────┘
                   │
-    ┌─────────────▼─────────────┐
-    │  Stage 1: Sequence Search │
-    │  MMseqs2 (488k seqs DB)   │──→ template hits
-    │  + ligand filtering       │    (rcsb_index.db lookup)
-    └─────────────┬─────────────┘
-                  │
-    ┌─────────────▼─────────────────────────────────────────┐
-    │  Stage 2: Co-folding (4 models × 5 seeds × 5 samples) │
-    │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ │
-    │  │ Boltz-2  │ │ Boltz-2x │ │ Protenix │ │   AF3    │ │
-    │  │(no pot.) │ │(potent.) │ │   v2     │ │  (JAX)   │ │
-    │  │+affinity │ │+affinity │ │          │ │          │ │
-    │  └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘ │
-    │       │             │            │             │       │
-    │       └──── BRIDGE: Boltz MSA → AF3 ──────────┘       │
-    │                                                        │
-    │  → 25 structures/model × 4 models = 100 structures    │
-    └──────────────────────┬────────────────────────────────-┘
-                           │
-    ┌──────────────────────▼──────────────────────┐
-    │  Stage 3: Structure Search (Foldseek)       │
-    │  Each model output → Foldseek (251k DB)     │
-    │  + ligand filtering + cross-model consensus  │
-    └──────────────────────┬──────────────────────┘
+    ┌─────────────▼─────────────┐  ┌─────────────────────────────┐
+    │  Stage 1a: Sequence Search │  │  Stage 1b: Structure Search │
+    │  MMseqs2 (488k seqs DB)   │  │  Foldseek (251k struct DB)  │
+    │  → mmseqs_hits.tsv        │  │  query = best cofold cif    │
+    └─────────────┬─────────────┘  │  → foldseek_hits.tsv        │
+                  │                  └─────────────┬───────────────┘
+                  │                                │
+                  └────────────────┬───────────────┘
+                                   │
+       ┌───────────────────────────▼────────────────────────────┐
+       │  Stage 1c: Template Bridges (auto, after both searches) │
+       │  • Union filter — mmseqs ∪ foldseek by (pdb_id, chain)  │
+       │    NO MCS gate. Tanimoto/MCS = metadata only.            │
+       │  • Pocket extraction — gemmi CA align template→cofold   │
+       │    → bound-ligand centroids in cofold frame              │
+       │  • Pocket clustering — single-link 5 Å, weighted by     │
+       │    (in_mmseqs + in_foldseek) + max(qtmscore, pident/100)│
+       │    → top-K consensus centroids                           │
+       └───────────────────────────┬────────────────────────────┘
+                                   │
+    ┌──────────────────────────────▼──────────────────────────┐
+    │  Stage 2: Co-folding (4 models × 5 seeds × 5 samples)  │
+    │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐  │
+    │  │ Boltz-2  │ │ Boltz-2x │ │ Protenix │ │   AF3    │  │
+    │  │(no pot.) │ │(potent.) │ │   v2     │ │  (JAX)   │  │
+    │  └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘  │
+    │       └──── BRIDGE: Boltz MSA → AF3 ───────────┘       │
+    │  → 25 structures/model × 4 models = 100 structures      │
+    └──────────────────────┬──────────────────────────────────┘
                            │
     ┌──────────────────────▼──────────────────────┐
     │  Stage 4: Docking Prep (automatic)          │
     │  • Auto-select best model (pLDDT score)     │
-    │  • Binding site: SwinSite > P2Rank          │
+    │  • 6 binding-site sources →                 │
+    │    cofolding · swinsite · p2rank ·           │
+    │    template_consensus_{1,2,3}                │
     │  • SMILES → 3D SDF → PDBQT (RDKit + meeko) │
     │  • CIF → PDB → PDBQT (gemmi + pdb2pqr)     │
-    │  • Box: 22.5Å, spacing 0.375Å              │
+    │  • Box: 22.5 Å, spacing 0.375 Å            │
     └──────────────────────┬──────────────────────┘
                            │
     ┌──────────────────────▼──────────────────────┐
     │  Stage 5: Docking (Multi-track, Multi-seed) │
     │                                             │
-    │  Track 1 (always — cofolding receptor):     │
-    │  ┌────────┐  ┌─────────────┐  ┌───────────┐│
-    │  │  Vina  │  │ AutoDock-GPU│  │Protenix-  ││
-    │  │ 5 seeds│  │  5 seeds    │  │ Dock 1x   ││
-    │  │~2-4min │  │    ~45s     │  │ ~8-9min   ││
-    │  └────────┘  └─────────────┘  └───────────┘│
+    │  Track 1 (always) — 6-source fan-out:       │
+    │  Vina × 6 + AutoDock-GPU × 6 + PxDock × 1  │
     │                                             │
-    │  Track 2+3 (MCS ≥ 0.5 — template receptor):│
-    │  ┌─────────────────┐  ┌───────────────────┐│
-    │  │ Template-based   │  │    lig-align      ││
-    │  │ Box Docking      │  │ MCS anchor+Vina  ││
-    │  │ Vina+ADG+PxDock  │  │ scoring+torsion   ││
-    │  └─────────────────┘  └───────────────────┘│
+    │  Track 2 (any template) — pocket borrow:    │
+    │  Template-based box docking (Vina+ADG+PxD) │
+    │                                             │
+    │  Track 3 (MCS ≥ 0.5) — atom-anchor:         │
+    │  lig-align (MCS-guided pose generation)     │
     └──────────────────────┬──────────────────────┘
                            │
     ┌──────▼──────────────────────────────────────┐
@@ -90,13 +92,20 @@ Orchestrates external ML models (Boltz2/2x, Protenix v2, AlphaFold3), template s
     │  ├── outputs/boltz2x/seed_*/   (25 structs) │
     │  ├── outputs/protenix/seed_*/  (25 structs) │
     │  ├── outputs/alphafold3/       (num_seeds)  │
-    │  ├── outputs/vina/seed_*/      (5 × poses)  │
-    │  ├── outputs/autodock_gpu/seed_*/           │
+    │  ├── outputs/vina_{cofolding,swinsite,p2rank,                │
+    │  │     template_consensus_{1,2,3}}/seed_*/  (6 × 5 = 30)    │
+    │  ├── outputs/autodock_gpu_{... 6 sources}/seed_*/            │
     │  ├── outputs/protenix_dock/    (single)     │
+    │  ├── outputs/template_search_sequence/      │
+    │  │   ├── mmseqs_hits.tsv  filtered_hits.tsv │
+    │  ├── outputs/template_search_structure/     │
+    │  │   └── foldseek_hits.tsv                   │
+    │  ├── outputs/template_pockets/ (Stage 1c)   │
+    │  │   ├── template_pockets.json (per-instance)│
+    │  │   └── template_pocket_clusters.json (top-K)│
     │  ├── outputs/template_docking/ (Track 2+3)  │
     │  │   └── <pdb_id>/vina/adg/pxdock/lig_align │
     │  ├── outputs/ion_placement/    (if ion)     │
-    │  ├── outputs/structure_search/ (consensus)  │
     │  ├── outputs/analysis/         (BA/RMSD TSVs)│
     │  └── outputs/submission_scores.json         │
     └─────────────────────────────────────────────┘
@@ -191,22 +200,38 @@ srun --partition=6000ada --gres=gpu:1 \
 
 ## Pipeline Stages Detail
 
-### Stage 1: Template Search (Sequence)
+### Stage 1: Template Search (Union — sequence + structure)
 
-**Tool**: MMseqs2 (`easy-search` against preindexed RCSB sequence DB)
-**Input**: Protein sequence from unified YAML
-**Output**: `outputs/template_search_sequence/mmseqs_hits.tsv`
-**Post-filter**: `run_template_filter.py` → `template_filter.py` queries `rcsb_index.db`, computes Tanimoto + MCS vs target SMILES
+서열 검색과 구조 검색을 **둘 다 돌려서** 최대한 많은 template 을 모은다. MCS/Tanimoto 는 metadata 로만 보존 — gating 은 lig-MCS-align (Track 3) 에서만.
+
+**1a · Sequence (MMseqs2)** — `easy-search` against `data/search_dbs/sequence/rcsb_seqDB`
+- Output: `outputs/template_search_sequence/mmseqs_hits.tsv`
+
+**1b · Structure (Foldseek)** — `easy-search` against `data/search_dbs/structure/rcsb_structDB`
+- Query 자동 선택: cofolding 결과 (`query_from_cofolding=true`, priority `[alphafold3, boltz, protenix]`)
+- Stage 의존성 검증이 cofold 보다 먼저 도는 순서를 자동 차단
+- Output: `outputs/template_search_structure/foldseek_hits.tsv`
+
+**1c · Template bridges (auto, after both searches)**
 
 ```python
 from casp17.template_filter import filter_hits_with_ligands
-hits = filter_hits_with_ligands(hits_tsv, db_path, target_smiles="CCO")
-# → hits sorted by MCS coverage → Tanimoto → pident
-# Each hit has: best_tanimoto, best_mcs_coverage, ligand_codes, ligand_smiles
+hits = filter_hits_with_ligands(
+    hits_tsv=mmseqs_tsv,
+    foldseek_tsv=foldseek_tsv,   # union by (pdb_id, chain_id)
+    db_path=rcsb_index_db,
+    target_smiles="CCO",
+)
+# Each hit carries: in_mmseqs, in_foldseek, qtmscore, pident, best_tanimoto, best_mcs_coverage
+# Sort key: evidence_breadth (2 sources > 1) > qtmscore > pident > n_ligands > tanimoto > mcs
 ```
 
-**Outputs**: `mmseqs_hits.tsv` (raw) → `filtered_hits.tsv` (scored + ranked)
-**MCS threshold**: Hits with `best_mcs_coverage ≥ 0.5` trigger Track 2+3 docking (configurable via `template_search_sequence.mcs_threshold`)
+3 단계로 자동 실행:
+1. **Union filter** (`run_template_filter.py`) — mmseqs ∪ foldseek dedup, ligand annotation. **MCS 게이트 없음**.
+2. **Pocket extraction** (`extract_template_pockets.py`) — 각 hit 을 `gemmi` CA superposition 으로 cofold model 에 align, bound candidate ligand heavy-atom centroid 추출 → `template_pockets.json` (flat per-instance list).
+3. **Pocket clustering** (`cluster_template_pockets.py`) — single-link clustering 5 Å, weight = `(in_mmseqs + in_foldseek) + max(qtmscore, pident/100)`. Top-K (default 5) → `template_pocket_clusters.json`. 각 cluster centroid 가 다음 단계에서 binding-site source 로 등록됨.
+
+**MCS threshold** (`template_search_sequence.mcs_threshold`, default `0.5`) — **Track 3 (lig-align) 만** gating.
 
 ### Stage 2: Co-folding
 
@@ -235,17 +260,9 @@ Measured on RTX 6000 Ada with `cofolding_seeds=[42,101,202,303,404]`, `diffusion
 }
 ```
 
-### Stage 3: Structure Search (Foldseek)
+### Stage 3: (deprecated) Cross-model Foldseek consensus
 
-**Tool**: `scripts/run_structure_search.py`
-**Input**: CIF structures from each cofolding model
-**Output**: `outputs/structure_search/consensus_summary.json`
-
-For each model:
-1. Run Foldseek against RCSB structure DB
-2. Collect all hits, lookup ligands via `rcsb_index.db`
-3. Cross-model consensus: PDBs found by multiple models ranked highest
-4. Ligand-containing hits highlighted
+이전 버전의 cross-model consensus 는 Stage 1b (foldseek easy-search, query=best cofold cif) + Stage 1c (mmseqs ∪ foldseek union filter) 가 대체. 자세한 내용은 위의 Stage 1 참조.
 
 ### Stage 4: Docking Preparation (Automatic Bridge)
 
@@ -254,45 +271,51 @@ Runs automatically between cofolding and docking in the wrapper pipeline.
 
 | Step | Tool | Output |
 |------|------|--------|
-| Auto-select best model | pLDDT comparison | Best CIF |
+| Auto-select best model | mean pLDDT comparison | Best CIF |
 | CIF → PDB | gemmi | `receptor.pdb` |
 | PDB → protonated PDB | pdb2pqr (AMBER) | `receptor_protonated.pdb` (HIS→HID/HIE/HIP) |
 | PDB → PDBQT | pdb2pqr + AD4 typing | `receptor.pdbqt` (charges + atom types) |
 | SMILES → 3D SDF | RDKit (ETKDG + MMFF) | `ligand_L.sdf` |
 | SDF → PDBQT | meeko | `ligand_L.pdbqt` |
-| Binding site | SwinSite > P2Rank | Box center + size |
+| Binding site sources | 6 sources (cofolding + swinsite + p2rank + template_consensus_{1,2,3}) | `binding_site_predictions` dict in summary JSON |
 
-**Binding site prediction priority:**
-1. **SwinSite** (Swin-Unet ML, `.venvs/pred`) — preferred
-2. **P2Rank** (surface-based, Java) — fallback
-3. **Ligand coordinates** (RDKit 3D) — last resort
+**Binding site sources** (각각 독립 docking variant 로 fan-out — winner-take-all 아님):
 
-**Unified box**: 22.5Å × 22.5Å × 22.5Å, grid spacing 0.375Å
+1. **Cofolding centroid** — co-folding 모델이 직접 놓은 ligand 위치 (가장 직접적인 신호)
+2. **SwinSite** — Swin-Unet ML pocket predictor (`.venvs/pred`)
+3. **P2Rank** — surface geometry pocket predictor (Java)
+4. **template_consensus_1 / 2 / 3** — `cluster_template_pockets.py` 가 만든 top-3 cluster centroid (mmseqs+foldseek union template 의 bound-ligand 위치 합의)
+
+**Fallback box pick** (`box_method` — protenix-dock 같은 단일-box 도구가 사용): `cofolding > strong consensus (n_unique_pdb ≥ 2) > swinsite > p2rank > weak consensus`.
+
+**Unified box**: 22.5 Å × 22.5 Å × 22.5 Å, grid spacing 0.375 Å.
 
 ### Stage 5: Docking (Multi-track)
 
 3 parallel docking tracks, where Track 2+3 activate conditionally:
 
-#### Track 1 (always): Cofolding-based docking
+#### Track 1 (always): Cofolding-based docking — **6-source fan-out**
 
-| Tool | Type | Time (all 5 seeds combined) | Output |
-|------|------|------|--------|
-| **Vina** | Python API | ~2-4 min (130-254s) | `outputs/vina/seed_<seed>/docked.pdbqt` |
-| **AutoDock-GPU** | CUDA GPU | ~45s (42s both runs) | `outputs/autodock_gpu/seed_<seed>/docking.dlg` |
-| **Protenix-Dock** | CPU force field | ~8-9 min (459-513s) | `outputs/protenix_dock/*_out.json` (single run, no seed loop) |
+각 binding-site source 마다 vina/adg variant 를 별도로 돌림 (PxDock 만 priority-picked 단일 run). 한 source 가 pocket 을 못 찾으면 (e.g. SwinSite "no pockets", template hit 없는 타겟의 `template_consensus_*`) 해당 variant 만 `sys.exit(0)` 으로 clean skip.
 
-Receptor from cofolding best model, box from SwinSite/P2Rank. All tools auto-detect from `docking_prep_summary.json` at runtime (including the AutoDock-GPU wrapper, which also parses the ligand PDBQT to emit `ligand_types` / grid maps dynamically — any atom type present in the ligand gets its own map, so ligands with F / Cl / Br / P / I / Si work out of the box).
+| Tool | Variant 수 | Type | Output |
+|------|-----------|------|--------|
+| **Vina** | 6 (`vina_{cofolding,swinsite,p2rank,template_consensus_{1,2,3}}`) | Python API CPU | `outputs/{variant}/seed_<seed>/ligand_<lid>/docked.pdbqt` |
+| **AutoDock-GPU** | 6 (`autodock_gpu_{... 6 sources}`) | CUDA GPU | `outputs/{variant}/seed_<seed>/ligand_<lid>/docking.dlg` |
+| **Protenix-Dock** | 1 (priority-picked box) | CPU force field | `outputs/protenix_dock/poses_<lid>.sdf` |
 
-#### Track 2 (MCS ≥ 0.5): Template-based Box Docking
+ADG wrapper 는 추가로 **런타임에 ligand pdbqt 를 파싱**해서 `ligand_types` / grid map 을 동적 구성 — F/Cl/Br/P/I/Si 등 비표준 원자 타입도 자동 대응. 모든 도구는 `docking_prep_summary.json` 에서 receptor/ligand/box 를 runtime 에 읽음.
 
-Same 3 docking tools, but using template structure as receptor and template ligand position for docking box.
+#### Track 2 (any template, **no MCS gate**): Template-based Box Docking
+
+Template ligand 가 query 와 닮을 필요 없음 — pocket geometry 만 빌리는 것이 목적. `filtered_hits.tsv` 에서 `num_ligands > 0` 인 상위 3 template (sort key 가 evidence_breadth × similarity 이라 both-source / 높은 qtm 우선).
 
 | Step | Script | Output |
 |------|--------|--------|
 | Template prep | `prepare_template_docking.py` | receptor PDB/PDBQT + ligand files + box from template ligand |
 | Docking | Vina + ADG + PxDock | `outputs/template_docking/<pdb_id>/vina/`, `autodock_gpu/`, `protenix_dock/` |
 
-#### Track 3 (MCS ≥ 0.5): lig-align (MCS-guided pose generation)
+#### Track 3 (per-template `mcs ≥ mcs_threshold`): lig-align (MCS-guided pose generation)
 
 Uses template ligand bound pose as anchor for MCS-guided conformer generation with Vina scoring.
 
@@ -438,16 +461,25 @@ alphafold3:
 template_search_sequence:
   enabled: true
   database_path: data/search_dbs/sequence/rcsb_seqDB
-  rcsb_dir: ~/DB/RCSB/raw/mmCIF_data        # CIF files for template-based box docking
+  rcsb_dir: ~/DB/RCSB/raw/mmCIF_data         # CIF files for pocket extraction + template-based docking
   rcsb_db_path: ~/DB/RCSB/processed/rcsb_index.db  # ligand index
-  mcs_threshold: 0.5                          # Track 2+3 activation threshold
+  mcs_threshold: 0.5                          # Track 3 (lig-align) activation threshold ONLY
+  max_deposition_date: "2025-01-01"           # optional time-split filter (held-out benches)
+
+template_search_structure:
+  enabled: true                               # turn on foldseek for union template search
+  database_path: data/search_dbs/structure/rcsb_structDB
+  query_from_cofolding: true                  # query auto-resolved from cofold cif
+  query_model_priority: [alphafold3, boltz, protenix]
+  sensitivity: 9.5
+  max_hits: 200
 
 vina:
-  enabled: true
+  enabled: true            # fans out into 6 variants per binding-site source
 autodock_gpu:
-  enabled: true
+  enabled: true            # fans out into 6 variants per binding-site source
 protenix_dock:
-  enabled: true
+  enabled: true            # single run, priority-picked box (no fan-out)
 
 slurm:
   partition: 6000ada
@@ -471,30 +503,35 @@ experiments/runs/<target>/
 │   │   ├── ligand_L.sdf / .pdbqt      # ligand (3D from SMILES)
 │   │   ├── p2rank/                     # P2Rank pocket predictions
 │   │   └── swinsite/                   # SwinSite pocket predictions
-│   └── template_docking/            # Track 2+3 docking inputs (if MCS ≥ 0.5)
+│   └── template_docking/            # Track 2 docking inputs (any template — no MCS gate)
 │       ├── template_docking_summary.json
 │       └── template_<pdb_id>/
 │           ├── receptor.pdb / .pdbqt
-│           ├── template_ligand_<CCD>.sdf  # bound-pose ligand (for lig-align)
+│           ├── template_ligand_<CCD>.sdf  # bound-pose ligand (Track 3 lig-align: MCS ≥ 0.5)
 │           ├── ligand_L.sdf / .pdbqt       # target ligand (from SMILES)
 │           └── docking_prep_summary.json
 ├── outputs/
-│   ├── template_search_sequence/    # MMseqs2 hits + filtered_hits.tsv
+│   ├── template_search_sequence/    # mmseqs_hits.tsv + filtered_hits.tsv (union)
+│   ├── template_search_structure/   # foldseek_hits.tsv (query=best cofold cif)
+│   ├── template_pockets/            # per-instance pocket centers + top-K cluster centroids
+│   │   ├── template_pockets.json
+│   │   └── template_pocket_clusters.json
 │   ├── boltz2/                      # structure + confidence + affinity + MSA
 │   ├── boltz2x/                     # structure + confidence + affinity (potentials)
 │   ├── protenix/                    # structure + confidence
 │   ├── alphafold3/                  # structure + confidence + ranking
-│   ├── structure_search/            # Foldseek consensus across models
-│   ├── vina/seed_*/                 # Track 1: docked.pdbqt (per docking seed)
-│   ├── autodock_gpu/seed_*/         # Track 1: docking.dlg  (per docking seed)
-│   ├── protenix_dock/               # Track 1: *_out.json + poses.sdf (built by post-analysis)
-│   ├── template_docking/            # Track 2+3 results (if MCS ≥ 0.5)
+│   ├── vina_{cofolding,swinsite,p2rank,template_consensus_{1,2,3}}/seed_*/
+│   │       └── ligand_<lid>/docked.pdbqt   # Track 1: 6 variants × seeds
+│   ├── autodock_gpu_{... 6 sources}/seed_*/
+│   │       └── ligand_<lid>/docking.dlg    # Track 1: 6 variants × seeds
+│   ├── protenix_dock/               # Track 1: poses_<lid>.sdf + *_out.json (single run)
+│   ├── template_docking/            # Track 2+3 results
 │   │   ├── multi_track_summary.json   # aggregated results across all templates
 │   │   └── <pdb_id>/
 │   │       ├── vina/                    # Track 2: template-based box docking
 │   │       ├── autodock_gpu/            # Track 2: template-based box docking
 │   │       ├── protenix_dock/           # Track 2: template-based box docking
-│   │       └── lig_align/               # Track 3: MCS-guided poses
+│   │       └── lig_align/               # Track 3: MCS-guided poses (MCS ≥ 0.5 only)
 │   ├── ion_placement/               # Ion positions (if ion CCD in input)
 │   │   └── ion_placement_summary.json # clustered by confidence (70%/50%/30%)
 │   └── analysis/                    # BA-Pred + RMSD-Pred TSVs
