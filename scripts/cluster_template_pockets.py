@@ -10,10 +10,13 @@ downstream.
 
 Pocket-point evidence weight:
 
-    w = (in_mmseqs + in_foldseek) + max(qtmscore, pident/100)
+    w = (in_mmseqs + in_foldseek) + max(alignment_tmscore, pident/100)
 
 Range ≈ [0, 3]. Both-source hits + high structural/sequence similarity get
-the highest weight.
+the highest weight. ``alignment_tmscore`` is USalign's actual TM-score
+from the pocket-extraction step (the real quantity, not foldseek's
+estimate); using it makes mmseqs-only hits — which have ``qtmscore=0``
+in the filter row — also score correctly here.
 
 Usage::
 
@@ -37,7 +40,14 @@ from pathlib import Path
 
 def _pocket_weight(p: dict) -> float:
     sources = int(bool(p.get("in_mmseqs"))) + int(bool(p.get("in_foldseek")))
-    sim = max(float(p.get("qtmscore", 0.0) or 0.0), float(p.get("pident", 0.0) or 0.0) / 100.0)
+    # USalign's actual TM-score for the template→cofold superposition.
+    # Falls back to foldseek's qtmscore field if alignment_tmscore is
+    # absent (older JSON written before the USalign switch), and to
+    # pident/100 as a last-resort similarity proxy.
+    actual_tm = float(p.get("alignment_tmscore", 0.0) or 0.0)
+    fold_tm = float(p.get("qtmscore", 0.0) or 0.0)
+    seq_sim = float(p.get("pident", 0.0) or 0.0) / 100.0
+    sim = max(actual_tm, fold_tm, seq_sim)
     return float(sources + sim)
 
 
@@ -108,6 +118,7 @@ def _summarize(clusters: list[dict]) -> list[dict]:
             if d > spread:
                 spread = d
         # Best per-member metrics — useful for downstream filtering / debugging
+        best_tm = max((float(m.get("alignment_tmscore", 0.0) or 0.0) for m in members), default=0.0)
         best_qtm = max((float(m.get("qtmscore", 0.0) or 0.0) for m in members), default=0.0)
         best_pident = max((float(m.get("pident", 0.0) or 0.0) for m in members), default=0.0)
         best_tanimoto = max((float(m.get("best_tanimoto", 0.0) or 0.0) for m in members), default=0.0)
@@ -121,6 +132,7 @@ def _summarize(clusters: list[dict]) -> list[dict]:
             "in_mmseqs_only": in_seq_only,
             "in_foldseek_only": in_struct_only,
             "unique_ccds": unique_ccd,
+            "best_alignment_tmscore": round(best_tm, 3),
             "best_qtmscore": round(best_qtm, 3),
             "best_pident": round(best_pident, 1),
             "best_tanimoto": round(best_tanimoto, 3),

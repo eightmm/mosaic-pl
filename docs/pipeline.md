@@ -129,11 +129,11 @@ flowchart LR
 - **Module**: `src/casp17/template_filter.py` (`parse_mmseqs_hits`, `parse_foldseek_hits`, `filter_hits_with_ligands`)
 - **Logic**:
   1. 두 TSV 를 파싱해 source 태깅 (`source: mmseqs` / `source: foldseek`)
-  2. **Foldseek-only floor** (선택): foldseek hit 에 한해 `max(qtmscore, ttmscore) >= foldseek_qtmscore_min` 통과한 것만 union 에 들어감. default 0.5 = Zhang/Skolnick "same fold" 임계. mmseqs hit 은 이미 `≥30% id + ≥70% cov` 통과했으므로 우회 (qtm=0 이어도 OK).
-  3. `(pdb_id, chain_id)` 키로 dedup → 한 row 가 mmseqs+foldseek 모두에 등장하면 두 metric 다 보존 (`in_mmseqs=1, in_foldseek=1`). dual-source hit 은 floor 와 무관하게 통과 (mmseqs 가 이미 통과시켰으므로).
+  2. **Foldseek-only floor** (default off): `template_search_structure.qtmscore_min > 0` 일 때만 발동. default 0.0 — foldseek 의 qtmscore 는 *estimate* 라 pre-filter 의미 적고, sort 의 ordering hint 로만 사용. 진짜 quality gate 는 다음 단계 (pocket extraction) 의 USalign 이 결정. 0.5 같은 cosmetic floor 를 두면 `filtered_hits.tsv` 만 깨끗해짐 (검사용).
+  3. `(pdb_id, chain_id)` 키로 dedup → 한 row 가 mmseqs+foldseek 모두에 등장하면 두 metric 다 보존 (`in_mmseqs=1, in_foldseek=1`).
   4. 각 PDB 에서 `rcsb_index.db` candidate ligand (`is_candidate=1`, `ligand_type ∈ {small_molecule, cofactor, metabolite, nucleotide_like, peptide_like}`) 조회
   5. Target SMILES vs template ligand: **Tanimoto** (Morgan FP, r=2, 2048 bits) + **MCS coverage** (`rdFMCS`, timeout=5s) — **저장만 하고 필터링에 쓰지 않음**
-  6. Sort key: `(in_mmseqs+in_foldseek 합계 ↓, qtmscore ↓, pident ↓, n_ligands ↓, tanimoto ↓, mcs ↓)` — both-source + 높은 구조/서열 유사도가 상위
+  6. Sort key: `(in_mmseqs+in_foldseek 합계 ↓, qtmscore ↓, pident ↓, n_ligands ↓, tanimoto ↓, mcs ↓)` — both-source + 높은 구조/서열 유사도가 상위. qtmscore 는 foldseek 의 estimate 지만 ordering 에는 충분히 정확.
 - **Output**: `outputs/template_search_sequence/filtered_hits.tsv` (기존 14 컬럼 + `in_mmseqs, in_foldseek, qtmscore, ttmscore, alntmscore, prob` 6 컬럼 append; 옛 consumer 들도 그대로 동작)
 - **MCS 게이트는 여기서 발동하지 않음**. Track 3 (lig-MCS-align) 만 `mcs ≥ template_search_sequence.mcs_threshold` (default 0.5) 검사.
 - **Time-split 필터링** (옵션): `template_search_sequence.max_deposition_date: "YYYY-MM-DD"` — held-out 벤치(예: `experiments/novel2025_test`)에서 template leakage 차단. CLI: `scripts/run_template_filter.py --max-deposition-date 2025-01-01`
@@ -171,7 +171,7 @@ flowchart LR
 
 - **Script**: `scripts/cluster_template_pockets.py`
 - **Cutoff** (`--cutoff`, default **5.0 Å**) — druglike binding pocket 직경 ~10-15 Å 이라 잘 align 된 template 들이 ~5 Å 안에 모임
-- **Per-pocket 가중치**: `weight = (in_mmseqs + in_foldseek) + max(qtmscore, pident/100)` — 범위 ≈ [0, 3]. both-source + 높은 유사도 = 큰 weight
+- **Per-pocket 가중치**: `weight = (in_mmseqs + in_foldseek) + max(alignment_tmscore, qtmscore, pident/100)` — 범위 ≈ [0, 3]. both-source + 높은 유사도 = 큰 weight. `alignment_tmscore` 는 USalign 이 실제 측정한 TM (ground truth), `qtmscore` 는 foldseek 의 estimate (foldseek-only hit 의 mmseqs 부재 시 fallback), `pident/100` 은 마지막 fallback. mmseqs-only hit 은 foldseek qtm=0 이어도 USalign actual TM 으로 평가 받음.
 - **Cluster centroid**: weighted mean (가중치 합 = 0 인 fallback 케이스에선 unweighted mean)
 - **Cluster evidence_score**: `Σ weight`. 정렬 후 top-K (`--top-k 5`, default) 보존
 - **Per-cluster metadata**: `n_members`, `n_unique_pdb`, `evidence_score`, `spread_angstrom`, `in_both_sources`, `in_mmseqs_only`, `in_foldseek_only`, `unique_ccds`, `best_qtmscore`, `best_pident`, `best_tanimoto`

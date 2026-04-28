@@ -30,11 +30,11 @@ template_search_structure:
   max_hits: 500
   alignment_type: 1
   threads: 8
-  # Same-fold floor for foldseek-only hits (mmseqs hits already passed
-  # 30% id + 70% coverage, so they bypass this gate). 0.5 is the canonical
-  # Zhang/Skolnick "same fold" threshold — below it the binding-site
-  # equivalence assumption breaks down.
-  qtmscore_min: 0.5
+  # Foldseek's *estimated* qtmscore is left as a sort hint only — the
+  # authoritative same-fold gate is USalign's actual TM-score, applied
+  # by ``extract_template_pockets --min-tmscore`` (default 0.5). Setting
+  # this > 0 here would only filter ``filtered_hits.tsv`` for inspection.
+  qtmscore_min: 0.0
 
 boltz:
   enabled: true

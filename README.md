@@ -228,13 +228,14 @@ hits = filter_hits_with_ligands(
 ```
 
 3 단계로 자동 실행:
-1. **Union filter** (`run_template_filter.py`) — mmseqs ∪ foldseek dedup, ligand annotation. **MCS 게이트 없음**. **Foldseek-only hit 에 한해** `max(qtmscore, ttmscore) ≥ qtmscore_min` floor 적용 (default 0.5 = Zhang/Skolnick "same fold"). mmseqs hit 과 dual-source hit 은 우회.
-2. **Pocket extraction** (`extract_template_pockets.py`) — top `--max-templates 100` (default) hit 을 `gemmi` CA superposition 으로 cofold model 에 align, bound candidate ligand heavy-atom centroid 추출 → `template_pockets.json`.
-3. **Pocket clustering** (`cluster_template_pockets.py`) — single-link clustering 5 Å, weight = `(in_mmseqs + in_foldseek) + max(qtmscore, pident/100)`. Top-K (default 5) → `template_pocket_clusters.json`. 각 cluster centroid 가 다음 단계에서 binding-site source 로 등록됨.
+1. **Union filter** (`run_template_filter.py`) — mmseqs ∪ foldseek dedup, ligand annotation. **MCS 게이트 없음**. foldseek 의 qtmscore 는 estimate 라 pre-filter 안 함 (default `qtmscore_min=0`); 모든 hit 이 다음 단계로 흘러가 USalign 이 진짜 TM 으로 결정.
+2. **Pocket extraction** (`extract_template_pockets.py`) — top `--max-templates 100` (default) hit 을 **USalign** 으로 cofold model 에 align (structure-based). actual TM-score < `--min-tmscore` (default 0.5 = canonical same-fold) 면 drop. bound candidate ligand heavy-atom centroid → `template_pockets.json`.
+3. **Pocket clustering** (`cluster_template_pockets.py`) — single-link clustering 5 Å, weight = `(in_mmseqs + in_foldseek) + max(alignment_tmscore, qtmscore, pident/100)`. Top-K (default 5) → `template_pocket_clusters.json`. 각 cluster centroid 가 다음 단계에서 binding-site source 로 등록됨.
 
 **Threshold 정리**:
-- `template_search_structure.qtmscore_min` (default `0.5`) — foldseek-only hit 의 fold-similarity 게이트
+- **`extract_template_pockets --min-tmscore 0.5`** — 유일한 quality gate (USalign 의 actual TM)
 - `template_search_sequence.mcs_threshold` (default `0.5`) — **Track 3 (lig-align) 만** gating
+- `template_search_structure.qtmscore_min` (default `0.0`) — disabled; cosmetic 용
 
 ### Stage 2: Co-folding
 
@@ -476,7 +477,7 @@ template_search_structure:
   query_model_priority: [alphafold3, boltz, protenix]
   sensitivity: 9.5
   max_hits: 500                               # wide recall — foldseek has no native id/cov gate
-  qtmscore_min: 0.5                           # same-fold floor for foldseek-only hits
+  qtmscore_min: 0.0                           # 0 = disabled; USalign actual TM is the real gate
 
 vina:
   enabled: true            # fans out into 6 variants per binding-site source

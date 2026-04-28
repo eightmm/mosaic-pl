@@ -180,20 +180,21 @@ def main() -> int:
              "the tail. With foldseek max_hits=500 and qtmscore_min=0.5, the "
              "post-filter pool is typically 50-300 hits; 100 keeps the bulk.",
     )
-    # Alignment quality gate. USalign almost always converges since it's
-    # structure-based, but we keep a safety net in case a corrupt CIF or
-    # a chain-only-overlap edge case sneaks through. The defaults are
-    # forgiving — typical same-fold superposition lands at TM-score >= 0.5,
-    # which corresponds to RMSD-on-aligned-residues of a few Å.
+    # The single authoritative quality gate on the union template pool.
+    # Since USalign aligns every selected template, its TM-score is the
+    # ground truth — foldseek's qtmscore_min is now disabled by default
+    # so this is the only filter that decides which templates contribute
+    # pockets. 0.5 is the canonical Zhang/Skolnick "same fold" cutoff;
+    # below it the binding-site-equivalence premise of consensus
+    # extraction breaks down.
     parser.add_argument(
         "--min-tmscore",
         type=float,
-        default=0.4,
-        help="Drop a template if USalign reports TM-score below this "
-             "(reference-normalized). Default 0.4 — slightly below "
-             "0.5 (canonical same-fold) so we don't double-penalise "
-             "templates that already passed the foldseek qtmscore_min "
-             "filter; mostly catches degenerate single-chain overlaps.",
+        default=0.5,
+        help="Drop a template if USalign's reference-normalized TM-score "
+             "falls below this. Default 0.5 — Zhang/Skolnick canonical "
+             "same-fold cutoff. With foldseek pre-filter disabled, this "
+             "is the only TM gate.",
     )
     parser.add_argument("--output-dir", type=Path, default=None)
     args = parser.parse_args()
