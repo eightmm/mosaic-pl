@@ -665,6 +665,11 @@ def _source_family(src: str) -> str:
     if src.startswith("vina_cofolding"):       return "vina_cofold"
     if src.startswith("vina_p2rank"):          return "vina_p2rank"
     if src.startswith("vina_swinsite"):        return "vina_swinsite"
+    # Template-consensus pocket variants share one family — the box source is
+    # the same kind of signal regardless of which cluster index it points at,
+    # so cross-family consensus treats them as a single bucket.
+    if src.startswith("vina_template_consensus"):       return "vina_template_consensus"
+    if src.startswith("autodock_gpu_template_consensus"): return "adg_template_consensus"
     if src.startswith("autodock_gpu_cofolding"): return "adg_cofold"
     if src.startswith("autodock_gpu_p2rank"):    return "adg_p2rank"
     if src.startswith("autodock_gpu_swinsite"):  return "adg_swinsite"

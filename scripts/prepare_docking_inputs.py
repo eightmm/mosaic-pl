@@ -24,24 +24,50 @@ import sys
 from pathlib import Path
 
 
-def smiles_to_sdf(smiles: str, output_path: Path, name: str = "ligand") -> Path:
-    """Convert SMILES to 3D SDF using RDKit."""
+def smiles_to_sdf(smiles: str, output_path: Path, name: str = "ligand") -> Path | None:
+    """Convert SMILES to 3D SDF using RDKit.
+
+    Returns the output path on success, ``None`` on parse/embedding failure.
+    Large lipids (phosphatidylcholine, polyisoprenoids, glycolipids with long
+    aliphatic chains) can make ETKDGv3 run for many minutes — we cap each
+    embedding attempt and drop the ligand if neither the template nor random
+    fallback succeeds. Callers handle ``None`` by skipping the ligand rather
+    than aborting the whole run.
+    """
     from rdkit import Chem
     from rdkit.Chem import AllChem
 
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
-        raise ValueError(f"Invalid SMILES: {smiles}")
+        print(f"  ERROR: RDKit could not parse SMILES for {name}: {smiles[:80]}")
+        return None
 
     mol = Chem.AddHs(mol)
     mol.SetProp("_Name", name)
 
-    # Generate 3D conformer
-    result = AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())
+    # Cap embedding cost: long-chain ligands hit pathological runtime with
+    # ETKDGv3's stochastic search. ``maxAttempts`` bounds the retry count
+    # and keeps total wall-time predictable even for 100+ atom lipids.
+    params = AllChem.ETKDGv3()
+    params.maxAttempts = 50
+    params.useRandomCoords = False
+    result = AllChem.EmbedMolecule(mol, params)
     if result == -1:
-        # Fallback: use random coordinates
-        AllChem.EmbedMolecule(mol, AllChem.ETKDGv3(), useRandomCoords=True)
-    AllChem.MMFFOptimizeMolecule(mol, maxIters=500)
+        # Template attempt failed → fall back to random coords (still bounded
+        # by maxAttempts). This works for chains RDKit can't stereo-match.
+        params.useRandomCoords = True
+        result = AllChem.EmbedMolecule(mol, params)
+    if result == -1:
+        print(f"  WARNING: could not generate 3D conformer for {name} (chain too long or stereochem ambiguous)")
+        return None
+
+    # MMFF optimization is best-effort: raises on missing parameters (some
+    # metal coordinations, exotic elements). Missing optimization isn't
+    # fatal — the embedded geometry is already usable for docking prep.
+    try:
+        AllChem.MMFFOptimizeMolecule(mol, maxIters=500)
+    except Exception as e:
+        print(f"  WARNING: MMFF optimization failed for {name}: {e} (keeping embedded geometry)")
 
     writer = Chem.SDWriter(str(output_path))
     writer.write(mol)
@@ -50,20 +76,33 @@ def smiles_to_sdf(smiles: str, output_path: Path, name: str = "ligand") -> Path:
     return output_path
 
 
-def sdf_to_pdbqt(sdf_path: Path, output_path: Path) -> Path:
-    """Convert SDF to PDBQT using meeko."""
+def sdf_to_pdbqt(sdf_path: Path | None, output_path: Path) -> Path | None:
+    """Convert SDF to PDBQT using meeko.
+
+    Returns the output path on success, ``None`` if the SDF is missing or
+    meeko rejects the molecule. Docking on that ligand is then skipped
+    rather than aborting the whole pipeline.
+    """
     from meeko import MoleculePreparation
     from rdkit import Chem
 
+    if sdf_path is None or not Path(sdf_path).exists():
+        return None
     supplier = Chem.SDMolSupplier(str(sdf_path), removeHs=False)
-    mol = next(supplier)
+    mol = next(supplier, None)
     if mol is None:
-        raise ValueError(f"Failed to read SDF: {sdf_path}")
+        print(f"  WARNING: failed to read SDF {sdf_path}, skipping PDBQT conversion")
+        return None
 
     preparator = MoleculePreparation()
-    preparator.prepare(mol)
+    try:
+        preparator.prepare(mol)
+    except Exception as e:
+        print(f"  WARNING: meeko crashed on {sdf_path.name}: {e}")
+        return None
     if not preparator.is_ok:
-        raise ValueError(f"meeko failed to prepare {sdf_path}: {preparator.log}")
+        print(f"  WARNING: meeko rejected {sdf_path.name}: {preparator.log}")
+        return None
 
     pdbqt_string = preparator.write_pdbqt_string()
     output_path.write_text(pdbqt_string)
@@ -335,35 +374,63 @@ def run_swinsite(pdb_path: Path, output_dir: Path) -> tuple[list[float], list[fl
         print(f"  SwinSite failed: {e}")
         return None
 
-    # Parse pocket PDB files to find center
+    # Parse SwinSite output. File layout (observed in runs/22mj_input/...):
+    #   results/input/receptor/
+    #     grid0_score_0.7219.pdb     ← HETATM UNL grid points of pocket volume
+    #     grid1_score_0.3136.pdb
+    #     pocket0_score_0.7219.pdb   ← protein residues near the pocket
+    #     pocket1_score_0.3136.pdb
+    # ``grid*`` files give the cleanest pocket centroid (they are literally
+    # the predicted pocket cloud); their filenames carry a score suffix we
+    # sort on to pick the highest-confidence pocket. The old parser used a
+    # ``pocket_*.pdb`` glob which never matched (files have a score suffix,
+    # no underscore), so every run silently dropped SwinSite.
     results_dir = swinsite_out / "results" / "input" / "receptor"
     if not results_dir.exists():
         print("  SwinSite produced no output.")
         return None
 
-    for pocket_pdb in sorted(results_dir.glob("pocket_*.pdb")):
-        # Read coordinates and compute centroid
-        coords = []
-        for line in pocket_pdb.read_text().splitlines():
-            if line.startswith(("ATOM", "HETATM")):
-                try:
-                    x = float(line[30:38])
-                    y = float(line[38:46])
-                    z = float(line[46:54])
-                    coords.append((x, y, z))
-                except ValueError:
-                    continue
-        if not coords:
-            continue
-        import numpy as _np
-        arr = _np.array(coords)
-        center = arr.mean(axis=0).tolist()
-        box_side = 22.5
-        print(f"  SwinSite pocket 1: center=[{center[0]:.1f}, {center[1]:.1f}, {center[2]:.1f}], atoms={len(coords)}")
-        return (center, [box_side, box_side, box_side])
+    import re as _re
+    score_re = _re.compile(r"_score_([0-9.]+)\.pdb$")
 
-    print("  SwinSite found no pockets.")
-    return None
+    def _score(path: Path) -> float:
+        m = score_re.search(path.name)
+        try:
+            return float(m.group(1)) if m else -1.0
+        except ValueError:
+            return -1.0
+
+    # Prefer grid files (pocket-volume point cloud). Fall back to pocket
+    # files (near-pocket protein residues) if grids are missing.
+    grid_files = sorted(results_dir.glob("grid*_score_*.pdb"), key=_score, reverse=True)
+    pocket_files = sorted(results_dir.glob("pocket*_score_*.pdb"), key=_score, reverse=True)
+    candidates = grid_files or pocket_files
+
+    if not candidates:
+        print("  SwinSite found no pockets.")
+        return None
+
+    best = candidates[0]
+    coords = []
+    for line in best.read_text().splitlines():
+        if line.startswith(("ATOM", "HETATM")):
+            try:
+                x = float(line[30:38])
+                y = float(line[38:46])
+                z = float(line[46:54])
+                coords.append((x, y, z))
+            except ValueError:
+                continue
+    if not coords:
+        print(f"  SwinSite top pocket {best.name} had no atoms, skipping.")
+        return None
+
+    import numpy as _np
+    arr = _np.array(coords)
+    center = arr.mean(axis=0).tolist()
+    box_side = 22.5
+    print(f"  SwinSite top pocket {best.name}: center=[{center[0]:.1f}, {center[1]:.1f}, {center[2]:.1f}], atoms={len(coords)}, score={_score(best):.3f}")
+    return (center, [box_side, box_side, box_side])
 
 
 def extract_smiles_from_yaml(input_yaml: Path) -> list[tuple[str, str]]:
@@ -451,6 +518,59 @@ def _extract_cofolding_ligand_centroid(cif_path: Path) -> list[float] | None:
         return None
 
 
+TEMPLATE_CONSENSUS_TOP_K = 3
+TEMPLATE_CONSENSUS_BOX_SIZE = [22.5, 22.5, 22.5]
+
+
+def _add_template_consensus_sources(
+    run_dir: Path | None,
+    binding_site_results: dict,
+) -> list[str]:
+    """Read template_pocket_clusters.json (if produced upstream) and inject the
+    top-K consensus pocket centroids as ``template_consensus_N`` entries in
+    ``binding_site_results``. Each entry is ``(center, size, metadata)``.
+
+    Returns the list of source names that were added (in priority order).
+    Silently no-ops when the cluster JSON is missing — keeps the script
+    backward compatible with runs that did not enable template search.
+    """
+    if run_dir is None:
+        return []
+    cluster_json = run_dir / "outputs" / "template_pockets" / "template_pocket_clusters.json"
+    if not cluster_json.exists():
+        return []
+    try:
+        data = json.loads(cluster_json.read_text())
+    except Exception as e:
+        print(f"  WARNING: could not parse {cluster_json}: {e}")
+        return []
+    clusters = data.get("clusters") or []
+    added: list[str] = []
+    for i, cl in enumerate(clusters[:TEMPLATE_CONSENSUS_TOP_K], 1):
+        centroid = cl.get("centroid")
+        if not centroid or len(centroid) != 3:
+            continue
+        src_name = f"template_consensus_{i}"
+        meta = {
+            "n_members": cl.get("n_members"),
+            "n_unique_pdb": cl.get("n_unique_pdb"),
+            "evidence_score": cl.get("evidence_score"),
+            "spread_angstrom": cl.get("spread_angstrom"),
+            "in_both_sources": cl.get("in_both_sources"),
+            "in_mmseqs_only": cl.get("in_mmseqs_only"),
+            "in_foldseek_only": cl.get("in_foldseek_only"),
+            "best_qtmscore": cl.get("best_qtmscore"),
+            "best_pident": cl.get("best_pident"),
+        }
+        binding_site_results[src_name] = (
+            list(centroid),
+            list(TEMPLATE_CONSENSUS_BOX_SIZE),
+            meta,
+        )
+        added.append(src_name)
+    return added
+
+
 def compute_box_from_ligand(sdf_path: Path, box_side: float = 22.5) -> tuple[list[float], list[float]]:
     """Compute docking box center from ligand 3D coordinates. Box size fixed."""
     from rdkit import Chem
@@ -499,11 +619,38 @@ def main() -> int:
         print("  No ligands with SMILES found, skipping ligand preparation.")
         return 0
 
-    # 2. Convert SMILES → SDF → PDBQT for ALL ligands
+    # 2. Convert SMILES → SDF → PDBQT for ALL ligands. Per-ligand failures
+    # (e.g. RDKit cannot embed a polyisoprenoid chain, meeko chokes on an
+    # exotic valence) are logged and skipped so the pipeline still reaches
+    # receptor prep + summary. ``prepared_ligands`` records which ones
+    # actually have usable SDF/PDBQT files for the summary JSON.
+    prepared_ligands: list[tuple[str, str, Path | None, Path | None]] = []
     for lig_id, smiles in ligands:
         print(f"  Preparing ligand {lig_id}: {smiles}")
-        sdf_path = smiles_to_sdf(smiles, args.output_dir / f"ligand_{lig_id}.sdf", name=lig_id)
-        sdf_to_pdbqt(sdf_path, args.output_dir / f"ligand_{lig_id}.pdbqt")
+        try:
+            sdf_path = smiles_to_sdf(smiles, args.output_dir / f"ligand_{lig_id}.sdf", name=lig_id)
+        except Exception as e:
+            print(f"  WARNING: SDF generation crashed for {lig_id}: {e}")
+            sdf_path = None
+        try:
+            pdbqt_path = sdf_to_pdbqt(sdf_path, args.output_dir / f"ligand_{lig_id}.pdbqt")
+        except Exception as e:
+            print(f"  WARNING: PDBQT generation crashed for {lig_id}: {e}")
+            pdbqt_path = None
+        prepared_ligands.append((lig_id, smiles, sdf_path, pdbqt_path))
+
+    usable = [pl for pl in prepared_ligands if pl[2] is not None or pl[3] is not None]
+    if not usable:
+        print(
+            f"  WARNING: 0/{len(prepared_ligands)} ligands produced usable SDF/PDBQT. "
+            "All subsequent docking will be skipped by the docking runners; "
+            "submission will fall back to the cofolded ligand pose if available."
+        )
+    elif len(usable) < len(prepared_ligands):
+        print(
+            f"  {len(usable)}/{len(prepared_ligands)} ligands prepared successfully "
+            f"({len(prepared_ligands) - len(usable)} failed SDF/PDBQT)."
+        )
 
     # 3. Select best cofolding structure
     cofolding_dir = args.cofolding_dir
@@ -569,19 +716,48 @@ def main() -> int:
         if p2rank_result:
             binding_site_results["p2rank"] = p2rank_result
 
-    # Pick best by priority
-    for method in ("cofolding", "swinsite", "p2rank"):
+    # 4d. Template-consensus pockets (mmseqs+foldseek union → bound-ligand
+    #     centroids → spatial cluster). Each top-K cluster centroid becomes
+    #     a separate ``template_consensus_N`` source so vina/adg/pxdock dock
+    #     at every plausible pocket the templates agree on.
+    consensus_sources = _add_template_consensus_sources(args.run_dir, binding_site_results)
+    if consensus_sources:
+        print(f"  Template-consensus pockets: {consensus_sources}")
+
+    # Pick best for the *fallback* box_center (each source still gets its own
+    # docking variant downstream — this picks only the legacy single-box
+    # field). Strong template-consensus pockets (n_unique_pdb≥2) win over
+    # swinsite/p2rank because multi-template agreement is the highest-quality
+    # binding-site signal we have when seq+struct templates align.
+    priority = ["cofolding"]
+    for src in consensus_sources:
+        info = binding_site_results.get(src)
+        if isinstance(info, tuple) and len(info) >= 3 and info[2].get("n_unique_pdb", 0) >= 2:
+            priority.append(src)
+    priority += ["swinsite", "p2rank"]
+    for src in consensus_sources:
+        if src not in priority:
+            priority.append(src)
+    for method in priority:
         if method in binding_site_results:
-            center, size = binding_site_results[method]
+            entry = binding_site_results[method]
+            center, size = entry[0], entry[1]
             box_method = method
             break
 
     if center is None:
-        first_sdf = args.output_dir / f"ligand_{ligands[0][0]}.sdf"
-        center, size = compute_box_from_ligand(first_sdf)
-        box_method = "ligand_coordinates"
+        # Last-resort fallback: centre the box on whichever ligand SDF we
+        # managed to generate. If none did, leave center/size as None and
+        # downstream consumers skip their docking runs (they all check the
+        # summary JSON at runtime).
+        first_sdf = next((sdf for _lid, _smi, sdf, _pdbqt in prepared_ligands if sdf is not None), None)
+        if first_sdf is not None:
+            center, size = compute_box_from_ligand(first_sdf)
+            box_method = "ligand_coordinates"
 
-    # 5. Write summary JSON
+    # 5. Write summary JSON — include only the ligands that actually have
+    # usable SDF + PDBQT files. Downstream docking tools iterate this list
+    # and skip pipeline stages cleanly when the ligand list is empty.
     summary = {
         "receptor_pdb": str(args.output_dir / "receptor_protonated.pdb"),
         "receptor_pdb_raw": str(args.output_dir / "receptor.pdb"),
@@ -590,16 +766,22 @@ def main() -> int:
             {
                 "id": lig_id,
                 "smiles": smiles,
-                "sdf": str(args.output_dir / f"ligand_{lig_id}.sdf"),
-                "pdbqt": str(args.output_dir / f"ligand_{lig_id}.pdbqt"),
+                "sdf": str(sdf) if sdf is not None else None,
+                "pdbqt": str(pdbqt) if pdbqt is not None else None,
             }
-            for lig_id, smiles in ligands
+            for lig_id, smiles, sdf, pdbqt in prepared_ligands
+            if sdf is not None and pdbqt is not None
         ],
         "box_center": center,
         "box_size": size,
         "box_method": box_method,
         "binding_site_predictions": {
-            k: {"center": v[0], "size": v[1]} for k, v in binding_site_results.items()
+            k: (
+                {"center": v[0], "size": v[1], **(v[2] if len(v) >= 3 and isinstance(v[2], dict) else {})}
+                if isinstance(v, tuple)
+                else {"center": v[0], "size": v[1]}
+            )
+            for k, v in binding_site_results.items()
         },
         "cofolding_structure": str(structure),
         "cofolding_model": model,

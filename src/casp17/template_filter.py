@@ -40,6 +40,16 @@ class TemplateHit:
     ligands: list[LigandHit] = field(default_factory=list)
     best_tanimoto: float = 0.0
     best_mcs_coverage: float = 0.0
+    # Provenance (union of mmseqs + foldseek). MCS/Tanimoto are kept as
+    # *metadata only* here — no gating happens in this filter, so callers
+    # like Track-2 box docking and pocket extraction see every hit. Only
+    # lig-mcs-align (Track 3) inspects best_mcs_coverage downstream.
+    in_mmseqs: bool = False
+    in_foldseek: bool = False
+    qtmscore: float = 0.0      # foldseek query-side TM-score (1.0 = identical fold)
+    ttmscore: float = 0.0      # foldseek target-side TM-score
+    alntmscore: float = 0.0    # foldseek alignment TM-score
+    prob: float = 0.0          # foldseek HMM probability
 
 
 def _compute_ligand_similarity(
@@ -84,7 +94,11 @@ def _compute_ligand_similarity(
 
 
 def parse_mmseqs_hits(tsv_path: Path) -> list[dict[str, str]]:
-    """Parse MMseqs2 easy-search output TSV."""
+    """Parse MMseqs2 easy-search output TSV (default 12-column format).
+
+    Each row is tagged with ``source="mmseqs"`` so downstream merge logic
+    can reconcile a target with a parallel foldseek hit list.
+    """
     hits = []
     with open(tsv_path) as f:
         for line in f:
@@ -92,6 +106,7 @@ def parse_mmseqs_hits(tsv_path: Path) -> list[dict[str, str]]:
             if len(parts) < 12:
                 continue
             hits.append({
+                "source": "mmseqs",
                 "query": parts[0],
                 "target": parts[1],
                 "pident": parts[2],
@@ -100,6 +115,44 @@ def parse_mmseqs_hits(tsv_path: Path) -> list[dict[str, str]]:
                 "bits": parts[11],
                 "qlen": parts[12] if len(parts) > 12 else "0",
                 "tlen": parts[13] if len(parts) > 13 else "0",
+                # foldseek-only metrics absent for mmseqs hits
+                "qtmscore": "0",
+                "ttmscore": "0",
+                "alntmscore": "0",
+                "prob": "0",
+            })
+    return hits
+
+
+def parse_foldseek_hits(tsv_path: Path) -> list[dict[str, str]]:
+    """Parse Foldseek easy-search output produced by our adapter.
+
+    Adapter command in ``adapters.py`` uses
+    ``--format-output query,target,evalue,bits,alntmscore,qtmscore,ttmscore,prob``
+    so each row carries 8 fields. Sequence-only metrics (pident/qlen/tlen)
+    are filled with sentinels so the merged schema stays uniform.
+    """
+    hits = []
+    with open(tsv_path) as f:
+        for line in f:
+            parts = line.strip().split("\t")
+            if len(parts) < 8:
+                continue
+            hits.append({
+                "source": "foldseek",
+                "query": parts[0],
+                "target": parts[1],
+                "evalue": parts[2],
+                "bits": parts[3],
+                "alntmscore": parts[4],
+                "qtmscore": parts[5],
+                "ttmscore": parts[6],
+                "prob": parts[7],
+                # not provided by foldseek easy-search with this format
+                "pident": "0",
+                "alnlen": "0",
+                "qlen": "0",
+                "tlen": "0",
             })
     return hits
 
@@ -148,42 +201,114 @@ def lookup_deposition_date(db_path: Path, pdb_id: str) -> str | None:
     return row[0] if row and row[0] else None
 
 
+def _safe_float(s: str, default: float = 0.0) -> float:
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return default
+
+
+def _safe_int(s: str, default: int = 0) -> int:
+    try:
+        return int(s)
+    except (ValueError, TypeError):
+        return default
+
+
 def filter_hits_with_ligands(
-    hits_tsv: Path,
-    db_path: Path,
+    hits_tsv: Path | None = None,
+    db_path: Path | None = None,
     target_smiles: str | None = None,
     ligand_types: set[str] | None = None,
     output_path: Path | None = None,
     max_deposition_date: str | None = None,
+    foldseek_tsv: Path | None = None,
 ) -> list[TemplateHit]:
-    """Filter template search hits to those with candidate ligands.
+    """Union-merge template hits from MMseqs2 + Foldseek and annotate with ligand info.
 
     Args:
-        hits_tsv: MMseqs2/Foldseek output TSV.
+        hits_tsv: MMseqs2 easy-search output TSV (optional — pass ``None`` to use
+            foldseek-only).
         db_path: Path to rcsb_index.db SQLite database.
-        target_smiles: Target ligand SMILES for similarity comparison.
+        target_smiles: Target ligand SMILES — only used to populate Tanimoto/MCS
+            metadata. **No gating happens here**; downstream consumers decide
+            whether to apply MCS thresholds (only lig-align does, currently).
         ligand_types: Optional set of ligand types to keep.
         output_path: Optional path to write filtered results TSV.
         max_deposition_date: Drop any hit whose RCSB ``deposition_date`` is
-            on or after this ISO date (``YYYY-MM-DD``). Hits missing a date
-            in the index are kept. Used for time-split benchmarks where
-            templates released after a cutoff must not leak into inference.
+            on or after this ISO date. Used for time-split benchmarks.
+        foldseek_tsv: Optional Foldseek easy-search output TSV. When supplied,
+            its hits are unioned with the mmseqs list keyed on ``(pdb_id,
+            chain_id)``. Foldseek-only hits expose ``qtmscore`` etc. as the
+            primary structural-similarity signal (pident=0 for those).
 
     Returns:
-        List of TemplateHit with ligand information and similarity scores.
+        List of TemplateHit with ligand information and similarity scores,
+        sorted so candidates with both-source provenance + good metrics
+        appear first.
     """
     if ligand_types is None:
         ligand_types = {"small_molecule", "cofactor", "metabolite", "nucleotide_like", "peptide_like"}
 
-    raw_hits = parse_mmseqs_hits(hits_tsv)
-    results: list[TemplateHit] = []
-    date_skipped = 0
+    if hits_tsv is None and foldseek_tsv is None:
+        raise ValueError("filter_hits_with_ligands: must provide at least one of hits_tsv or foldseek_tsv")
+    if db_path is None:
+        raise ValueError("filter_hits_with_ligands: db_path is required")
 
+    raw_hits: list[dict[str, str]] = []
+    if hits_tsv is not None and Path(hits_tsv).exists():
+        raw_hits.extend(parse_mmseqs_hits(hits_tsv))
+    if foldseek_tsv is not None and Path(foldseek_tsv).exists():
+        raw_hits.extend(parse_foldseek_hits(foldseek_tsv))
+
+    # Union-merge by (pdb_id, chain_id). When both sources hit the same chain
+    # we keep both sets of metrics on a single TemplateHit so the consumer can
+    # see "this template was supported by both seq+struct" as evidence.
+    merged: dict[tuple[str, str], dict] = {}
     for hit in raw_hits:
         target = hit["target"]
         pdb_id = target.split("_")[0].lower() if "_" in target else target[:4].lower()
         chain_id = target.split("_")[1] if "_" in target else ""
+        key = (pdb_id, chain_id)
+        slot = merged.get(key)
+        if slot is None:
+            slot = {
+                "query": hit["query"],
+                "target": target,
+                "pdb_id": pdb_id,
+                "chain_id": chain_id,
+                "pident": 0.0,
+                "evalue": float("inf"),
+                "qlen": 0,
+                "tlen": 0,
+                "in_mmseqs": False,
+                "in_foldseek": False,
+                "qtmscore": 0.0,
+                "ttmscore": 0.0,
+                "alntmscore": 0.0,
+                "prob": 0.0,
+            }
+            merged[key] = slot
+        evalue = _safe_float(hit["evalue"], default=float("inf"))
+        if evalue < slot["evalue"]:
+            slot["evalue"] = evalue
+        if hit["source"] == "mmseqs":
+            slot["in_mmseqs"] = True
+            slot["pident"] = max(slot["pident"], _safe_float(hit["pident"]))
+            slot["qlen"] = max(slot["qlen"], _safe_int(hit["qlen"]))
+            slot["tlen"] = max(slot["tlen"], _safe_int(hit["tlen"]))
+        else:  # foldseek
+            slot["in_foldseek"] = True
+            slot["qtmscore"] = max(slot["qtmscore"], _safe_float(hit["qtmscore"]))
+            slot["ttmscore"] = max(slot["ttmscore"], _safe_float(hit["ttmscore"]))
+            slot["alntmscore"] = max(slot["alntmscore"], _safe_float(hit["alntmscore"]))
+            slot["prob"] = max(slot["prob"], _safe_float(hit["prob"]))
 
+    results: list[TemplateHit] = []
+    date_skipped = 0
+
+    for slot in merged.values():
+        pdb_id = slot["pdb_id"]
         if max_deposition_date:
             dep = lookup_deposition_date(db_path, pdb_id)
             if dep and dep >= max_deposition_date:
@@ -193,7 +318,6 @@ def filter_hits_with_ligands(
         ligands = lookup_ligands(db_path, pdb_id)
         filtered_ligands = [l for l in ligands if l.ligand_type in ligand_types]
 
-        # Compute similarity if target SMILES provided
         scored_ligands = []
         best_tanimoto = 0.0
         best_mcs = 0.0
@@ -217,25 +341,45 @@ def filter_hits_with_ligands(
             best_mcs = max(best_mcs, mcs_cov)
 
         template_hit = TemplateHit(
-            query=hit["query"],
-            target=target,
-            pdb_id=pdb_id,
-            chain_id=chain_id,
-            pident=float(hit["pident"]),
-            evalue=float(hit["evalue"]),
-            qlen=int(hit["qlen"]),
-            tlen=int(hit["tlen"]),
+            query=slot["query"],
+            target=slot["target"],
+            pdb_id=slot["pdb_id"],
+            chain_id=slot["chain_id"],
+            pident=float(slot["pident"]),
+            evalue=float(slot["evalue"]) if slot["evalue"] != float("inf") else 0.0,
+            qlen=int(slot["qlen"]),
+            tlen=int(slot["tlen"]),
             ligands=scored_ligands,
             best_tanimoto=best_tanimoto,
             best_mcs_coverage=best_mcs,
+            in_mmseqs=bool(slot["in_mmseqs"]),
+            in_foldseek=bool(slot["in_foldseek"]),
+            qtmscore=float(slot["qtmscore"]),
+            ttmscore=float(slot["ttmscore"]),
+            alntmscore=float(slot["alntmscore"]),
+            prob=float(slot["prob"]),
         )
         results.append(template_hit)
 
     if max_deposition_date and date_skipped:
         print(f"  date-filter: dropped {date_skipped} hit(s) with deposition_date >= {max_deposition_date}")
 
-    # Sort: best tanimoto first, then ligand count, then identity
-    results.sort(key=lambda h: (-h.best_tanimoto, -h.best_mcs_coverage, -len(h.ligands), -h.pident))
+    # Sort by evidence breadth first (both sources > one source), then by the
+    # best structural/sequence similarity available, then ligand count.
+    # Tanimoto/MCS used as secondary tiebreakers ONLY — they do not gate.
+    def _evidence_key(h: TemplateHit) -> tuple:
+        sources = int(h.in_mmseqs) + int(h.in_foldseek)
+        struct_sim = max(h.qtmscore, h.alntmscore)
+        return (
+            -sources,
+            -struct_sim,
+            -h.pident,
+            -len(h.ligands),
+            -h.best_tanimoto,
+            -h.best_mcs_coverage,
+        )
+
+    results.sort(key=_evidence_key)
 
     if output_path:
         with open(output_path, "w", newline="") as f:
@@ -245,6 +389,10 @@ def filter_hits_with_ligands(
                 "num_ligands", "best_tanimoto", "best_mcs_coverage",
                 "ligand_codes", "ligand_types", "ligand_smiles",
                 "ligand_tanimotos", "ligand_mcs_coverages",
+                # Provenance + foldseek metrics (appended to keep older
+                # consumers reading the first 14 columns intact).
+                "in_mmseqs", "in_foldseek",
+                "qtmscore", "ttmscore", "alntmscore", "prob",
             ])
             for h in results:
                 writer.writerow([
@@ -257,6 +405,9 @@ def filter_hits_with_ligands(
                     ";".join(l.smiles or "" for l in h.ligands),
                     ";".join(f"{l.tanimoto:.4f}" for l in h.ligands),
                     ";".join(f"{l.mcs_coverage:.4f}" for l in h.ligands),
+                    int(h.in_mmseqs), int(h.in_foldseek),
+                    f"{h.qtmscore:.4f}", f"{h.ttmscore:.4f}",
+                    f"{h.alntmscore:.4f}", f"{h.prob:.4f}",
                 ])
 
     return results

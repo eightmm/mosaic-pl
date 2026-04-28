@@ -28,6 +28,51 @@ class PreparedModelRun:
         }
 
 
+# Boltz affinity module hard cap: larger ligands make prediction crash with
+# ``Error: The ligand for affinity is too large``. Kept in sync with
+# ``experiments/novel2025_test/build_inputs.py``.
+_BOLTZ_AFFINITY_MAX_HEAVY_ATOMS = 128
+
+# Elements Boltz rejects in free-form SMILES at input processing
+# (``Molecule is excluded``). These ligands must use a ``ccd:`` entry
+# instead, and cannot be used as an affinity binder even when available.
+_BOLTZ_EXCLUDED_METALS = frozenset({
+    "Li", "Na", "K", "Rb", "Cs", "Be", "Mg", "Ca", "Sr", "Ba",
+    "Al", "Ga", "Sn", "Pb", "Bi",
+    "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn",
+    "Y", "Zr", "Nb", "Mo", "Tc", "Ru", "Rh", "Pd", "Ag", "Cd",
+    "Hf", "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg",
+})
+
+
+def _boltz_affinity_compatible(smiles: str) -> bool:
+    """Return True if ``smiles`` is scoreable by Boltz's affinity module.
+
+    False when parsing fails, the molecule contains an excluded metal, or
+    the heavy-atom count exceeds the affinity cap. Used to gate the
+    auto-inject of the ``properties.affinity`` block in ``prepare_boltz``
+    so structure prediction stays alive for heme / cobalamin / large
+    glycolipid binders.
+    """
+    try:
+        from rdkit import Chem
+        from rdkit.RDLogger import DisableLog
+        DisableLog("rdApp.*")
+    except Exception:
+        return True  # pessimistic default — keep existing behaviour
+    mol = Chem.MolFromSmiles(smiles or "")
+    if mol is None:
+        return False
+    heavy = 0
+    for atom in mol.GetAtoms():
+        if atom.GetSymbol() == "H":
+            continue
+        if atom.GetSymbol() in _BOLTZ_EXCLUDED_METALS:
+            return False
+        heavy += 1
+    return 1 < heavy <= _BOLTZ_AFFINITY_MAX_HEAVY_ATOMS
+
+
 def _build_boltz_command(
     config: RunnerConfig, common: CommonInput, input_path: Path, output_dir: Path, *, use_potentials: bool
 ) -> list[str]:
@@ -105,13 +150,27 @@ def prepare_boltz(common: CommonInput, config: RunnerConfig, run_dir: Path) -> l
     if not config.boltz.enabled:
         return []
 
-    # Auto-inject affinity properties if ligands present
+    # Auto-inject affinity properties if ligands present — but only when
+    # the primary ligand is actually scoreable by Boltz's affinity module.
+    # Skip when the user explicitly left properties empty and the primary
+    # ligand is one of:
+    #   - a ``ccd:`` entry (Boltz affinity needs SMILES input)
+    #   - a SMILES with > 128 heavy atoms (Boltz affinity hard cap — crashes
+    #     the whole structure prediction if present with an oversize binder)
+    # Dropping the block keeps structure prediction alive for these edge
+    # cases (heme cofactors, giant lipid-sugar conjugates, etc.).
     spec = dict(common.spec)
     has_ligand = any(_entity(e)[0] == "ligand" for e in common.sequences)
     if has_ligand and not common.properties:
-        ligand_ids = [_entity_ids(_entity(e)[1]) for e in common.sequences if _entity(e)[0] == "ligand"]
-        if ligand_ids:
-            spec["properties"] = [{"affinity": {"binder": ligand_ids[0][0]}}]
+        first_ligand = next(
+            (_entity(e)[1] for e in common.sequences if _entity(e)[0] == "ligand"),
+            None,
+        )
+        primary_smi = (first_ligand or {}).get("smiles") or ""
+        if primary_smi and _boltz_affinity_compatible(primary_smi):
+            ligand_ids = [_entity_ids(_entity(e)[1]) for e in common.sequences if _entity(e)[0] == "ligand"]
+            if ligand_ids:
+                spec["properties"] = [{"affinity": {"binder": ligand_ids[0][0]}}]
 
     input_path = run_dir / "inputs" / "boltz_input.yaml"
     dump_yaml_file(spec, input_path)
@@ -690,7 +749,19 @@ def _load_docking_prep_summary(run_dir: Path) -> dict[str, Any] | None:
     return None
 
 
-_DOCKING_BOX_SOURCES = ("cofolding", "swinsite", "p2rank")
+_DOCKING_BOX_SOURCES = (
+    "cofolding",
+    "swinsite",
+    "p2rank",
+    # Template-consensus pockets (top-K from spatial cluster of bound-ligand
+    # centroids across all mmseqs+foldseek union hits). Each source maps to
+    # one cluster centroid; runtime exits cleanly when prep_summary lacks
+    # the entry, so a target with no template hits behaves like the old
+    # 3-source flow.
+    "template_consensus_1",
+    "template_consensus_2",
+    "template_consensus_3",
+)
 
 
 def prepare_vina(
@@ -746,8 +817,6 @@ def _prepare_vina_variant(
             "Use the wrapper pipeline with cofolding+docking stages for auto-preparation."
         )
 
-    out_path = output_dir / "docked.pdbqt"
-    log_path = output_dir / "vina.log"
     seed = config.vina.seed if config.vina.seed is not None else common.seed
 
     summary_path = run_dir / "inputs" / "docking" / "docking_prep_summary.json"
@@ -759,11 +828,10 @@ def _prepare_vina_variant(
         "",
         f"BOX_SOURCE = {box_source!r}  # binding-site predictor this variant uses",
         f"receptor_pdbqt = {receptor_pdbqt!r}",
-        f"ligand_pdbqt = {ligand_pdbqt!r}",
+        f"fallback_ligand_pdbqt = {ligand_pdbqt!r}",
         f"center = [{center_x}, {center_y}, {center_z}]",
         f"size = [{size_x}, {size_y}, {size_z}]",
-        f"out_path = {str(out_path)!r}",
-        f"log_path = {str(log_path)!r}",
+        f"default_out_dir = {str(output_dir)!r}",
         f"exhaustiveness = {config.vina.exhaustiveness}",
         f"n_poses = {config.vina.num_modes}",
         f"energy_range = {config.vina.energy_range}",
@@ -771,19 +839,16 @@ def _prepare_vina_variant(
         "",
         "# Multi-seed override via environment variable",
         "seed = int(os.environ.get('DOCK_SEED', str(seed)))",
-        "if os.environ.get('DOCK_OUT_DIR'):",
-        "    _out_dir = Path(os.environ['DOCK_OUT_DIR'])",
-        "    _out_dir.mkdir(parents=True, exist_ok=True)",
-        "    out_path = str(_out_dir / 'docked.pdbqt')",
-        "    log_path = str(_out_dir / 'vina.log')",
+        "seed_out_dir = Path(os.environ.get('DOCK_OUT_DIR', default_out_dir))",
+        "seed_out_dir.mkdir(parents=True, exist_ok=True)",
         "",
         "# Runtime auto-detect from docking prep bridge",
         f"summary_path = Path({str(summary_path)!r})",
+        "prep_ligands = []",
         "if summary_path.exists():",
         "    prep = json.loads(summary_path.read_text())",
         "    receptor_pdbqt = receptor_pdbqt or prep['receptor_pdbqt']",
-        "    if prep.get('ligands'):",
-        "        ligand_pdbqt = ligand_pdbqt or prep['ligands'][0]['pdbqt']",
+        "    prep_ligands = [lig for lig in (prep.get('ligands') or []) if lig.get('pdbqt')]",
         "    # Prefer this variant's dedicated binding-site source over the",
         "    # default box_center. If the source predictor yielded no pocket,",
         "    # exit cleanly so the wrapper moves on to the next variant/tool.",
@@ -799,23 +864,44 @@ def _prepare_vina_variant(
         "    if size[0] is None:",
         "        size = prep.get('box_size', [20, 20, 20])",
         "",
+        "# Dock each ligand of the target separately. Output goes under",
+        "# ``{seed_out_dir}/ligand_{id}/docked.pdbqt`` so downstream post-analysis",
+        "# can stage per-ligand poses without ambiguity.",
+        "if not prep_ligands and fallback_ligand_pdbqt:",
+        "    prep_ligands = [{'id': 'L', 'pdbqt': fallback_ligand_pdbqt}]",
+        "if not prep_ligands:",
+        "    print(f'Vina[{BOX_SOURCE}]: no ligand pdbqt available — nothing to dock.')",
+        "    sys.exit(0)",
+        "",
         "from vina import Vina",
-        'print(f"Vina[{BOX_SOURCE}]: receptor={receptor_pdbqt}")',
-        'print(f"Vina[{BOX_SOURCE}]: ligand={ligand_pdbqt}")',
-        'print(f"Vina[{BOX_SOURCE}]: center={center}, size={size}, seed={seed}")',
+        "print(f'Vina[{BOX_SOURCE}]: receptor={receptor_pdbqt}')",
+        "print(f'Vina[{BOX_SOURCE}]: {len(prep_ligands)} ligand(s) to dock')",
+        "print(f'Vina[{BOX_SOURCE}]: center={center}, size={size}, seed={seed}')",
         "",
-        "v = Vina(sf_name='vina', seed=seed)",
-        "v.set_receptor(receptor_pdbqt)",
-        "v.set_ligand_from_file(ligand_pdbqt)",
-        "v.compute_vina_maps(center=center, box_size=size)",
-        "v.dock(exhaustiveness=exhaustiveness, n_poses=n_poses)",
-        "",
-        "v.write_poses(out_path, n_poses=n_poses, overwrite=True)",
-        "",
-        "with open(log_path, 'w') as f:",
-        "    f.write(v.score().__repr__())",
-        "",
-        'print(f"Vina[{BOX_SOURCE}]: results written to {out_path}")',
+        "for lig in prep_ligands:",
+        "    lig_id = str(lig.get('id') or 'L')",
+        "    lig_pdbqt = lig.get('pdbqt')",
+        "    if not lig_pdbqt:",
+        "        print(f'Vina[{BOX_SOURCE}]: ligand {lig_id} has no pdbqt, skipping.')",
+        "        continue",
+        "    lig_out_dir = seed_out_dir / f'ligand_{lig_id}'",
+        "    lig_out_dir.mkdir(parents=True, exist_ok=True)",
+        "    out_path = str(lig_out_dir / 'docked.pdbqt')",
+        "    log_path = str(lig_out_dir / 'vina.log')",
+        "    print(f'  -> {lig_id}: {lig_pdbqt}')",
+        "    try:",
+        "        v = Vina(sf_name='vina', seed=seed)",
+        "        v.set_receptor(receptor_pdbqt)",
+        "        v.set_ligand_from_file(lig_pdbqt)",
+        "        v.compute_vina_maps(center=center, box_size=size)",
+        "        v.dock(exhaustiveness=exhaustiveness, n_poses=n_poses)",
+        "        v.write_poses(out_path, n_poses=n_poses, overwrite=True)",
+        "        with open(log_path, 'w') as f:",
+        "            f.write(v.score().__repr__())",
+        "        print(f'  -> {lig_id}: wrote {out_path}')",
+        "    except Exception as exc:",
+        "        print(f'  -> {lig_id}: Vina failed: {exc}')",
+        "        continue",
     ]
     runner_script.write_text("\n".join(script_lines) + "\n")
 
@@ -886,14 +972,12 @@ def _prepare_autodock_gpu_variant(
         "",
         f"BOX_SOURCE = {box_source!r}  # binding-site predictor this variant uses",
         f"receptor_pdbqt = {receptor_pdbqt!r}",
-        f"ligand_pdbqt = {ligand_pdbqt!r}",
+        f"fallback_ligand_pdbqt = {ligand_pdbqt!r}",
         f"user_center = [{center_x!r}, {center_y!r}, {center_z!r}]",
         f"user_size = [{size_x!r}, {size_y!r}, {size_z!r}]",
         "center = [0.0, 0.0, 0.0]",
         "size = [22.5, 22.5, 22.5]",
-        f"grid_dir = Path({str(grid_dir)!r})",
-        "fld_path = grid_dir / 'receptor.maps.fld'",
-        f"output_dir = Path({str(output_dir)!r})",
+        f"default_out_dir = Path({str(output_dir)!r})",
         f"binary = {str(repo_root / config.autodock_gpu.binary)!r}",
         f"nrun = {config.autodock_gpu.nrun}",
         f"nev = {config.autodock_gpu.nev}",
@@ -903,22 +987,18 @@ def _prepare_autodock_gpu_variant(
         "",
         "# Multi-seed override via environment variable",
         "seed = int(os.environ.get('DOCK_SEED', str(seed)))",
-        "if os.environ.get('DOCK_OUT_DIR'):",
-        "    output_dir = Path(os.environ['DOCK_OUT_DIR'])",
-        "    output_dir.mkdir(parents=True, exist_ok=True)",
-        "    grid_dir = output_dir / 'grid'",
-        "    grid_dir.mkdir(parents=True, exist_ok=True)",
-        "    fld_path = grid_dir / 'receptor.maps.fld'",
+        "seed_out_dir = Path(os.environ.get('DOCK_OUT_DIR', str(default_out_dir)))",
+        "seed_out_dir.mkdir(parents=True, exist_ok=True)",
         "",
         "# Runtime auto-detect from docking prep bridge. Prefer runtime prep",
         "# summary over compile-time config because adapter runs before the",
         "# docking prep bridge creates the summary file.",
         f"summary_path = Path({str(summary_path)!r})",
+        "prep_ligands = []",
         "if summary_path.exists():",
         "    prep = json.loads(summary_path.read_text())",
         "    receptor_pdbqt = receptor_pdbqt or prep['receptor_pdbqt']",
-        "    if prep.get('ligands'):",
-        "        ligand_pdbqt = ligand_pdbqt or prep['ligands'][0]['pdbqt']",
+        "    prep_ligands = [lig for lig in (prep.get('ligands') or []) if lig.get('pdbqt')]",
         "    # Prefer this variant's dedicated binding-site source; skip if missing.",
         "    bs_preds = prep.get('binding_site_predictions') or {}",
         "    source_pred = bs_preds.get(BOX_SOURCE)",
@@ -937,6 +1017,12 @@ def _prepare_autodock_gpu_variant(
         "    if v is not None:",
         "        size[i] = v",
         "",
+        "if not prep_ligands and fallback_ligand_pdbqt:",
+        "    prep_ligands = [{'id': 'L', 'pdbqt': fallback_ligand_pdbqt}]",
+        "if not prep_ligands:",
+        "    print(f'AutoDock-GPU[{BOX_SOURCE}]: no ligand pdbqt available — nothing to dock.')",
+        "    sys.exit(0)",
+        "",
         "# Dynamically derive ligand atom types from ligand pdbqt (last token of ATOM/HETATM lines)",
         "def _parse_lig_types(path):",
         "    types = []",
@@ -950,51 +1036,69 @@ def _prepare_autodock_gpu_variant(
         "                    types.append(tok)",
         "    return types",
         "",
-        "lig_types = _parse_lig_types(ligand_pdbqt)",
-        "if not lig_types:",
-        "    lig_types = ['A', 'C', 'HD', 'N', 'NA', 'OA', 'SA']",
-        "# Receptor needs the standard protein type set so autogrid can build all interaction maps",
-        "_rec_base = ['A', 'C', 'HD', 'N', 'NA', 'OA', 'SA']",
-        "rec_types = list(dict.fromkeys(_rec_base + lig_types))",
+        f"autogrid_bin = {str(repo_root / '.local' / 'bin' / 'autogrid4')!r}",
         "",
-        "# Generate GPF",
-        "npts = [max(1, int(s / 0.375)) for s in size]",
-        "gpf = [",
-        "    f'npts {npts[0]} {npts[1]} {npts[2]}',",
-        "    f'gridfld receptor.maps.fld',",
-        "    f'spacing 0.375',",
-        "    f'receptor_types {chr(32).join(rec_types)}',",
-        "    f'ligand_types {chr(32).join(lig_types)}',",
-        "    f'receptor {receptor_pdbqt}',",
-        "    f'gridcenter {center[0]} {center[1]} {center[2]}',",
-        "    f'smooth 0.5',",
-        "]",
-        "for t in lig_types:",
-        "    gpf.append(f'map receptor.{t}.map')",
-        "gpf.extend([",
-        "    'elecmap receptor.e.map', 'dsolvmap receptor.d.map',",
-        "    'dielectric -0.1465',",
-        "])",
-        "gpf_path = grid_dir / 'receptor.gpf'",
-        "gpf_path.write_text('\\n'.join(gpf) + '\\n')",
+        "print(f'AutoDock-GPU[{BOX_SOURCE}]: receptor={receptor_pdbqt}')",
+        "print(f'AutoDock-GPU[{BOX_SOURCE}]: {len(prep_ligands)} ligand(s) to dock')",
         "",
-        "print(f'AutoDock-GPU: receptor={receptor_pdbqt}')",
-        "print(f'AutoDock-GPU: ligand={ligand_pdbqt}')",
-        "print(f'AutoDock-GPU: center={center}, size={size}')",
+        "# Dock each ligand separately. Each ligand gets its own grid (ligand",
+        "# atom types vary) and its own output subdir so post-analysis can pick",
+        "# up per-ligand DLG files.",
+        "for lig in prep_ligands:",
+        "    lig_id = str(lig.get('id') or 'L')",
+        "    lig_pdbqt = lig.get('pdbqt')",
+        "    if not lig_pdbqt:",
+        "        print(f'  -> {lig_id}: missing pdbqt, skipping.')",
+        "        continue",
+        "    lig_out_dir = seed_out_dir / f'ligand_{lig_id}'",
+        "    lig_out_dir.mkdir(parents=True, exist_ok=True)",
+        "    lig_grid_dir = lig_out_dir / 'grid'",
+        "    lig_grid_dir.mkdir(parents=True, exist_ok=True)",
         "",
-        "# Run autogrid4",
-        "os.chdir(str(grid_dir))",
-        f"subprocess.run([{str(repo_root / '.local' / 'bin' / 'autogrid4')!r}, '-p', 'receptor.gpf', '-l', 'autogrid.log'], check=True)",
+        "    lig_types = _parse_lig_types(lig_pdbqt)",
+        "    if not lig_types:",
+        "        lig_types = ['A', 'C', 'HD', 'N', 'NA', 'OA', 'SA']",
+        "    _rec_base = ['A', 'C', 'HD', 'N', 'NA', 'OA', 'SA']",
+        "    rec_types = list(dict.fromkeys(_rec_base + lig_types))",
         "",
-        "# Run AutoDock-GPU",
-        "subprocess.run([",
-        "    binary, '--ffile', str(fld_path), '--lfile', ligand_pdbqt,",
-        "    '--nrun', str(nrun), '--nev', str(nev),",
-        "    '--heuristics', str(heuristics), '--autostop', str(autostop),",
-        "    '--seed', str(seed), '--resnam', str(output_dir / 'docking'),",
-        "], check=True)",
+        "    npts = [max(1, int(s / 0.375)) for s in size]",
+        "    gpf = [",
+        "        f'npts {npts[0]} {npts[1]} {npts[2]}',",
+        "        f'gridfld receptor.maps.fld',",
+        "        f'spacing 0.375',",
+        "        f'receptor_types {chr(32).join(rec_types)}',",
+        "        f'ligand_types {chr(32).join(lig_types)}',",
+        "        f'receptor {receptor_pdbqt}',",
+        "        f'gridcenter {center[0]} {center[1]} {center[2]}',",
+        "        f'smooth 0.5',",
+        "    ]",
+        "    for t in lig_types:",
+        "        gpf.append(f'map receptor.{t}.map')",
+        "    gpf.extend([",
+        "        'elecmap receptor.e.map', 'dsolvmap receptor.d.map',",
+        "        'dielectric -0.1465',",
+        "    ])",
+        "    gpf_path = lig_grid_dir / 'receptor.gpf'",
+        "    gpf_path.write_text('\\n'.join(gpf) + '\\n')",
         "",
-        "print(f'AutoDock-GPU: results in {output_dir}')",
+        "    print(f'  -> {lig_id}: ligand={lig_pdbqt}, types={lig_types}')",
+        "    try:",
+        "        subprocess.run(",
+        "            [autogrid_bin, '-p', 'receptor.gpf', '-l', 'autogrid.log'],",
+        "            cwd=str(lig_grid_dir), check=True,",
+        "        )",
+        "        subprocess.run([",
+        "            binary, '--ffile', str(lig_grid_dir / 'receptor.maps.fld'),",
+        "            '--lfile', lig_pdbqt,",
+        "            '--nrun', str(nrun), '--nev', str(nev),",
+        "            '--heuristics', str(heuristics), '--autostop', str(autostop),",
+        "            '--seed', str(seed),",
+        "            '--resnam', str(lig_out_dir / 'docking'),",
+        "        ], check=True)",
+        "        print(f'  -> {lig_id}: results in {lig_out_dir}')",
+        "    except Exception as exc:",
+        "        print(f'  -> {lig_id}: AutoDock-GPU failed: {exc}')",
+        "        continue",
     ]
     runner_script.write_text("\n".join(script_lines) + "\n")
 
@@ -1047,7 +1151,6 @@ def prepare_protenix_dock(
             "Use the wrapper pipeline with cofolding+docking stages for auto-preparation."
         )
 
-    result_path = output_dir / "docking_results.json"
     log_path = output_dir / "protenix_dock.log"
     summary_path = run_dir / "inputs" / "docking" / "docking_prep_summary.json"
     script_lines = [
@@ -1060,50 +1163,70 @@ def prepare_protenix_dock(
         "from pxdock import ProtenixDock",
         "",
         f"receptor_pdb = {receptor_pdb!r}",
-        f"ligand_sdf = {ligand_sdf!r}",
+        f"fallback_ligand_sdf = {ligand_sdf!r}",
         f"box_center = [{center_x}, {center_y}, {center_z}]",
         f"box_size = [{size_x}, {size_y}, {size_z}]",
-        f"output_path = {str(result_path)!r}",
+        f"base_output_dir = Path({str(output_dir)!r})",
         f"log_path = {str(log_path)!r}",
         f"cache_map_spacing = {config.protenix_dock.cache_map_spacing}",
         f"use_cache_maps = {config.protenix_dock.use_cache_maps}",
         "",
         "# Runtime auto-detect from docking prep bridge",
         f"summary_path = Path({str(summary_path)!r})",
+        "prep_ligands = []",
         "if summary_path.exists():",
         "    prep = json.loads(summary_path.read_text())",
         "    receptor_pdb = receptor_pdb or prep['receptor_pdb']",
-        "    if prep.get('ligands'):",
-        "        ligand_sdf = ligand_sdf or prep['ligands'][0]['sdf']",
+        "    prep_ligands = [lig for lig in (prep.get('ligands') or []) if lig.get('sdf')]",
         "    if box_center[0] is None:",
         "        box_center = prep.get('box_center', [0, 0, 0])",
         "    if box_size[0] is None:",
         "        box_size = prep.get('box_size', [20, 20, 20])",
         "",
-        'print(f"Protenix-Dock: receptor={receptor_pdb}")',
-        'print(f"Protenix-Dock: ligand={ligand_sdf}")',
-        'print(f"Protenix-Dock: box_center={box_center}, box_size={box_size}")',
+        "if not prep_ligands and fallback_ligand_sdf:",
+        "    prep_ligands = [{'id': 'L', 'sdf': fallback_ligand_sdf}]",
+        "if not prep_ligands:",
+        "    print('Protenix-Dock: no ligand sdf available — nothing to dock.')",
+        "    sys.exit(0)",
+        "",
+        "print(f'Protenix-Dock: receptor={receptor_pdb}')",
+        "print(f'Protenix-Dock: box_center={box_center}, box_size={box_size}')",
+        "print(f'Protenix-Dock: {len(prep_ligands)} ligand(s) to dock')",
         "",
         "dock = ProtenixDock(receptor_pdb)",
         "dock.set_box(box_center, box_size)",
         "",
         "if use_cache_maps:",
         "    cache_dir = dock.generate_cache_maps(spacing=cache_map_spacing)",
-        '    print(f"Protenix-Dock: cache maps generated at {cache_dir}")',
+        "    print(f'Protenix-Dock: cache maps generated at {cache_dir}')",
         "",
-        f"results = dock.run_docking(ligand_sdf, out_dir={str(output_dir)!r})",
-        "",
-        "# Copy result files to output dir and save summary",
-        "import glob, shutil",
-        "result_files = glob.glob(str(results) + '/**/*', recursive=True) if isinstance(results, str) else []",
-        "summary = {'docking_output': str(results), 'files': []}",
-        "for f in result_files:",
-        "    if os.path.isfile(f):",
-        "        summary['files'].append(os.path.basename(f))",
-        'with open(output_path, "w") as f:',
-        "    json.dump(summary, f, indent=2)",
-        "",
-        'print(f"Protenix-Dock: results written to {output_path}")',
+        "# Dock each ligand separately. PxDock writes into its own per-ligand",
+        "# output dir; a per-ligand docking_results.json summary lives at",
+        "# ``{base_output_dir}/ligand_{id}/docking_results.json`` so downstream",
+        "# post-analysis can discover poses by ligand id.",
+        "for lig in prep_ligands:",
+        "    lig_id = str(lig.get('id') or 'L')",
+        "    lig_sdf = lig.get('sdf')",
+        "    if not lig_sdf:",
+        "        print(f'  -> {lig_id}: missing sdf, skipping.')",
+        "        continue",
+        "    lig_out_dir = base_output_dir / f'ligand_{lig_id}'",
+        "    lig_out_dir.mkdir(parents=True, exist_ok=True)",
+        "    print(f'  -> {lig_id}: ligand={lig_sdf}')",
+        "    try:",
+        "        results = dock.run_docking(lig_sdf, out_dir=str(lig_out_dir))",
+        "        import glob",
+        "        result_files = glob.glob(str(results) + '/**/*', recursive=True) if isinstance(results, str) else []",
+        "        summary = {",
+        "            'ligand_id': lig_id,",
+        "            'docking_output': str(results),",
+        "            'files': [os.path.basename(f) for f in result_files if os.path.isfile(f)],",
+        "        }",
+        "        (lig_out_dir / 'docking_results.json').write_text(json.dumps(summary, indent=2))",
+        "        print(f'  -> {lig_id}: results in {lig_out_dir}')",
+        "    except Exception as exc:",
+        "        print(f'  -> {lig_id}: Protenix-Dock failed: {exc}')",
+        "        continue",
     ]
     runner_script.parent.mkdir(parents=True, exist_ok=True)
     runner_script.write_text("\n".join(script_lines) + "\n")

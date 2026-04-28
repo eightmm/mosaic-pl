@@ -314,7 +314,14 @@ def test_prepare_vina_and_validate_docking_stage(tmp_path: Path) -> None:
 
     prepared = prepare_vina_run(common, config, tmp_path, "slurm")
     names = [m.model_name for m in prepared.model_runs]
-    assert names == ["vina_cofolding", "vina_swinsite", "vina_p2rank"]
+    assert names == [
+        "vina_cofolding",
+        "vina_swinsite",
+        "vina_p2rank",
+        "vina_template_consensus_1",
+        "vina_template_consensus_2",
+        "vina_template_consensus_3",
+    ]
     # One runner script per variant.
     for name in names:
         assert (prepared.run_dir / "scripts" / f"run_{name}.py").exists()
@@ -462,10 +469,16 @@ def test_prepare_docking_run_combines_vina_and_protenix_dock(tmp_path: Path) -> 
 
     prepared = prepare_docking_run(common, config, tmp_path, "slurm")
     model_names = [m.model_name for m in prepared.model_runs]
-    # Vina fans out into one variant per binding-site source.
-    assert {"vina_cofolding", "vina_swinsite", "vina_p2rank"}.issubset(set(model_names))
+    # Vina fans out into one variant per binding-site source: 3 predictor
+    # sources (cofolding/swinsite/p2rank) + 3 template-consensus pocket
+    # centroids (top-K cluster centers from mmseqs+foldseek union).
+    assert {
+        "vina_cofolding", "vina_swinsite", "vina_p2rank",
+        "vina_template_consensus_1", "vina_template_consensus_2", "vina_template_consensus_3",
+    }.issubset(set(model_names))
     assert "protenix-dock" in model_names
-    assert len(prepared.model_runs) == 4
+    # 6 vina variants + 1 protenix-dock; autodock_gpu disabled in this fixture.
+    assert len(prepared.model_runs) == 7
 
 
 def test_write_example_config_includes_protenix_dock(tmp_path: Path) -> None:
@@ -668,10 +681,14 @@ def test_wrapper_no_multi_track_without_template_search(tmp_path: Path) -> None:
     assert "run_multi_track_docking.py" not in script
 
 
-def test_check_mcs_hits_filters_by_threshold(tmp_path: Path) -> None:
+def test_check_template_hits_keeps_all_with_ligands(tmp_path: Path) -> None:
+    """Track 2 (template box docking) doesn't need MCS atom matching — any
+    template with a bound ligand yields a usable pocket box. Only Track 3
+    lig-MCS-align is gated by MCS, and that gate lives per-template in the
+    main loop, not in this helper."""
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-    from run_multi_track_docking import check_mcs_hits
+    from run_multi_track_docking import check_template_hits
 
     tsv = tmp_path / "filtered_hits.tsv"
     tsv.write_text(
@@ -683,20 +700,17 @@ def test_check_mcs_hits_filters_by_threshold(tmp_path: Path) -> None:
         "Q\t3ghi_C\t3ghi\tC\t70.0\t1e-30\t0\t0.9000\t0.9000\t\t\t\t\t\n"
     )
 
-    hits = check_mcs_hits(tsv, 0.5)
-    assert len(hits) == 1
-    assert hits[0]["pdb_id"] == "1abc"
-
-    hits_low = check_mcs_hits(tsv, 0.1)
-    assert len(hits_low) == 2  # 3ghi excluded (num_ligands=0)
+    hits = check_template_hits(tsv)
+    assert len(hits) == 2  # 3ghi excluded (num_ligands=0); 2def kept despite low MCS
+    assert {h["pdb_id"] for h in hits} == {"1abc", "2def"}
 
 
-def test_check_mcs_hits_missing_file(tmp_path: Path) -> None:
+def test_check_template_hits_missing_file(tmp_path: Path) -> None:
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-    from run_multi_track_docking import check_mcs_hits
+    from run_multi_track_docking import check_template_hits
 
-    hits = check_mcs_hits(tmp_path / "nonexistent.tsv", 0.5)
+    hits = check_template_hits(tmp_path / "nonexistent.tsv")
     assert hits == []
 
 
@@ -817,6 +831,18 @@ def test_wrapper_no_ion_placement_without_cofolding(tmp_path: Path) -> None:
 # --- CASP17 LG submission tests ---
 
 
+def _mk_ligand(number: int, name: str = "LIG", lscore: float | None = 0.82) -> dict:
+    """Helper: one LIGAND entry in the new models schema."""
+    mdl = (
+        "     RDKit          3D\n\n"
+        " 1  0  0  0  0  0  0  0  0  0999 V2000\n"
+        "   12.345   23.456   34.567 C   0  0  0  0  0  0  0  0  0  0  0  0\n"
+        "M  END"
+    )
+    return {"ligand_number": number, "ligand_name": name,
+            "ligand_mdl": mdl, "lscore": lscore}
+
+
 def test_build_lg_submission_basic() -> None:
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
@@ -826,23 +852,16 @@ def test_build_lg_submission_basic() -> None:
         "ATOM      1  N   ILE A  21      16.852   8.985  28.369  1.00 85.00           N",
         "TER",
     ]
-    mdl = (
-        "     RDKit          3D\n\n"
-        " 1  0  0  0  0  0  0  0  0  0999 V2000\n"
-        "   12.345   23.456   34.567 C   0  0  0  0  0  0  0  0  0  0  0  0\n"
-        "M  END"
-    )
     result = build_lg_submission(
         target_id="L2001",
         author="0123-4567-8901",
         method="test method",
-        protein_pdb_lines=protein_lines,
-        models=[{"ligand_mdl": mdl, "lscore": 0.82}],
-        ligand_number=1,
-        ligand_name="761",
-        parent="1CGH",
+        models=[{
+            "protein_pdb_lines": protein_lines,
+            "parent": "1CGH",
+            "ligands": [_mk_ligand(1, "761", 0.82)],
+        }],
     )
-
     assert result.startswith("PFRMAT LG\n")
     assert "TARGET L2001" in result
     assert "AUTHOR 0123-4567-8901" in result
@@ -863,10 +882,10 @@ def test_build_lg_submission_no_lscore() -> None:
         target_id="L2002",
         author="0000-0000-0000",
         method="test",
-        protein_pdb_lines=["ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 50.00", "TER"],
-        models=[{"ligand_mdl": "test\n\n 0  0  0  0  0  0  0  0  0  0999 V2000\nM  END", "lscore": None}],
-        ligand_number=2,
-        ligand_name="380",
+        models=[{
+            "protein_pdb_lines": ["ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 50.00", "TER"],
+            "ligands": [_mk_ligand(2, "380", lscore=None)],
+        }],
     )
     assert "LIGAND 002 380" in result
     assert "LSCORE" not in result
@@ -877,38 +896,36 @@ def test_build_lg_submission_auto_appends_ter() -> None:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
     from make_casp_submission import build_lg_submission
 
-    # No TER in protein lines
     result = build_lg_submission(
         target_id="T1",
         author="A",
         method="M",
-        protein_pdb_lines=["ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 50.00"],
-        models=[{"ligand_mdl": "     RDKit          3D\n\n 0  0  0  0  0  0  0  0  0  0999 V2000\nM  END", "lscore": None}],
-        ligand_number=1,
-        ligand_name="X",
+        models=[{
+            "protein_pdb_lines": ["ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 50.00"],
+            "ligands": [_mk_ligand(1, "X", lscore=None)],
+        }],
     )
-    # Should have added TER
     assert "\nTER\n" in result
 
 
 def test_build_lg_submission_with_affinity() -> None:
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-    from make_casp_submission import build_lg_submission_with_affinity
+    from make_casp_submission import build_lg_submission
 
-    result = build_lg_submission_with_affinity(
+    result = build_lg_submission(
         target_id="L2001",
         author="0000-0000-0000",
         method="test",
-        protein_pdb_lines=["ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 50.00", "TER"],
-        models=[{"ligand_mdl": "test\n\n 0  0  0  0  0  0  0  0  0  0999 V2000\nM  END", "lscore": 0.85}],
-        ligand_number=1,
-        ligand_name="761",
-        affinity_nM=12.5,
+        models=[{
+            "protein_pdb_lines": ["ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 50.00", "TER"],
+            "ligands": [_mk_ligand(1, "761", 0.85)],
+            "affinity_nM": 12.5,
+        }],
     )
     assert "LSCORE 0.850" in result
     assert "AFFNTY 12.500 aa" in result
-    # AFFNTY must appear before END
+    # AFFNTY must appear between the last M END and the MODEL's END
     lines = result.strip().splitlines()
     end_idx = lines.index("END")
     affnty_idx = next(i for i, l in enumerate(lines) if l.startswith("AFFNTY"))
@@ -918,21 +935,93 @@ def test_build_lg_submission_with_affinity() -> None:
 def test_build_lg_submission_without_affinity_still_works() -> None:
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-    from make_casp_submission import build_lg_submission_with_affinity
+    from make_casp_submission import build_lg_submission
 
-    result = build_lg_submission_with_affinity(
+    result = build_lg_submission(
         target_id="L2001",
         author="0000-0000-0000",
         method="test",
-        protein_pdb_lines=["ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 50.00", "TER"],
-        models=[{"ligand_mdl": "test\n\n 0  0  0  0  0  0  0  0  0  0999 V2000\nM  END", "lscore": 0.85}],
-        ligand_number=1,
-        ligand_name="761",
-        affinity_nM=None,  # Pose-only task
+        models=[{
+            "protein_pdb_lines": ["ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 50.00", "TER"],
+            "ligands": [_mk_ligand(1, "761", 0.85)],
+        }],
     )
     assert "LSCORE 0.850" in result
     assert "AFFNTY" not in result
     assert result.strip().endswith("END")
+
+
+def test_build_lg_submission_multi_ligand_per_model() -> None:
+    """CASP17 spec: each MODEL carries every ligand of the target."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from make_casp_submission import build_lg_submission
+
+    result = build_lg_submission(
+        target_id="T1214",
+        author="0000-0000-0000",
+        method="multi-ligand test",
+        models=[{
+            "protein_pdb_lines": ["ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 50.00", "TER"],
+            "ligands": [_mk_ligand(1, "LIG", 0.82), _mk_ligand(2, "LIG", 0.65)],
+            "affinity_nM": 45.0,
+        }],
+    )
+    # Both LIGAND blocks present in same MODEL
+    assert "LIGAND 001 LIG" in result
+    assert "LIGAND 002 LIG" in result
+    # Both LSCOREs present
+    assert "LSCORE 0.820" in result
+    assert "LSCORE 0.650" in result
+    # Exactly one MODEL + one END in output (multi-ligand, single-MODEL case)
+    lines = result.strip().splitlines()
+    assert sum(1 for line in lines if line.startswith("MODEL ")) == 1
+    assert sum(1 for line in lines if line == "END") == 1
+    # AFFNTY appears once, after both LIGAND blocks
+    m_end_positions = [i for i, line in enumerate(lines) if line == "M  END"]
+    affnty_idx = next(i for i, line in enumerate(lines) if line.startswith("AFFNTY"))
+    assert len(m_end_positions) == 2  # one per ligand MDL
+    assert affnty_idx > m_end_positions[-1]
+
+
+def test_build_lg_submission_five_alternate_models() -> None:
+    """Up to 5 MODELs allowed; each MODEL is a complete snapshot."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from make_casp_submission import build_lg_submission
+
+    protein = ["ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 50.00", "TER"]
+    models = [
+        {"protein_pdb_lines": protein, "ligands": [_mk_ligand(1, "LIG", 0.90 - i * 0.05)]}
+        for i in range(5)
+    ]
+    result = build_lg_submission(
+        target_id="L2001", author="A", method="M", models=models,
+    )
+    lines = result.strip().splitlines()
+    assert [line for line in lines if line.startswith("MODEL ")] == [
+        "MODEL 1", "MODEL 2", "MODEL 3", "MODEL 4", "MODEL 5",
+    ]
+    # 5 ENDs (one per MODEL), 5 M ENDs (one per MDL)
+    assert sum(1 for line in lines if line == "END") == 5
+    assert sum(1 for line in lines if line == "M  END") == 5
+
+
+def test_build_lg_submission_rejects_more_than_5_models() -> None:
+    import sys
+    import pytest
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from make_casp_submission import build_lg_submission
+
+    protein = ["ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 50.00", "TER"]
+    models = [
+        {"protein_pdb_lines": protein, "ligands": [_mk_ligand(1)]}
+        for _ in range(6)
+    ]
+    with pytest.raises(ValueError, match="at most 5"):
+        build_lg_submission(
+            target_id="L", author="A", method="M", models=models,
+        )
 
 
 # --- Ensemble affinity tests ---

@@ -223,12 +223,19 @@ def build_shell_script(
                 'echo "================================================================"',
                 f"_start_{var_name}=$SECONDS",
             ])
+            # Per-seed timeout: Vina's autodock engine can occasionally fail
+            # to converge on flexible / polyisoprenoid-like ligands and hang
+            # in ``Performing docking`` for hours (observed eating full 12h
+            # wall-time on 9emd/9emo/9emt). Cap each seed at 15 min so one
+            # bad seed doesn't kill the whole docking stage; surviving seeds
+            # still produce usable poses.
             for si, seed in enumerate(docking_seeds, 1):
                 seed_out = f"{base_out}/seed_{seed}"
                 lines.extend([
                     f'echo "  seed {seed} ({si}/{len(docking_seeds)})"',
                     f"mkdir -p {shlex.quote(seed_out)}",
-                    f"DOCK_SEED={seed} DOCK_OUT_DIR={shlex.quote(seed_out)} {base_cmd}",
+                    f"timeout 900 env DOCK_SEED={seed} DOCK_OUT_DIR={shlex.quote(seed_out)} {base_cmd}"
+                    f" || echo '  (seed {seed} timed out or failed, continuing)'",
                 ])
             lines.extend([
                 f'_elapsed_{var_name}=$(( SECONDS - _start_{var_name} ))',
@@ -237,13 +244,23 @@ def build_shell_script(
                 "",
             ])
         else:
+            rendered = _render_command(model_run.command)
+            # PxDock has no per-seed structure but can hang in conformer
+            # generation on large/flexible ligands (observed: 9cv8 spent
+            # 5h wall-time stuck there). Cap at 25 min; failure is caught
+            # by the outer ``|| echo`` fallback so downstream stages still run.
+            if model_run.model_name == "protenix-dock":
+                rendered = (
+                    f"timeout 1500 {rendered}"
+                    f" || echo '  (protenix-dock timed out or failed, continuing)'"
+                )
             lines.extend([
                 'echo ""',
                 'echo "================================================================"',
                 f'echo "  [{idx}/{total}] {name_upper}"',
                 'echo "================================================================"',
                 f"_start_{var_name}=$SECONDS",
-                _render_command(model_run.command),
+                rendered,
                 f'_elapsed_{var_name}=$(( SECONDS - _start_{var_name} ))',
                 f'echo "  [{idx}/{total}] {name_upper} done in ${{_elapsed_{var_name}}}s"',
                 'echo "================================================================"',
@@ -294,6 +311,8 @@ def build_wrapper_shell_script(
     align_script = repo_root / "scripts" / "align_cofolding_outputs.py"
     prep_script = repo_root / "scripts" / "prepare_docking_inputs.py"
     filter_script = repo_root / "scripts" / "run_template_filter.py"
+    pockets_script = repo_root / "scripts" / "extract_template_pockets.py"
+    cluster_script = repo_root / "scripts" / "cluster_template_pockets.py"
     multi_track_script = repo_root / "scripts" / "run_multi_track_docking.py"
     ion_script = repo_root / "scripts" / "collect_template_ions.py"
     post_analysis_script = repo_root / "scripts" / "run_post_analysis.py"
@@ -302,69 +321,129 @@ def build_wrapper_shell_script(
     pred_python = repo_root / ".venvs" / "pred" / "bin" / "python"
     hub_python = repo_root / ".venv" / "bin" / "python"
     stage_names = [s for s, _ in stage_scripts]
-    has_template_search = "template-search-sequence" in stage_names
+    has_template_search_seq = "template-search-sequence" in stage_names
+    has_template_search_struct = "template-search-structure" in stage_names
+    has_template_search = has_template_search_seq or has_template_search_struct
     has_docking = "docking" in stage_names
     has_cofolding = "cofolding" in stage_names
-    prev_stage = None
-    for stage_name, script_path in stage_scripts:
-        # Insert alignment + docking prep bridges between cofolding and docking
-        if stage_name == "docking" and prev_stage == "cofolding":
-            run_dir = script_path.parent.parent
-            # Align all cofolding outputs to a common frame
-            lines.extend([
-                'echo ""',
-                'echo "================================================================"',
-                'echo "  BRIDGE: Aligning cofolding outputs to common frame"',
-                'echo "================================================================"',
-                f"{shlex.quote(str(hub_python))} {shlex.quote(str(align_script))} "
-                f"--run-dir {shlex.quote(str(run_dir))}",
-                "",
-            ])
-            lines.extend([
-                'echo ""',
-                'echo "----------------------------------------------------------------"',
-                'echo "  BRIDGE: Preparing docking inputs"',
-                'echo "----------------------------------------------------------------"',
-                f"{shlex.quote(str(dock_python))} {shlex.quote(str(prep_script))} "
-                f"--input-yaml {shlex.quote(str(run_dir / 'inputs' / 'boltz_input.yaml'))} "
+
+    def _emit_template_bridges(run_dir: Path) -> None:
+        """Filter (mmseqs+foldseek union) → pocket extraction → spatial cluster.
+        Runs as one block so downstream consumers (docking-prep, multi-track,
+        ion placement) all see the same canonical artifacts.
+        """
+        ts_cfg = config.template_search_sequence
+        rcsb_db = Path(ts_cfg.rcsb_db_path).expanduser()
+        rcsb_dir = Path(ts_cfg.rcsb_dir).expanduser()
+        mmseqs_tsv = run_dir / "outputs" / "template_search_sequence" / "mmseqs_hits.tsv"
+        foldseek_tsv = run_dir / "outputs" / "template_search_structure" / "foldseek_hits.tsv"
+        filtered_tsv = run_dir / "outputs" / "template_search_sequence" / "filtered_hits.tsv"
+        input_yaml = run_dir / "inputs" / "boltz_input.yaml"
+        pockets_json = run_dir / "outputs" / "template_pockets" / "template_pockets.json"
+
+        filter_cmd = (
+            f"{shlex.quote(str(hub_python))} {shlex.quote(str(filter_script))} "
+            f"--rcsb-db {shlex.quote(str(rcsb_db))} "
+            f"--input-yaml {shlex.quote(str(input_yaml))} "
+            f"--output-tsv {shlex.quote(str(filtered_tsv))}"
+        )
+        if has_template_search_seq:
+            filter_cmd += f" --hits-tsv {shlex.quote(str(mmseqs_tsv))}"
+        if has_template_search_struct:
+            filter_cmd += f" --foldseek-tsv {shlex.quote(str(foldseek_tsv))}"
+        if ts_cfg.max_deposition_date:
+            filter_cmd += f" --max-deposition-date {shlex.quote(ts_cfg.max_deposition_date)}"
+        lines.extend([
+            'echo ""',
+            'echo "================================================================"',
+            'echo "  BRIDGE: Filtering template hits (mmseqs + foldseek union)"',
+            'echo "================================================================"',
+            f"{filter_cmd} || echo '  (template filter failed, continuing)'",
+            "",
+        ])
+
+        # Pocket extraction + clustering need cofolding to have produced a
+        # reference cif. When cofolding isn't a stage we still run the filter
+        # so multi-track docking can use the hits, but skip the pocket steps.
+        if has_cofolding:
+            pockets_cmd = (
+                f"{shlex.quote(str(hub_python))} {shlex.quote(str(pockets_script))} "
                 f"--run-dir {shlex.quote(str(run_dir))} "
-                f"--output-dir {shlex.quote(str(run_dir / 'inputs' / 'docking'))} "
-                f"--model auto",
+                f"--rcsb-dir {shlex.quote(str(rcsb_dir))}"
+            )
+            lines.extend([
+                'echo ""',
+                'echo "----------------------------------------------------------------"',
+                'echo "  BRIDGE: Extracting template pocket centers"',
+                'echo "----------------------------------------------------------------"',
+                f"{pockets_cmd} || echo '  (pocket extraction failed, continuing)'",
                 "",
             ])
+            cluster_cmd = (
+                f"{shlex.quote(str(hub_python))} {shlex.quote(str(cluster_script))} "
+                f"--pockets-json {shlex.quote(str(pockets_json))}"
+            )
+            lines.extend([
+                'echo ""',
+                'echo "----------------------------------------------------------------"',
+                'echo "  BRIDGE: Clustering template pockets (top-K consensus)"',
+                'echo "----------------------------------------------------------------"',
+                f"{cluster_cmd} || echo '  (pocket clustering failed, continuing)'",
+                "",
+            ])
+
+    template_bridges_done = False
+    cofold_done = False
+    for stage_name, script_path in stage_scripts:
+        # Pre-docking bridges. Order matters: template artifacts (filter +
+        # pockets + cluster) must come BEFORE docking-prep so the prep step
+        # can register template_consensus_* sources for vina/adg/pxdock.
+        if stage_name == "docking":
+            run_dir = script_path.parent.parent
+            if has_template_search and not template_bridges_done:
+                _emit_template_bridges(run_dir)
+                template_bridges_done = True
+            if cofold_done:
+                lines.extend([
+                    'echo ""',
+                    'echo "================================================================"',
+                    'echo "  BRIDGE: Aligning cofolding outputs to common frame"',
+                    'echo "================================================================"',
+                    f"{shlex.quote(str(hub_python))} {shlex.quote(str(align_script))} "
+                    f"--run-dir {shlex.quote(str(run_dir))}"
+                    f" || echo '  (cofolding alignment failed, continuing)'",
+                    "",
+                ])
+                lines.extend([
+                    'echo ""',
+                    'echo "----------------------------------------------------------------"',
+                    'echo "  BRIDGE: Preparing docking inputs"',
+                    'echo "----------------------------------------------------------------"',
+                    f"{shlex.quote(str(dock_python))} {shlex.quote(str(prep_script))} "
+                    f"--input-yaml {shlex.quote(str(run_dir / 'inputs' / 'boltz_input.yaml'))} "
+                    f"--run-dir {shlex.quote(str(run_dir))} "
+                    f"--output-dir {shlex.quote(str(run_dir / 'inputs' / 'docking'))} "
+                    f"--model auto"
+                    f" || echo '  (docking prep failed, continuing)'",
+                    "",
+                ])
         lines.extend(
             [
                 f'echo "stage={stage_name}"',
-                f"bash {shlex.quote(str(script_path))}",
+                f"bash {shlex.quote(str(script_path))} "
+                f"|| echo '  (stage={stage_name} failed, continuing)'",
                 "",
             ]
         )
-        # Insert template filter after template-search-sequence
-        if stage_name == "template-search-sequence":
-            run_dir = script_path.parent.parent
-            ts_cfg = config.template_search_sequence
-            rcsb_db = Path(ts_cfg.rcsb_db_path).expanduser()
-            mmseqs_tsv = run_dir / "outputs" / "template_search_sequence" / "mmseqs_hits.tsv"
-            filtered_tsv = run_dir / "outputs" / "template_search_sequence" / "filtered_hits.tsv"
-            input_yaml = run_dir / "inputs" / "boltz_input.yaml"
-            filter_cmd = (
-                f"{shlex.quote(str(hub_python))} {shlex.quote(str(filter_script))} "
-                f"--hits-tsv {shlex.quote(str(mmseqs_tsv))} "
-                f"--rcsb-db {shlex.quote(str(rcsb_db))} "
-                f"--input-yaml {shlex.quote(str(input_yaml))} "
-                f"--output-tsv {shlex.quote(str(filtered_tsv))}"
-            )
-            if ts_cfg.max_deposition_date:
-                filter_cmd += f" --max-deposition-date {shlex.quote(ts_cfg.max_deposition_date)}"
-            lines.extend([
-                'echo ""',
-                'echo "----------------------------------------------------------------"',
-                'echo "  BRIDGE: Filtering template hits (ligand + MCS)"',
-                'echo "----------------------------------------------------------------"',
-                filter_cmd,
-                "",
-            ])
-        prev_stage = stage_name
+        if stage_name == "cofolding":
+            cofold_done = True
+
+    # Template-only pipeline (no docking stage): emit bridges post-loop so
+    # multi-track docking + ion placement still find filtered_hits.tsv.
+    if has_template_search and not template_bridges_done:
+        run_dir = stage_scripts[0][1].parent.parent
+        _emit_template_bridges(run_dir)
+        template_bridges_done = True
 
     # Multi-track docking: run after all stages if template search + docking both present
     if has_template_search and has_docking:
@@ -372,17 +451,22 @@ def build_wrapper_shell_script(
         ts_cfg = config.template_search_sequence
         rcsb_dir = Path(ts_cfg.rcsb_dir).expanduser()
         rcsb_db = Path(ts_cfg.rcsb_db_path).expanduser()
-        lines.extend([
-            'echo ""',
-            'echo "================================================================"',
-            'echo "  MULTI-TRACK DOCKING (Track 2 + Track 3)"',
-            'echo "================================================================"',
+        multi_track_cmd = (
             f"{shlex.quote(str(dock_python))} {shlex.quote(str(multi_track_script))} "
             f"--run-dir {shlex.quote(str(run_dir))} "
             f"--input-yaml {shlex.quote(str(run_dir / 'inputs' / 'boltz_input.yaml'))} "
             f"--rcsb-dir {shlex.quote(str(rcsb_dir))} "
             f"--rcsb-db {shlex.quote(str(rcsb_db))} "
-            f"--mcs-threshold {ts_cfg.mcs_threshold}",
+            f"--mcs-threshold {ts_cfg.mcs_threshold}"
+        )
+        if not config.protenix_dock.enabled:
+            multi_track_cmd += " --skip-pxdock"
+        lines.extend([
+            'echo ""',
+            'echo "================================================================"',
+            'echo "  MULTI-TRACK DOCKING (Track 2 + Track 3)"',
+            'echo "================================================================"',
+            f"{multi_track_cmd} || echo '  (multi-track docking failed, continuing)'",
             "",
         ])
 
@@ -427,12 +511,13 @@ def build_wrapper_shell_script(
         run_dir = stage_scripts[0][1].parent.parent
         sub_cfg = config.submission
         submission_output = run_dir.parent.parent / "submissions" / f"{job_name}.lg"
+        # Ligand numbers + names are derived from docking_prep_summary.json
+        # inside make_casp_submission.py. The --ligand-name flag overrides the
+        # MDL "name" label — default "LIG" matches CASP convention.
         cmd = (
             f"{shlex.quote(str(hub_python))} {shlex.quote(str(submission_script))} "
             f"--run-dir {shlex.quote(str(run_dir))} "
             f"--target-id {shlex.quote(job_name)} "
-            f"--ligand-name {shlex.quote(job_name)} "  # fallback to target id
-            f"--ligand-number {sub_cfg.ligand_number} "
             f"--author {shlex.quote(sub_cfg.author)} "
             f"--method {shlex.quote(sub_cfg.method)} "
             f"--parent {shlex.quote(sub_cfg.parent)} "
