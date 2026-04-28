@@ -173,16 +173,16 @@ def main() -> int:
     parser.add_argument(
         "--max-templates",
         type=int,
-        default=500,
-        help="Cap how many top-evidence templates USalign aligns. Bounds "
-             "wall time at ~3-5 s/template; 500 ≈ 25-40 min/target — "
-             "comfortable inside the SLURM 12h budget. The motivation for "
-             "going wide is that template gathering is the actual game: "
-             "USalign rejects bad-fold candidates fast (TM < min-tmscore), "
-             "so the marginal cost of extra candidates beyond the same-fold "
-             "tail is small. With foldseek max_hits=2000 the post-filter "
-             "pool typically has 100-1500 unique hits; 500 keeps the bulk "
-             "of credible same-fold candidates.",
+        default=2000,
+        help="Cap how many top-evidence templates USalign aligns. USalign "
+             "is fast — measured at ~0.5 s/template on typical 300-aa "
+             "structures — so 2000 templates cost ~17 min/target, well "
+             "inside the SLURM 12h budget. Default chosen to match "
+             "``template_search_structure.max_hits=2000`` so we don't "
+             "silently drop the foldseek tail; tail-rank dual-source hits "
+             "(mmseqs hit also at foldseek rank 1800) need the full pool "
+             "to surface. Beyond 2000 is diminishing returns since most "
+             "queries don't have that many credible candidates.",
     )
     # The single authoritative quality gate on the union template pool.
     # Since USalign aligns every selected template, its TM-score is the
