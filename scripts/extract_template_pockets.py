@@ -10,12 +10,20 @@ cofolding reference frame.
 The output is a *flat list* of pocket points; clustering is the next step
 and runs separately so it can be ablated independently.
 
+Alignment uses **USalign** (structure-based TM-align algorithm), not
+gemmi's sequence-anchored superposition. Foldseek finds templates by
+3Di + structural similarity, so the reciprocal alignment must also be
+structure-based — sequence-anchored gemmi collapses on distant homologs
+(matched-residue count drops to <50, transform RMSD blows up to 15+ Å,
+ligand centroids end up tens of Å off-pocket). USalign reproduces the
+same "fold view" foldseek used to find the hit.
+
 Usage::
 
     python extract_template_pockets.py \
         --run-dir experiments/runs/<target> \
         --rcsb-dir ~/DB/RCSB/raw/mmCIF_data \
-        --max-templates 50
+        --max-templates 100
 
 Output::
 
@@ -34,16 +42,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "src"))
 
-# Reuse the gemmi-based alignment + CIF helpers already used for ion
-# placement so we share one well-tested template-alignment path.
+# CIF lookup / extraction helpers come from the ion-placement script so we
+# don't duplicate that path. Alignment moved to the shared usalign module
+# (structure-based, not the gemmi sequence-anchored superposition).
 from collect_template_ions import (  # noqa: E402
-    align_template_to_reference,
     extract_cif,
     find_best_cofolding_structure,
     find_template_cif,
-    transform_position,
 )
+from casp17.usalign import run_usalign, transform_point  # noqa: E402
 
 
 @dataclass
@@ -58,8 +67,12 @@ class PocketPoint:
     centroid_x: float
     centroid_y: float
     centroid_z: float
+    # USalign-reported quality of the template→reference superposition.
+    # ``alignment_tmscore`` (reference-normalized) is the canonical
+    # structure-similarity score; ``alignment_rmsd`` is on the matched
+    # subset only (not structure-wide).
+    alignment_tmscore: float
     alignment_rmsd: float
-    aligned_residues: int
     in_mmseqs: bool
     in_foldseek: bool
     pident: float
@@ -167,31 +180,20 @@ def main() -> int:
              "the tail. With foldseek max_hits=500 and qtmscore_min=0.5, the "
              "post-filter pool is typically 50-300 hits; 100 keeps the bulk.",
     )
-    # Alignment quality gates. ``gemmi.calculate_superposition`` does
-    # *sequence-anchored* CA superposition: it aligns sequences first and
-    # only superposes the matched residues. For foldseek-only hits where
-    # the query and template share fold but not sequence, the matched
-    # residue count collapses and the resulting transform misplaces
-    # ligand centroids by tens of Å. Drop these so the pocket pool stays
-    # trustworthy. Defaults are loose: a real same-fold homolog easily
-    # gets <= 5 Å CA RMSD and >= 50 matched residues.
+    # Alignment quality gate. USalign almost always converges since it's
+    # structure-based, but we keep a safety net in case a corrupt CIF or
+    # a chain-only-overlap edge case sneaks through. The defaults are
+    # forgiving — typical same-fold superposition lands at TM-score >= 0.5,
+    # which corresponds to RMSD-on-aligned-residues of a few Å.
     parser.add_argument(
-        "--max-alignment-rmsd",
+        "--min-tmscore",
         type=float,
-        default=5.0,
-        help="Drop a template if its post-superposition CA RMSD exceeds "
-             "this value. Default 5.0 Å — same-fold homologs usually "
-             "land at 1-3 Å; > 5 Å indicates gemmi's sequence-anchored "
-             "alignment failed and the transform is unreliable.",
-    )
-    parser.add_argument(
-        "--min-aligned-residues",
-        type=int,
-        default=50,
-        help="Drop a template if fewer than this many residues survived "
-             "sequence alignment. Default 50 — covers small domain "
-             "matches but rejects the cases where only a few CAs anchor "
-             "the transform.",
+        default=0.4,
+        help="Drop a template if USalign reports TM-score below this "
+             "(reference-normalized). Default 0.4 — slightly below "
+             "0.5 (canonical same-fold) so we don't double-penalise "
+             "templates that already passed the foldseek qtmscore_min "
+             "filter; mostly catches degenerate single-chain overlaps.",
     )
     parser.add_argument("--output-dir", type=Path, default=None)
     args = parser.parse_args()
@@ -249,22 +251,24 @@ def main() -> int:
             n_failed_cif += 1
             continue
 
-        rmsd, n_res, transform = align_template_to_reference(cif, reference_cif)
-        if transform is None:
+        # USalign on the template CIF onto the cofolding reference. Returns
+        # ``ref ≈ R @ pred + t`` plus TM-score and aligned-region RMSD.
+        # Structure-based alignment matches how foldseek originally ranked
+        # the hit, so distant homologs that gemmi's sequence-anchored
+        # superposition fails on get a correct transform here.
+        align = run_usalign(cif, reference_cif)
+        if align is None:
             n_failed_align += 1
             continue
-        # Quality gate: the gemmi superposition can succeed (transform != None)
-        # but with a tiny matched-residue set, producing a bogus rigid body
-        # that pushes ligand centroids tens of Å off the actual pocket. Drop
-        # these so consensus clustering doesn't get poisoned.
-        if rmsd > args.max_alignment_rmsd or n_res < args.min_aligned_residues:
+        R, t_vec, tm_score, rmsd_aligned = align
+        if tm_score < args.min_tmscore:
             n_low_quality_align += 1
             continue
         n_aligned += 1
 
         ligand_centroids = _ligand_centroids(cif, candidate_ccds)
         for lig in ligand_centroids:
-            tx, ty, tz = transform_position(transform, lig["x"], lig["y"], lig["z"])
+            tx, ty, tz = transform_point(R, t_vec, lig["x"], lig["y"], lig["z"])
             pockets.append(PocketPoint(
                 template_pdb_id=pdb_id,
                 template_chain=chain_id,
@@ -274,8 +278,8 @@ def main() -> int:
                 centroid_x=round(tx, 3),
                 centroid_y=round(ty, 3),
                 centroid_z=round(tz, 3),
-                alignment_rmsd=round(float(rmsd), 3),
-                aligned_residues=int(n_res),
+                alignment_tmscore=round(float(tm_score), 4),
+                alignment_rmsd=round(float(rmsd_aligned), 3),
                 in_mmseqs=row.get("in_mmseqs", "0") == "1",
                 in_foldseek=row.get("in_foldseek", "0") == "1",
                 pident=_safe_float(row.get("pident")),
@@ -292,13 +296,13 @@ def main() -> int:
 
     summary = {
         "reference_cif": str(reference_cif),
+        "alignment_tool": "USalign",
         "n_templates_attempted": len(rows),
         "n_templates_aligned": n_aligned,
         "n_failed_cif": n_failed_cif,
         "n_failed_align": n_failed_align,
         "n_low_quality_align": n_low_quality_align,
-        "max_alignment_rmsd": args.max_alignment_rmsd,
-        "min_aligned_residues": args.min_aligned_residues,
+        "min_tmscore": args.min_tmscore,
         "n_pockets": len(pockets),
         "pockets": [asdict(p) for p in pockets],
     }
@@ -306,7 +310,7 @@ def main() -> int:
     out_path.write_text(json.dumps(summary, indent=2))
     print(
         f"[pockets] wrote {len(pockets)} pockets from {n_aligned}/{len(rows)} aligned templates "
-        f"(low-quality dropped: {n_low_quality_align}, rmsd>{args.max_alignment_rmsd}Å or aligned<{args.min_aligned_residues} residues) → {out_path}"
+        f"(low-quality dropped: {n_low_quality_align}, tm_score < {args.min_tmscore}) → {out_path}"
     )
     return 0
 

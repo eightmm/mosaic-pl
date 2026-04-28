@@ -151,11 +151,13 @@ flowchart LR
 ```
 
 - **Script**: `scripts/extract_template_pockets.py`
-- **Reuses**: `collect_template_ions.py` 의 `find_template_cif`, `extract_cif`, `align_template_to_reference`, `transform_position`, `find_best_cofolding_structure` — 한 align 경로를 ion placement + pocket extraction 양쪽이 공유.
-- **Per-record 출력 필드** (`PocketPoint`): `template_pdb_id`, `template_chain`, `ligand_ccd`, `ligand_chain`, `ligand_n_heavy`, `centroid_(x|y|z)` (cofold frame), `alignment_rmsd`, `aligned_residues`, `in_mmseqs`, `in_foldseek`, `pident`, `qtmscore`, `best_tanimoto`, `best_mcs_coverage`.
-- **`--max-templates 100`** (default): hits>500 케이스에서 wall time 보호. filter 의 evidence sort 덕분에 both-source / 높은 TM-score / 높은 pident 가 우선 align 됨.
-- **Alignment quality 게이트** (`--max-alignment-rmsd 5.0`, `--min-aligned-residues 50`): `gemmi.calculate_superposition` 은 *sequence-anchored* (Needleman–Wunsch + matched-CA Kabsch). foldseek-only hit 이 fold 만 닮고 sequence 가 다르면 matched residue 가 30개 미만으로 떨어지고 RMSD 가 15+ Å 로 폭발 → ligand centroid 가 잘못된 위치로 transform 됨. 두 게이트가 그런 케이스를 drop. 같은-fold 진짜 homolog 는 보통 1-3 Å, 200+ residues 라 통과. 검증: 101m (myoglobin) 을 가짜 foldseek-only hit 으로 inject 했을 때 rmsd 16.7 Å, 34 residues → 정확히 drop 됨.
-- **Output**: `outputs/template_pockets/template_pockets.json`. 각 row 는 한 ligand-instance pocket point (homotetramer 라면 4개 binding site → 4 record). `n_low_quality_align` 필드에 게이트로 drop 된 갯수 기록.
+- **Alignment 도구**: `casp17.usalign.run_usalign` — `.local/bin/USalign` 호출. 구조 기반 (TM-align algorithm) 이라 foldseek 이 hit 을 찾은 logic 과 동일한 view. distant homolog 도 정확히 align (gemmi 는 sequence-anchored 라서 같은 fold 라도 sequence 멀면 matched residue <50 으로 떨어져 RMSD 15+ Å 로 폭발 → ligand centroid 가 엉뚱한 위치로 transform 됨; USalign 은 그 문제 없음).
+- **CIF 입력 직접 받음** (USalign 이 mmCIF/PDB auto-detect). RCSB 의 .cif.gz → `extract_cif` 로 풀어 `_extract_work/` 캐시한 다음 USalign 에 그대로 넘김.
+- **Per-record 출력 필드** (`PocketPoint`): `template_pdb_id`, `template_chain`, `ligand_ccd`, `ligand_chain`, `ligand_n_heavy`, `centroid_(x|y|z)` (cofold frame), `alignment_tmscore` (USalign reference-normalized), `alignment_rmsd` (aligned region only), `in_mmseqs`, `in_foldseek`, `pident`, `qtmscore`, `best_tanimoto`, `best_mcs_coverage`.
+- **`--max-templates 100`** (default): hits>500 케이스에서 wall time 보호. filter 의 evidence sort 덕분에 both-source / 높은 TM-score / 높은 pident 가 우선 align 됨. USalign ~3-5 s/template × 100 ≈ 5-8 min/타겟 — SLURM 12h 안에서 무시 가능.
+- **Alignment quality 게이트** (`--min-tmscore 0.4`, default): USalign 은 거의 항상 수렴하지만 corrupt CIF / chain-only-overlap 등 엣지 케이스 대비. 0.4 는 canonical 0.5 보다 약간 낮춰서 foldseek `qtmscore_min=0.5` 통과한 hit 을 이중 penalise 하지 않음. 검증: 101m (myoglobin) 을 가짜 qtm=0.72 으로 inject → 실제 USalign tm <0.4 (myoglobin vs 7htl 진짜 다른 fold) → drop. 같은-fold 진짜 homolog (8qrt, 78% pident): USalign tm=0.89, rmsd 1.21 Å → 통과.
+- **Multi-chain handling**: USalign 은 globally optimal chain matching 사용 (gemmi 는 chain A→A 고정). 호모테트라머 케이스에서 chain permutation 차이로 centroid 좌표가 달라질 수 있으나, **clustering (5 Å cutoff) 단계에서 같은 consensus pocket 으로 수렴**. 검증: 7htl (homotetramer) 에서 gemmi vs USalign 결과 top-2 cluster centroid 가 모두 (4.7-4.8, -2.0±0.5, 13-14) 와 (27, -7~-8, -21) 로 동일.
+- **Output**: `outputs/template_pockets/template_pockets.json`. 각 row 는 한 ligand-instance pocket point (homotetramer 라면 4개 binding site → 4 record). `n_low_quality_align` 필드에 게이트로 drop 된 갯수, `alignment_tool="USalign"` summary 필드에 수단 기록.
 
 ### Step 1-5: Pocket Clustering (Top-K Consensus)
 
