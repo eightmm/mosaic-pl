@@ -207,6 +207,56 @@ get there:
 
 ![RMSD distribution per family](figures/rmsd_dist_by_family.png)
 
+Same picture split by **difficulty zone** (novel / remote / related).
+Tells us whether the family hierarchy holds across difficulty or
+whether harder zones break the pattern:
+
+![RMSD distribution per family — by zone](figures/rmsd_dist_by_family_per_zone.png)
+
+Read-outs (zone facet):
+
+- **Family hierarchy is preserved across zones.** Cofold families
+  always sit at the bottom (closest to native), docking
+  (PxDock → Vina → ADG) middle, template-frame Vina at the top.
+  Difficulty hits *every* family proportionally, not just one.
+- **`novel` zone shows a bimodal long tail at 18-23 Å** — visible
+  in the density plot below as the secondary peak. That tail is
+  largely the Track 2 `template_*_vina` coordinate-frame artefact
+  (templates are evaluated against the cofold-frame crystal pose
+  but the docking outputs are in template frame). Fixed in this
+  session's `tune(track2)` commit.
+- **`remote` zone has the tightest distributions overall** — its
+  cofold IQR ends at ≈ 10 Å while `novel` and `related` reach
+  ≈ 12-13 Å. Consistent with the SR-by-zone finding (remote has
+  the highest oracle SR ≈ 73 %).
+- **`related` zone is wider than expected.** Despite > 50 % seq
+  id, related-zone cofolds reach a ~13 Å IQR top — likely because
+  some of the 130-member XChem fragment cluster falls here and
+  fragment-screen ligands are intrinsically hard.
+
+Pose-level density of `true_rmsd` per zone — overlaid so the
+absolute difficulty difference between zones is visible. The
+2 Å native cutoff is dashed; the per-zone native rate (% poses
+< 2 Å) appears in the legend:
+
+![RMSD density by zone](figures/rmsd_density_by_zone.png)
+
+Read-outs (density):
+
+- **Per-pose native rate**: novel 5.9 % < related 8.3 % ≈ remote 8.9 %.
+  Translates the per-target SR story to the per-pose level — even
+  the easier zones still produce > 90 % non-native poses.
+- **The novel-only secondary mode at 18-23 Å** is the smoking gun
+  for the Track 2 frame bug. After the `prepare_template_docking
+  --cofold-ref-cif` fix lands, we'd expect that mode to collapse
+  into the main 5-10 Å peak.
+- **All three zones share the same primary peak around 5-8 Å** —
+  the bulk distribution is dominated by docking poses (vina_*,
+  adg_*), so the absolute difficulty signal is small at the
+  pose level. Where zones really diverge is at the < 2 Å sharp
+  edge: novel has the lightest density right at 0-2 Å, remote
+  the heaviest.
+
 - **`cofold_protenix`** is the only family whose box overlaps the
   2 Å line — most of its mass is sub-5 Å.
 - **`template_8p8k_vina` etc.** sit at 23 Å median — the

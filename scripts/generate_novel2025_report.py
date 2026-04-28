@@ -17,7 +17,6 @@ is mutated. Re-run any time the SR / cluster artefacts get refreshed.
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 
 import matplotlib
@@ -136,7 +135,6 @@ def chart_cluster_size_dist(clusters: pd.DataFrame, out: Path) -> None:
     fig, ax = plt.subplots(figsize=(7.5, 3.8))
     bins = [1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144]
     counts, edges = np.histogram(sizes, bins=bins)
-    centers = (edges[:-1] + edges[1:]) / 2
     ax.bar(range(len(counts)), counts, width=0.85, color="#7e6cd5")
     ax.set_xticks(range(len(counts)))
     ax.set_xticklabels([f"{int(edges[i])}–{int(edges[i+1])-1}"
@@ -364,6 +362,70 @@ def chart_native_rate_by_family(per_pose: pd.DataFrame, out: Path) -> None:
                 f"{rate * 100:.1f} %  (n={int(n_poses):,})",
                 va="center", fontsize=8.5)
     ax.set_xlim(0, grouped["rate"].max() * 100 * 1.25)
+    _save(fig, out)
+
+
+def chart_rmsd_density_by_zone(per_pose: pd.DataFrame, out: Path) -> None:
+    """Overlaid density of ``true_rmsd`` per difficulty zone. Tells you
+    how hard each zone is in *absolute pose-quality* terms — a zone
+    with a fat right tail has lots of mis-docked poses, a zone with
+    most of the mass below 2 Å is "easy"."""
+    df = per_pose.dropna(subset=["true_rmsd", "seq_zone"])
+    df = df[df["true_rmsd"] <= 30].copy()
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    bins = np.linspace(0, 25, 80)
+    palette = {"novel": "#d44", "remote": "#5b8def", "related": "#7fbf7b"}
+    for zone in ("novel", "remote", "related"):
+        sub = df[df.seq_zone == zone]
+        if sub.empty:
+            continue
+        ax.hist(sub["true_rmsd"], bins=bins, density=True, alpha=0.5,
+                color=palette.get(zone, "#888"),
+                label=f"{zone}  (n={len(sub):,} poses, "
+                      f"native {(sub.true_rmsd < 2.0).mean():.1%})")
+    ax.axvline(2.0, color="#444", linestyle="--", linewidth=1, label="2 Å native cutoff")
+    ax.set_xlabel("true_rmsd (Å)")
+    ax.set_ylabel("density")
+    ax.set_title("Pose-level true_rmsd density by zone")
+    ax.legend(frameon=False)
+    _save(fig, out)
+
+
+def chart_rmsd_dist_by_family_per_zone(per_pose: pd.DataFrame, out: Path) -> None:
+    """Per-zone faceted boxplot of ``true_rmsd`` by source family.
+    Shows whether the family hierarchy holds across difficulty
+    (cofold > pxdock > vina > adg) or whether harder zones break the
+    pattern."""
+    df = _add_family(per_pose).dropna(subset=["true_rmsd", "seq_zone"])
+    df = df[df["true_rmsd"] <= 30].copy()
+    family_counts = df["family"].value_counts()
+    keep_families = family_counts[family_counts >= 500].index.tolist()
+    df = df[df["family"].isin(keep_families)].copy()
+    median_order = df.groupby("family")["true_rmsd"].median().sort_values().index
+    zones = ("novel", "remote", "related")
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5.0), sharey=True)
+    palette = {"novel": "#d44", "remote": "#5b8def", "related": "#7fbf7b"}
+    n_fam = len(median_order)
+    for ax, zone in zip(axes, zones):
+        sub = df[df.seq_zone == zone]
+        # Always pass len(median_order) groups so positions stay aligned —
+        # missing families come through as empty arrays and the boxplot
+        # collapses to a flat line at that position.
+        data = [sub.loc[sub.family == f, "true_rmsd"].values
+                if (sub.family == f).any() else np.array([np.nan])
+                for f in median_order]
+        bp = ax.boxplot(data, vert=False, widths=0.6, patch_artist=True,
+                        showfliers=False, positions=list(range(1, n_fam + 1)))
+        for patch in bp["boxes"]:
+            patch.set_facecolor(palette[zone])
+            patch.set_alpha(0.65)
+        ax.axvline(2.0, color="#444", linestyle="--", linewidth=1.0)
+        ax.set_yticks(range(1, n_fam + 1))
+        ax.set_yticklabels(list(median_order))
+        ax.set_xlabel("true_rmsd (Å)")
+        ax.set_title(f"{zone}  (n_targets={sub.target.nunique()})")
+    fig.suptitle("true_rmsd by source family — split by zone", y=1.02)
     _save(fig, out)
 
 
@@ -768,6 +830,56 @@ get there:
 
 ![RMSD distribution per family]({figures['rmsd_dist_by_family'].relative_to(md_path.parent)})
 
+Same picture split by **difficulty zone** (novel / remote / related).
+Tells us whether the family hierarchy holds across difficulty or
+whether harder zones break the pattern:
+
+![RMSD distribution per family — by zone]({figures['rmsd_dist_by_family_per_zone'].relative_to(md_path.parent)})
+
+Read-outs (zone facet):
+
+- **Family hierarchy is preserved across zones.** Cofold families
+  always sit at the bottom (closest to native), docking
+  (PxDock → Vina → ADG) middle, template-frame Vina at the top.
+  Difficulty hits *every* family proportionally, not just one.
+- **`novel` zone shows a bimodal long tail at 18-23 Å** — visible
+  in the density plot below as the secondary peak. That tail is
+  largely the Track 2 `template_*_vina` coordinate-frame artefact
+  (templates are evaluated against the cofold-frame crystal pose
+  but the docking outputs are in template frame). Fixed in this
+  session's `tune(track2)` commit.
+- **`remote` zone has the tightest distributions overall** — its
+  cofold IQR ends at ≈ 10 Å while `novel` and `related` reach
+  ≈ 12-13 Å. Consistent with the SR-by-zone finding (remote has
+  the highest oracle SR ≈ 73 %).
+- **`related` zone is wider than expected.** Despite > 50 % seq
+  id, related-zone cofolds reach a ~13 Å IQR top — likely because
+  some of the 130-member XChem fragment cluster falls here and
+  fragment-screen ligands are intrinsically hard.
+
+Pose-level density of `true_rmsd` per zone — overlaid so the
+absolute difficulty difference between zones is visible. The
+2 Å native cutoff is dashed; the per-zone native rate (% poses
+< 2 Å) appears in the legend:
+
+![RMSD density by zone]({figures['rmsd_density_by_zone'].relative_to(md_path.parent)})
+
+Read-outs (density):
+
+- **Per-pose native rate**: novel 5.9 % < related 8.3 % ≈ remote 8.9 %.
+  Translates the per-target SR story to the per-pose level — even
+  the easier zones still produce > 90 % non-native poses.
+- **The novel-only secondary mode at 18-23 Å** is the smoking gun
+  for the Track 2 frame bug. After the `prepare_template_docking
+  --cofold-ref-cif` fix lands, we'd expect that mode to collapse
+  into the main 5-10 Å peak.
+- **All three zones share the same primary peak around 5-8 Å** —
+  the bulk distribution is dominated by docking poses (vina_*,
+  adg_*), so the absolute difficulty signal is small at the
+  pose level. Where zones really diverge is at the < 2 Å sharp
+  edge: novel has the lightest density right at 0-2 Å, remote
+  the heaviest.
+
 - **`cofold_protenix`** is the only family whose box overlaps the
   2 Å line — most of its mass is sub-5 Å.
 - **`template_8p8k_vina` etc.** sit at 23 Å median — the
@@ -898,6 +1010,12 @@ def main() -> int:
 
     figures["rmsd_dist_by_family"] = figs_dir / "rmsd_dist_by_family.png"
     chart_rmsd_dist_by_family(per_pose, figures["rmsd_dist_by_family"])
+
+    figures["rmsd_density_by_zone"] = figs_dir / "rmsd_density_by_zone.png"
+    chart_rmsd_density_by_zone(per_pose, figures["rmsd_density_by_zone"])
+
+    figures["rmsd_dist_by_family_per_zone"] = figs_dir / "rmsd_dist_by_family_per_zone.png"
+    chart_rmsd_dist_by_family_per_zone(per_pose, figures["rmsd_dist_by_family_per_zone"])
 
     figures["score_split_native"] = figs_dir / "score_split_native.png"
     chart_score_split_native(per_pose, figures["score_split_native"])

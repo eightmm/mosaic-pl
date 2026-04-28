@@ -24,6 +24,54 @@ import subprocess
 import sys
 from pathlib import Path
 
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "src"))
+
+
+def _usalign_template_to_cofold(template_cif: Path, cofold_cif: Path):
+    """Return ``(R, t, tm, rmsd)`` aligning ``template`` onto ``cofold``.
+
+    Wraps ``casp17.usalign.run_usalign``. Returns ``None`` on failure;
+    callers decide whether to fall back to no-transform (legacy behaviour).
+    """
+    try:
+        from casp17.usalign import run_usalign
+    except Exception as e:
+        print(f"  WARNING: casp17.usalign unavailable ({e}); skipping transform")
+        return None
+    return run_usalign(template_cif, cofold_cif)
+
+
+def _transform_cif_in_place(cif_path: Path, R, t) -> bool:
+    """Apply ``ref ≈ R @ pred + t`` to every atom in the CIF, in place.
+    Used to put a template structure into cofold frame *before* it gets
+    converted to receptor PDB / ligand SDF — that way every downstream
+    file (receptor.pdb, receptor.pdbqt, template_ligand_*.sdf, vina/adg
+    outputs) inherits the cofold coordinate system automatically.
+    """
+    try:
+        import gemmi
+        import numpy as np
+    except Exception as e:
+        print(f"  WARNING: gemmi/numpy unavailable ({e}); cannot transform")
+        return False
+    try:
+        st = gemmi.read_structure(str(cif_path))
+        R = np.asarray(R, dtype=float)
+        t = np.asarray(t, dtype=float)
+        for model in st:
+            for chain in model:
+                for residue in chain:
+                    for atom in residue:
+                        v = np.asarray([atom.pos.x, atom.pos.y, atom.pos.z])
+                        v2 = R @ v + t
+                        atom.pos = gemmi.Position(float(v2[0]), float(v2[1]), float(v2[2]))
+        st.make_mmcif_document().write_file(str(cif_path))
+        return True
+    except Exception as e:
+        print(f"  WARNING: CIF transform failed for {cif_path}: {e}")
+        return False
+
 
 def find_template_cif(pdb_id: str, rcsb_dir: Path) -> Path | None:
     """Find CIF file for a PDB ID in the RCSB raw data directory."""
@@ -79,13 +127,11 @@ def extract_template_ligand_sdf(cif_path: Path, ligand_ccd: str, output_sdf: Pat
 
     structure = gemmi.read_structure(str(cif_path))
     target_residue = None
-    target_chain = None
     for model in structure:
         for chain in model:
             for residue in chain:
                 if residue.name == ligand_ccd:
                     target_residue = residue
-                    target_chain = chain
                     break
             if target_residue:
                 break
@@ -299,6 +345,16 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--max-templates", type=int, default=3, help="Max templates to prepare.")
     parser.add_argument("--box-size", type=float, default=22.5)
+    parser.add_argument(
+        "--cofold-ref-cif", type=Path, default=None,
+        help="Path to the cofolding reference CIF (e.g. the best aligned "
+             "model). When provided, every template CIF is USalign'd onto "
+             "this reference and rewritten in cofold frame *before* "
+             "receptor.pdb / template_ligand SDF / docking inputs are "
+             "generated. Without this, Track 2 outputs land in template "
+             "frame and downstream RMSD evaluation against the cofold-frame "
+             "crystal pose returns garbage (~23 Å mean error)."
+    )
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -340,6 +396,28 @@ def main() -> int:
 
         cif = extract_cif(cif_path, template_dir)
         print(f"  Extracted: {cif.name}")
+
+        # Move the template CIF into cofold frame BEFORE we extract the
+        # receptor PDB / ligand SDF / dock against it. This is the only
+        # transform — every downstream artefact (receptor.pdb, .pdbqt,
+        # template_ligand_*.sdf, docked.pdbqt, docked.dlg, lig-align SDF)
+        # then lives in cofold frame and matches the crystal-pose RMSD
+        # evaluator's expectations.
+        if args.cofold_ref_cif is not None and args.cofold_ref_cif.exists():
+            align = _usalign_template_to_cofold(cif, args.cofold_ref_cif)
+            if align is None:
+                print(f"  WARNING: USalign({pdb_id} → cofold) failed; "
+                      "Track 2 outputs will be in template frame")
+            else:
+                R, t, tm_score, _aligned_rmsd = align
+                if tm_score < 0.4:
+                    print(f"  WARNING: low USalign TM={tm_score:.3f} for {pdb_id}; "
+                          "transform may be unreliable")
+                if _transform_cif_in_place(cif, R, t):
+                    print(f"  Applied template→cofold transform "
+                          f"(USalign TM={tm_score:.3f})")
+                else:
+                    print("  WARNING: failed to rewrite CIF in cofold frame")
 
         # Extract ligand center for docking box
         center = None

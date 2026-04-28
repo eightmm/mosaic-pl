@@ -26,17 +26,23 @@ import sys
 from pathlib import Path
 
 
-def check_mcs_hits(hits_tsv: Path, threshold: float) -> list[dict]:
-    """Return template hits with best_mcs_coverage >= threshold."""
+def check_template_hits(hits_tsv: Path) -> list[dict]:
+    """Return template hits with at least one bound ligand.
+
+    Track 2 (template-based box docking) only needs the template's
+    receptor pocket geometry — the template ligand's atom graph doesn't
+    have to match the query. Any template with a bound ligand gives a
+    usable box. The MCS threshold only gates Track 3 (lig-MCS-align),
+    which actually overlays the template ligand atoms onto the query.
+    """
     if not hits_tsv.exists():
         return []
     hits = []
     with open(hits_tsv) as f:
         reader = csv.DictReader(f, delimiter="\t")
         for row in reader:
-            mcs = float(row.get("best_mcs_coverage", 0))
             num_lig = int(row.get("num_ligands", 0))
-            if mcs >= threshold and num_lig > 0:
+            if num_lig > 0:
                 hits.append(row)
     return hits
 
@@ -48,6 +54,7 @@ def run_template_docking_prep(
     output_dir: Path,
     rcsb_db: Path | None = None,
     max_templates: int = 3,
+    cofold_ref_cif: Path | None = None,
 ) -> list[dict]:
     """Run prepare_template_docking.py and return template summaries."""
     script = Path(__file__).resolve().parent / "prepare_template_docking.py"
@@ -59,6 +66,8 @@ def run_template_docking_prep(
         "--output-dir", str(output_dir),
         "--max-templates", str(max_templates),
     ]
+    if cofold_ref_cif is not None:
+        cmd += ["--cofold-ref-cif", str(cofold_ref_cif)]
     print(f"  Running: {' '.join(cmd)}")
     result = subprocess.run(cmd, text=True, capture_output=True)
     print(result.stdout)
@@ -245,10 +254,19 @@ def run_protenix_dock_on_template(
         return None
 
 
+_MAIN_VENV_PYTHON = Path(__file__).resolve().parent.parent / ".venv" / "bin" / "python"
+
+
 def run_lig_align_on_template(
     template: dict, target_smiles: str, output_dir: Path
 ) -> dict | None:
-    """Run lig-align: MCS-guided pose generation from template ligand."""
+    """Run lig-align: MCS-guided pose generation from template ligand.
+
+    ``lig_align`` is only installed in the main ``.venv`` (it needs a
+    different torch/rdkit stack than the protenix-dock venv this script
+    runs in). We shell out to that interpreter via a small inline driver
+    so the import happens in the correct environment.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
 
     receptor_pdb = template.get("receptor_pdb_raw") or template.get("receptor_pdb")
@@ -260,35 +278,79 @@ def run_lig_align_on_template(
     if not ref_ligand_sdf or not Path(ref_ligand_sdf).exists():
         print("    lig-align: template ligand SDF not found, skipping.")
         return None
-
-    try:
-        from lig_align import run_pipeline
-
-        result = run_pipeline(
-            protein_pdb=str(receptor_pdb),
-            ref_ligand=str(ref_ligand_sdf),
-            query_ligand=target_smiles,
-            output_dir=str(output_dir),
-            num_confs=1000,
-            mcs_mode="auto",
-            optimize=True,
-            weight_preset="vina",
-            top_k=10,
-            verbose=True,
-        )
-        print(f"    lig-align: {result.get('num_poses', 0)} poses, "
-              f"best_score={result.get('best_score', 'N/A')}")
-        return {
-            "tool": "lig_align",
-            "output": result.get("output_file"),
-            "num_poses": result.get("num_poses"),
-            "best_score": result.get("best_score"),
-            "mcs_size": result.get("mcs_size"),
-            "template_pdb_id": template.get("template_pdb_id"),
-        }
-    except Exception as e:
-        print(f"    lig-align failed: {e}")
+    if not _MAIN_VENV_PYTHON.exists():
+        print(f"    lig-align: main venv python not found at {_MAIN_VENV_PYTHON}, skipping.")
         return None
+
+    payload = {
+        "protein_pdb": str(receptor_pdb),
+        "ref_ligand": str(ref_ligand_sdf),
+        "query_ligand": target_smiles,
+        "output_dir": str(output_dir),
+    }
+    # num_confs + optimize=False chosen so a 3-template run stays inside a
+    # 10-min per-target budget on CPU. Production lig_align with optimize=True
+    # was observed to exceed 90min on some pockets — well outside what the
+    # wrapper's SLURM 12h cap can afford across Track 2 (vina + adg) and this
+    # stage combined.
+    driver = (
+        "import json, sys\n"
+        "from lig_align import run_pipeline\n"
+        "args = json.loads(sys.stdin.read())\n"
+        "result = run_pipeline(\n"
+        "    protein_pdb=args['protein_pdb'],\n"
+        "    ref_ligand=args['ref_ligand'],\n"
+        "    query_ligand=args['query_ligand'],\n"
+        "    output_dir=args['output_dir'],\n"
+        "    num_confs=500,\n"
+        "    mcs_mode='auto',\n"
+        "    optimize=False,\n"
+        "    weight_preset='vina',\n"
+        "    top_k=5,\n"
+        "    verbose=False,\n"
+        ")\n"
+        "print('__LIG_ALIGN_RESULT__' + json.dumps({\n"
+        "    'output_file': result.get('output_file'),\n"
+        "    'num_poses': result.get('num_poses'),\n"
+        "    'best_score': result.get('best_score'),\n"
+        "    'mcs_size': result.get('mcs_size'),\n"
+        "}))\n"
+    )
+    try:
+        proc = subprocess.run(
+            [str(_MAIN_VENV_PYTHON), "-c", driver],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            timeout=900,
+        )
+    except subprocess.TimeoutExpired:
+        print("    lig-align: timed out after 900s")
+        return None
+    if proc.returncode != 0:
+        tail = proc.stderr.strip().splitlines()[-3:] if proc.stderr else []
+        print(f"    lig-align failed (exit {proc.returncode}): {' | '.join(tail)}")
+        return None
+    marker = "__LIG_ALIGN_RESULT__"
+    line = next((l for l in proc.stdout.splitlines() if l.startswith(marker)), None)
+    if line is None:
+        print("    lig-align: driver produced no result marker")
+        return None
+    try:
+        result = json.loads(line[len(marker):])
+    except json.JSONDecodeError as e:
+        print(f"    lig-align: failed to parse driver output: {e}")
+        return None
+    print(f"    lig-align: {result.get('num_poses', 0)} poses, "
+          f"best_score={result.get('best_score', 'N/A')}")
+    return {
+        "tool": "lig_align",
+        "output": result.get("output_file"),
+        "num_poses": result.get("num_poses"),
+        "best_score": result.get("best_score"),
+        "mcs_size": result.get("mcs_size"),
+        "template_pdb_id": template.get("template_pdb_id"),
+    }
 
 
 def extract_target_smiles(input_yaml: Path) -> list[tuple[str, str]]:
@@ -324,6 +386,11 @@ def main() -> int:
     parser.add_argument("--mcs-threshold", type=float, default=0.5)
     parser.add_argument("--max-templates", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--skip-pxdock",
+        action="store_true",
+        help="Skip Protenix-Dock in Track 2 (keeps Vina + ADG + lig-MCS-align).",
+    )
     args = parser.parse_args()
 
     run_dir = args.run_dir.resolve()
@@ -352,15 +419,15 @@ def main() -> int:
         )
 
     # 2. Check MCS threshold
-    qualifying_hits = check_mcs_hits(hits_tsv, args.mcs_threshold)
+    qualifying_hits = check_template_hits(hits_tsv)
     if not qualifying_hits:
-        print(f"No template hits with MCS >= {args.mcs_threshold}, "
-              "skipping Track 2 + Track 3.")
+        print("No template hits with bound ligands, skipping Track 2 + Track 3.")
         return 0
 
     print(f"\n{'='*60}")
-    print(f"  MULTI-TRACK DOCKING: {len(qualifying_hits)} templates with "
-          f"MCS >= {args.mcs_threshold}")
+    print(f"  MULTI-TRACK DOCKING: {len(qualifying_hits)} templates available")
+    print(f"  (Track 2: all templates; Track 3 lig-MCS-align: MCS >= "
+          f"{args.mcs_threshold} only)")
     print(f"{'='*60}")
 
     # 3. Extract target SMILES
@@ -372,6 +439,32 @@ def main() -> int:
 
     # 4. Prepare template docking inputs
     template_dock_dir = run_dir / "inputs" / "template_docking"
+    # Resolve cofold reference CIF — Track 1 docking-prep already picked
+    # one best model and recorded it in docking_prep_summary.cofolding_structure.
+    # Honour that pick so Track 2 lands in the same coordinate frame Track 1
+    # uses; otherwise the eval transform (cofold→crystal) misplaces every
+    # Track 2 pose by ~20 Å.
+    cofold_ref_cif: Path | None = None
+    prep_summary = run_dir / "inputs" / "docking" / "docking_prep_summary.json"
+    if prep_summary.exists():
+        try:
+            data = json.loads(prep_summary.read_text())
+            cof_path = data.get("cofolding_structure")
+            if cof_path and Path(cof_path).exists():
+                cofold_ref_cif = Path(cof_path)
+        except Exception:
+            cofold_ref_cif = None
+    if cofold_ref_cif is None:
+        # Fallback: first aligned cofold cif we can find.
+        candidates = sorted((run_dir / "outputs").rglob("*_aligned.cif"))
+        if candidates:
+            cofold_ref_cif = candidates[0]
+    if cofold_ref_cif is not None:
+        print(f"  cofold reference: {cofold_ref_cif}")
+    else:
+        print("  WARNING: no cofold reference found; Track 2 outputs will "
+              "stay in template frame (eval will be wrong)")
+
     templates = run_template_docking_prep(
         hits_tsv=hits_tsv,
         rcsb_dir=args.rcsb_dir,
@@ -379,6 +472,7 @@ def main() -> int:
         output_dir=template_dock_dir,
         rcsb_db=args.rcsb_db,
         max_templates=args.max_templates,
+        cofold_ref_cif=cofold_ref_cif,
     )
     if not templates:
         print("Template docking prep produced no templates.")
@@ -413,19 +507,28 @@ def main() -> int:
         if adg_result:
             all_results.append(adg_result)
 
-        pxdock_result = run_protenix_dock_on_template(
-            template, template_out / "protenix_dock", seed=args.seed,
-        )
-        if pxdock_result:
-            all_results.append(pxdock_result)
+        if args.skip_pxdock:
+            print("    Protenix-Dock: skipped (--skip-pxdock).")
+        else:
+            pxdock_result = run_protenix_dock_on_template(
+                template, template_out / "protenix_dock", seed=args.seed,
+            )
+            if pxdock_result:
+                all_results.append(pxdock_result)
 
-        # Track 3: lig-align
-        print("\n  --- Track 3: lig-align (MCS-guided) ---")
-        lig_align_result = run_lig_align_on_template(
-            template, target_smiles, template_out / "lig_align",
-        )
-        if lig_align_result:
-            all_results.append(lig_align_result)
+        # Track 3: lig-MCS-align — gated by MCS threshold because it
+        # performs an actual atom-mapped overlay of the template ligand.
+        # Below threshold the MCS is too small to produce a meaningful
+        # alignment; skip rather than emit a low-quality pose.
+        if mcs >= args.mcs_threshold:
+            print(f"\n  --- Track 3: lig-MCS-align (MCS={mcs:.2f} >= {args.mcs_threshold}) ---")
+            lig_align_result = run_lig_align_on_template(
+                template, target_smiles, template_out / "lig_align",
+            )
+            if lig_align_result:
+                all_results.append(lig_align_result)
+        else:
+            print(f"\n  --- Track 3: skipped (MCS={mcs:.2f} < {args.mcs_threshold}) ---")
 
     # 6. Write summary
     summary = {
