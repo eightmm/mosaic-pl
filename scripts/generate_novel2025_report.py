@@ -209,6 +209,265 @@ def chart_pose_pool_per_target(unified: pd.DataFrame, out: Path) -> None:
     _save(fig, out)
 
 
+def _add_family(df: pd.DataFrame) -> pd.DataFrame:
+    """Strip ligand id + seed/sample suffix off ``source`` so the
+    per-pose CSV gets the same family bucket as the unified manifest."""
+    out = df.copy()
+    fam = out["source"].str.replace(r"_(L\d*|X\d*)$", "", regex=True)
+    fam = fam.str.replace(r"_seed[_-]\d+.*", "", regex=True)
+    out["family"] = fam
+    return out
+
+
+_SCORER_DEF = [
+    # (column_name, label, polarity)
+    # polarity = +1 means "higher is better" (sort descending);
+    # polarity = -1 means "lower is better" (sort ascending).
+    ("lscore", "lscore", +1),
+    ("plddt", "pLDDT", +1),
+    ("conf", "conf", +1),
+    ("iptm", "ipTM", +1),
+    ("ptm", "pTM", +1),
+    ("ba_pred_pkd", "BA-Pred pKd", +1),
+    ("prmsd", "RMSD-Pred (raw)", -1),
+    ("boltz_aff_log10_kd_nM", "Boltz log10(Kd[nM])", -1),
+    ("boltz_binder_prob", "Boltz binder prob", +1),
+]
+
+
+def chart_scorer_correlations(per_pose: pd.DataFrame, out: Path) -> None:
+    """Per-target Spearman ρ between each scorer and ``true_rmsd``,
+    median over targets. Negative ρ means the scorer is a usable
+    ranker for "low rmsd = good"; positive means inverted (e.g.
+    raw RMSD-Pred is low when good, so ρ vs rmsd is +).
+
+    Per-target is the right unit because cross-target absolute
+    score comparisons are noisy (each target has a different scoring
+    regime; what matters is whether the scorer ranks within-target).
+    """
+    rows = []
+    df = per_pose.dropna(subset=["true_rmsd"])
+    for col, label, polarity in _SCORER_DEF:
+        if col not in df.columns:
+            continue
+        rhos = []
+        for t, g in df.groupby("target"):
+            sub = g.dropna(subset=[col])
+            if len(sub) < 5:
+                continue
+            r = sub[col].corr(sub["true_rmsd"], method="spearman")
+            if pd.notna(r):
+                rhos.append(r)
+        if not rhos:
+            continue
+        rhos = np.asarray(rhos)
+        rows.append({
+            "scorer": label,
+            "polarity": polarity,
+            "median_spearman": float(np.median(rhos)),
+            "p25": float(np.percentile(rhos, 25)),
+            "p75": float(np.percentile(rhos, 75)),
+            "n_targets": len(rhos),
+        })
+    res = pd.DataFrame(rows)
+    # Want "best ranker" on top. Multiply by polarity so the bar height
+    # uniformly reads "lower-rmsd correlated with higher score".
+    res["effective_rho"] = -res["median_spearman"] * res["polarity"]
+    res = res.sort_values("effective_rho", ascending=False)
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    y = np.arange(len(res))
+    colors = ["#5b8def" if v >= 0 else "#d44" for v in res["effective_rho"]]
+    ax.barh(y, res["effective_rho"], color=colors)
+    # IQR whiskers, transformed by polarity.
+    for i, row in enumerate(res.itertuples(index=False)):
+        eff_lo = -row.p75 * row.polarity
+        eff_hi = -row.p25 * row.polarity
+        if eff_lo > eff_hi:
+            eff_lo, eff_hi = eff_hi, eff_lo
+        ax.plot([eff_lo, eff_hi], [i, i], color="#444", linewidth=1.0)
+    ax.set_yticks(y)
+    ax.set_yticklabels([f"{r.scorer}  (n={r.n_targets})" for r in res.itertuples(index=False)])
+    ax.invert_yaxis()
+    ax.axvline(0, color="#888", linewidth=0.8)
+    ax.set_xlabel("median per-target Spearman ρ vs true_rmsd  (× polarity)\n"
+                  "→ higher = better ranker; whiskers = IQR over targets")
+    ax.set_title("Scorer ranking power within target (per-target Spearman)")
+    _save(fig, out)
+
+
+def chart_topk_hit_rate(per_pose: pd.DataFrame, out: Path) -> None:
+    """For each scorer, per target take its top-K poses, mark a hit
+    if ANY of those K is < 2 Å. Average over targets gives
+    "Best-of-top-K SR by scorer" — directly comparable to the
+    production ranker's Top-1 / Top-5 numbers.
+    """
+    df = per_pose.dropna(subset=["true_rmsd"])
+    Ks = [1, 2, 3, 5, 10, 20, 50, 100]
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    palette = plt.get_cmap("tab10")
+    line_idx = 0
+    for col, label, polarity in _SCORER_DEF:
+        if col not in df.columns:
+            continue
+        sub = df.dropna(subset=[col])
+        if sub.empty:
+            continue
+        # Sort each target's poses in the scorer's preference order.
+        ascending = polarity == -1
+        sub = sub.sort_values(["target", col], ascending=[True, ascending])
+        sr_curve = []
+        for k in Ks:
+            head = sub.groupby("target", as_index=False, sort=False).head(k)
+            hit = (head.groupby("target")["true_rmsd"].min() < 2.0).mean()
+            sr_curve.append(hit * 100)
+        ax.plot(Ks, sr_curve, marker="o", linewidth=2,
+                color=palette(line_idx % 10), label=label)
+        line_idx += 1
+    # Reference: oracle ceiling
+    n_targets = df["target"].nunique()
+    oracle = (df.groupby("target")["true_rmsd"].min() < 2.0).mean() * 100
+    ax.axhline(oracle, color="#444", linestyle="--", linewidth=1,
+               label=f"oracle ceiling ({oracle:.1f} %, n={n_targets})")
+    ax.set_xscale("log")
+    ax.set_xticks(Ks)
+    ax.set_xticklabels(Ks)
+    ax.set_xlabel("Top-K poses retained per target")
+    ax.set_ylabel("% targets with at least one < 2 Å pose in top-K")
+    ax.set_title("Best-of-top-K SR by scorer (per-target)")
+    ax.legend(loc="lower right", frameon=False, fontsize=9)
+    _save(fig, out)
+
+
+def chart_native_rate_by_family(per_pose: pd.DataFrame, out: Path) -> None:
+    """% of each family's poses that are < 2 Å. Tells us which family
+    *generates* native poses the most often (independent of scoring).
+    """
+    df = _add_family(per_pose).dropna(subset=["true_rmsd"])
+    grouped = df.groupby("family").agg(
+        n=("true_rmsd", "size"),
+        native=("true_rmsd", lambda x: (x < 2.0).sum()),
+    )
+    grouped["rate"] = grouped["native"] / grouped["n"]
+    grouped = grouped[grouped["n"] >= 500].sort_values("rate", ascending=False)
+
+    fig, ax = plt.subplots(figsize=(8.5, 5.0))
+    y = np.arange(len(grouped))
+    bars = ax.barh(y, grouped["rate"] * 100, color="#7e6cd5")
+    ax.set_yticks(y)
+    ax.set_yticklabels(grouped.index)
+    ax.invert_yaxis()
+    ax.set_xlabel("% of poses with true_rmsd < 2 Å")
+    ax.set_title("Native rate per source family  (families with ≥ 500 poses)")
+    for bar, rate, n_poses in zip(bars, grouped["rate"], grouped["n"]):
+        ax.text(rate * 100 + 0.3, bar.get_y() + bar.get_height() / 2,
+                f"{rate * 100:.1f} %  (n={int(n_poses):,})",
+                va="center", fontsize=8.5)
+    ax.set_xlim(0, grouped["rate"].max() * 100 * 1.25)
+    _save(fig, out)
+
+
+def chart_rmsd_dist_by_family(per_pose: pd.DataFrame, out: Path) -> None:
+    """Box+strip plot of true_rmsd per family. Outliers clipped at 30 Å
+    so the long tail doesn't squash the boxes."""
+    df = _add_family(per_pose).dropna(subset=["true_rmsd"])
+    df = df[df["true_rmsd"] <= 30].copy()
+    family_counts = df["family"].value_counts()
+    keep_families = family_counts[family_counts >= 500].index.tolist()
+    df = df[df["family"].isin(keep_families)].copy()
+    median_order = df.groupby("family")["true_rmsd"].median().sort_values().index
+    df["family"] = pd.Categorical(df["family"], list(median_order))
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    data = [df.loc[df.family == f, "true_rmsd"].values for f in median_order]
+    bp = ax.boxplot(data, vert=False, widths=0.6, patch_artist=True,
+                    showfliers=False)
+    for patch in bp["boxes"]:
+        patch.set_facecolor("#5b8def")
+        patch.set_alpha(0.7)
+    ax.axvline(2.0, color="#d44", linestyle="--", linewidth=1.0,
+               label="2 Å native cutoff")
+    ax.set_yticklabels(median_order)
+    ax.set_xlabel("true_rmsd (Å)")
+    ax.set_title("true_rmsd distribution per source family  (boxplot, IQR)")
+    ax.legend(loc="lower right", frameon=False)
+    _save(fig, out)
+
+
+def chart_score_split_native(per_pose: pd.DataFrame, out: Path) -> None:
+    """For each scorer, two histograms overlaid: native poses (rmsd<2)
+    in green, non-native in grey. If the two distributions overlap
+    heavily the scorer is weak; if they separate cleanly it's strong.
+    """
+    scorers = [(c, lab, pol) for c, lab, pol in _SCORER_DEF
+               if c in per_pose.columns]
+    n = len(scorers)
+    cols = 3
+    rows = (n + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(13, 3.0 * rows), squeeze=False)
+    df = per_pose.dropna(subset=["true_rmsd"])
+    for idx, (col, label, polarity) in enumerate(scorers):
+        ax = axes[idx // cols][idx % cols]
+        sub = df.dropna(subset=[col])
+        if sub.empty:
+            ax.axis("off")
+            continue
+        native = sub.loc[sub["true_rmsd"] < 2.0, col]
+        non_nat = sub.loc[sub["true_rmsd"] >= 2.0, col]
+        bins = np.linspace(np.nanpercentile(sub[col], 1),
+                           np.nanpercentile(sub[col], 99), 50)
+        ax.hist(non_nat, bins=bins, color="#bdbdbd", alpha=0.85,
+                label=f"≥ 2 Å  (n={len(non_nat):,})", density=True)
+        ax.hist(native, bins=bins, color="#7fbf7b", alpha=0.85,
+                label=f"< 2 Å  (n={len(native):,})", density=True)
+        ax.set_title(label)
+        ax.set_xlabel(label)
+        ax.set_ylabel("density")
+        ax.legend(loc="best", fontsize=8, frameon=False)
+    # blank any unused axes
+    for j in range(len(scorers), rows * cols):
+        axes[j // cols][j % cols].axis("off")
+    fig.suptitle("Score distribution: native (green) vs non-native (grey)", y=1.0)
+    _save(fig, out)
+
+
+def chart_zone_family_contribution(
+    per_pose: pd.DataFrame, out: Path
+) -> None:
+    """Per-zone, % of (target, ligand) top-1 picks coming from each family.
+    Stacked bar — shows whether some zones favour cofold winners and
+    others docking winners.
+    """
+    df = _add_family(per_pose).dropna(subset=["lscore"])
+    if df.empty:
+        return
+    # Per (target, ligand_id) top-1 by lscore. We approximate ligand_id
+    # by the trailing _L\d* tag of source.
+    df["ligand_id"] = df["source"].str.extract(r"_(L\d*)$").fillna("L")
+    top = df.loc[df.groupby(["target", "ligand_id"])["lscore"].idxmax()].copy()
+
+    counts = top.groupby(["seq_zone", "family"]).size().unstack(fill_value=0)
+    counts = counts.loc[["novel", "remote", "related"]]
+    # Order families by total contribution
+    family_order = counts.sum(axis=0).sort_values(ascending=False).index
+    counts = counts[family_order]
+    pct = counts.div(counts.sum(axis=1), axis=0) * 100
+
+    fig, ax = plt.subplots(figsize=(9, 4.2))
+    palette = plt.get_cmap("tab20")
+    bottom = np.zeros(len(pct.index))
+    for i, fam in enumerate(pct.columns):
+        ax.bar(pct.index, pct[fam], bottom=bottom, label=fam,
+               color=palette(i % 20))
+        bottom += pct[fam].values
+    ax.set_ylabel("% of top-1 picks (per zone)")
+    ax.set_title("Per-zone source-family contribution to per-(target, ligand) top-1")
+    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5),
+              fontsize=9, frameon=False)
+    ax.set_ylim(0, 105)
+    _save(fig, out)
+
+
 def chart_lscore_vs_rmsd(per_pose: pd.DataFrame, out: Path,
                           n_sample: int = 30000) -> None:
     """Scatter: lscore vs true_rmsd. The story is "lscore is a noisy
@@ -412,6 +671,126 @@ The signal is real but noisy: high lscore (right edge) skews towards
 sub-2 Å but misses are common; many low-rmsd poses (bottom edge)
 carry low lscore. That spread = the ranker bottleneck visualised.
 
+## Scorer ranking power vs `true_rmsd`
+
+Per-target Spearman ρ between each scorer and `true_rmsd`, sign-flipped
+so "higher bar = better ranker for picking low-rmsd poses". Whiskers
+show the IQR over targets — a scorer with a tall bar AND a tight
+whisker is reliable; a tall bar with a wide whisker means it works on
+some targets but not others.
+
+![Scorer ranking power]({figures['scorer_correlations'].relative_to(md_path.parent)})
+
+Read-outs:
+
+- **RMSD-Pred (raw) is the single best ranker**: median ρ ≈ +0.42.
+  `lscore` (= `1 − P(>2 Å)` on the same model) sits just below at
+  ≈ +0.35 — same signal, transformed.
+- **BA-Pred pKd** shows useful but weaker ranking (≈ +0.20). It
+  measures binding affinity, not pose RMSD, so the correlation is
+  indirect.
+- **Cofold confidence (pLDDT / conf / ipTM / pTM) ranks slightly
+  *negatively***. Within a single target the cofold confidence does
+  not predict whether *that* sample's ligand is correctly placed —
+  the protein gets a uniformly high pLDDT regardless of pose
+  quality. This is exactly why a cofold-only "best by confidence"
+  picker degenerates and why we lean on RMSD-Pred-derived scores.
+- Boltz affinity outputs (binder prob / log10(Kd)) ≈ 0 ρ —
+  affinity-trained scorers don't help rank poses on the same
+  target.
+
+The same story in top-K form — for each scorer, retain its top-K
+poses per target and check whether ANY of those K is < 2 Å. The
+production ranker (`lscore_top5_diverse`) picks K=5 with diversity;
+this gives the no-diversity upper bound at every K:
+
+![Top-K hit rate]({figures['topk_hit_rate'].relative_to(md_path.parent)})
+
+- All scorers leave a ≈ 10 pp gap to the oracle ceiling (57.9 %)
+  even at K=100 — the scorers are not pulling the right pose to
+  the top of any short list reliably.
+- pLDDT is surprisingly competitive at low K despite the
+  Spearman ρ being weakly negative — that's because pLDDT
+  selects *cofold poses* (where the underlying generation rate is
+  ≈ 22 %) over docking poses (≈ 4 %), so the family bias does
+  most of the work even when within-family ranking is weak.
+- BA-Pred pKd is the worst at K=1 (≈ 10 %) — useful for refinement
+  / weighting but not as a primary ranker.
+
+Score distributions split by native vs non-native. A scorer where the
+two distributions cleanly separate is informative; overlap = noise.
+Each panel is one scorer; native = green, non-native = grey:
+
+![Score split native]({figures['score_split_native'].relative_to(md_path.parent)})
+
+- **RMSD-Pred (raw)** has the cleanest separation — native peaks
+  near 1 Å, non-native broad around 5-8 Å. Visualises why it wins
+  the Spearman race.
+- **lscore** is bimodal (peak at 0 and 1) with native concentrated
+  near 1; the broad shoulder around 0 in non-native is the
+  obvious confusion zone the ranker fails on.
+- **pLDDT / ipTM / pTM** distributions overlap heavily — both
+  groups peak at the high end. Useless for within-target picking.
+- **Boltz binder prob** has the clearest boltz-only separation
+  (native sharply peaked at 1.0, non-native flatter), but only
+  cofold-Boltz poses carry it.
+
+## Per-source-family analysis
+
+Native rate per family (% poses with `true_rmsd < 2 Å`). Independent of
+scoring — measures how often each family **generates** a native pose:
+
+![Native rate per family]({figures['native_rate_by_family'].relative_to(md_path.parent)})
+
+- **Cofold poses dominate generation quality** (21-24 % native
+  rate), 4-5 × better than the best docking family. Co-folding
+  the receptor + ligand together is genuinely a stronger pose
+  source than docking-into-cofold-receptor.
+- **PxDock (9.6 %) >> Vina (~4.4 %) >> ADG (~1 %)** — among
+  docking tools, PxDock is the most native-aware (it's a
+  force-field with grid potentials), Vina is the standard energy
+  scorer, ADG is empirical and clearly fails on most targets.
+- **`autodock_gpu_*` is the largest pose family (~38 k each
+  variant) but produces only ~1 % native poses** — most of the
+  pool the ranker has to sort through is ADG noise. There's a
+  case to be made for *down-weighting ADG variants* in the
+  ranker or even disabling ADG entirely on grounds of
+  cost/benefit.
+- **`template_*_vina` shows 0.0 % native** — confirms the known
+  bug where the Track 2 box-docking coordinate frame doesn't
+  match the cofold frame after the receptor swap. Worth fixing
+  in a separate pass.
+
+`true_rmsd` distribution per family (boxplot, IQR, fliers clipped at
+30 Å). Families left of the 2 Å line in the body of the box generate
+mostly-native poses; families with the box well right of 2 Å rarely
+get there:
+
+![RMSD distribution per family]({figures['rmsd_dist_by_family'].relative_to(md_path.parent)})
+
+- **`cofold_protenix`** is the only family whose box overlaps the
+  2 Å line — most of its mass is sub-5 Å.
+- **`template_8p8k_vina` etc.** sit at 23 Å median — the
+  coordinate-frame bug, again.
+
+Per-zone share of top-1 picks (by lscore) across families. Tells us
+where each zone's wins come from:
+
+![Zone × family]({figures['zone_family_contribution'].relative_to(md_path.parent)})
+
+- **`cofold_protenix` + `protenix_dock` (= the Protenix family)
+  carries 36-44 % of the top-1 picks across every zone.** The
+  novel zone leans more heavily on Protenix (54 % combined) than
+  the related zone (40 %). This is consistent with Protenix v2's
+  strength on hard / novel-fold targets noted in earlier
+  ablations.
+- **Vina (cofolding+swinsite+p2rank combined) ≈ 25-35 %.**
+  Substantial across zones, slightly more in `related` where
+  the docking pocket is well-defined.
+- **AutoDock-GPU is invisible** at top-1 across all zones (despite
+  having the most poses) — the native-rate finding above
+  explains the absence.
+
 ## Where the SR ceilings sit (current pipeline)
 
 | metric                          | value     |
@@ -506,6 +885,25 @@ def main() -> int:
 
     figures["lscore_vs_rmsd"] = figs_dir / "lscore_vs_rmsd.png"
     chart_lscore_vs_rmsd(per_pose, figures["lscore_vs_rmsd"])
+
+    # true_rmsd-driven analysis ---------------------------------------------
+    figures["scorer_correlations"] = figs_dir / "scorer_correlations.png"
+    chart_scorer_correlations(per_pose, figures["scorer_correlations"])
+
+    figures["topk_hit_rate"] = figs_dir / "topk_hit_rate.png"
+    chart_topk_hit_rate(per_pose, figures["topk_hit_rate"])
+
+    figures["native_rate_by_family"] = figs_dir / "native_rate_by_family.png"
+    chart_native_rate_by_family(per_pose, figures["native_rate_by_family"])
+
+    figures["rmsd_dist_by_family"] = figs_dir / "rmsd_dist_by_family.png"
+    chart_rmsd_dist_by_family(per_pose, figures["rmsd_dist_by_family"])
+
+    figures["score_split_native"] = figs_dir / "score_split_native.png"
+    chart_score_split_native(per_pose, figures["score_split_native"])
+
+    figures["zone_family_contribution"] = figs_dir / "zone_family_contribution.png"
+    chart_zone_family_contribution(per_pose, figures["zone_family_contribution"])
 
     if not unified.empty:
         figures["source_family_top1"] = figs_dir / "source_family_top1.png"

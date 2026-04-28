@@ -110,6 +110,126 @@ The signal is real but noisy: high lscore (right edge) skews towards
 sub-2 Å but misses are common; many low-rmsd poses (bottom edge)
 carry low lscore. That spread = the ranker bottleneck visualised.
 
+## Scorer ranking power vs `true_rmsd`
+
+Per-target Spearman ρ between each scorer and `true_rmsd`, sign-flipped
+so "higher bar = better ranker for picking low-rmsd poses". Whiskers
+show the IQR over targets — a scorer with a tall bar AND a tight
+whisker is reliable; a tall bar with a wide whisker means it works on
+some targets but not others.
+
+![Scorer ranking power](figures/scorer_correlations.png)
+
+Read-outs:
+
+- **RMSD-Pred (raw) is the single best ranker**: median ρ ≈ +0.42.
+  `lscore` (= `1 − P(>2 Å)` on the same model) sits just below at
+  ≈ +0.35 — same signal, transformed.
+- **BA-Pred pKd** shows useful but weaker ranking (≈ +0.20). It
+  measures binding affinity, not pose RMSD, so the correlation is
+  indirect.
+- **Cofold confidence (pLDDT / conf / ipTM / pTM) ranks slightly
+  *negatively***. Within a single target the cofold confidence does
+  not predict whether *that* sample's ligand is correctly placed —
+  the protein gets a uniformly high pLDDT regardless of pose
+  quality. This is exactly why a cofold-only "best by confidence"
+  picker degenerates and why we lean on RMSD-Pred-derived scores.
+- Boltz affinity outputs (binder prob / log10(Kd)) ≈ 0 ρ —
+  affinity-trained scorers don't help rank poses on the same
+  target.
+
+The same story in top-K form — for each scorer, retain its top-K
+poses per target and check whether ANY of those K is < 2 Å. The
+production ranker (`lscore_top5_diverse`) picks K=5 with diversity;
+this gives the no-diversity upper bound at every K:
+
+![Top-K hit rate](figures/topk_hit_rate.png)
+
+- All scorers leave a ≈ 10 pp gap to the oracle ceiling (57.9 %)
+  even at K=100 — the scorers are not pulling the right pose to
+  the top of any short list reliably.
+- pLDDT is surprisingly competitive at low K despite the
+  Spearman ρ being weakly negative — that's because pLDDT
+  selects *cofold poses* (where the underlying generation rate is
+  ≈ 22 %) over docking poses (≈ 4 %), so the family bias does
+  most of the work even when within-family ranking is weak.
+- BA-Pred pKd is the worst at K=1 (≈ 10 %) — useful for refinement
+  / weighting but not as a primary ranker.
+
+Score distributions split by native vs non-native. A scorer where the
+two distributions cleanly separate is informative; overlap = noise.
+Each panel is one scorer; native = green, non-native = grey:
+
+![Score split native](figures/score_split_native.png)
+
+- **RMSD-Pred (raw)** has the cleanest separation — native peaks
+  near 1 Å, non-native broad around 5-8 Å. Visualises why it wins
+  the Spearman race.
+- **lscore** is bimodal (peak at 0 and 1) with native concentrated
+  near 1; the broad shoulder around 0 in non-native is the
+  obvious confusion zone the ranker fails on.
+- **pLDDT / ipTM / pTM** distributions overlap heavily — both
+  groups peak at the high end. Useless for within-target picking.
+- **Boltz binder prob** has the clearest boltz-only separation
+  (native sharply peaked at 1.0, non-native flatter), but only
+  cofold-Boltz poses carry it.
+
+## Per-source-family analysis
+
+Native rate per family (% poses with `true_rmsd < 2 Å`). Independent of
+scoring — measures how often each family **generates** a native pose:
+
+![Native rate per family](figures/native_rate_by_family.png)
+
+- **Cofold poses dominate generation quality** (21-24 % native
+  rate), 4-5 × better than the best docking family. Co-folding
+  the receptor + ligand together is genuinely a stronger pose
+  source than docking-into-cofold-receptor.
+- **PxDock (9.6 %) >> Vina (~4.4 %) >> ADG (~1 %)** — among
+  docking tools, PxDock is the most native-aware (it's a
+  force-field with grid potentials), Vina is the standard energy
+  scorer, ADG is empirical and clearly fails on most targets.
+- **`autodock_gpu_*` is the largest pose family (~38 k each
+  variant) but produces only ~1 % native poses** — most of the
+  pool the ranker has to sort through is ADG noise. There's a
+  case to be made for *down-weighting ADG variants* in the
+  ranker or even disabling ADG entirely on grounds of
+  cost/benefit.
+- **`template_*_vina` shows 0.0 % native** — confirms the known
+  bug where the Track 2 box-docking coordinate frame doesn't
+  match the cofold frame after the receptor swap. Worth fixing
+  in a separate pass.
+
+`true_rmsd` distribution per family (boxplot, IQR, fliers clipped at
+30 Å). Families left of the 2 Å line in the body of the box generate
+mostly-native poses; families with the box well right of 2 Å rarely
+get there:
+
+![RMSD distribution per family](figures/rmsd_dist_by_family.png)
+
+- **`cofold_protenix`** is the only family whose box overlaps the
+  2 Å line — most of its mass is sub-5 Å.
+- **`template_8p8k_vina` etc.** sit at 23 Å median — the
+  coordinate-frame bug, again.
+
+Per-zone share of top-1 picks (by lscore) across families. Tells us
+where each zone's wins come from:
+
+![Zone × family](figures/zone_family_contribution.png)
+
+- **`cofold_protenix` + `protenix_dock` (= the Protenix family)
+  carries 36-44 % of the top-1 picks across every zone.** The
+  novel zone leans more heavily on Protenix (54 % combined) than
+  the related zone (40 %). This is consistent with Protenix v2's
+  strength on hard / novel-fold targets noted in earlier
+  ablations.
+- **Vina (cofolding+swinsite+p2rank combined) ≈ 25-35 %.**
+  Substantial across zones, slightly more in `related` where
+  the docking pocket is well-defined.
+- **AutoDock-GPU is invisible** at top-1 across all zones (despite
+  having the most poses) — the native-rate finding above
+  explains the absence.
+
 ## Where the SR ceilings sit (current pipeline)
 
 | metric                          | value     |
