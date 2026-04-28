@@ -11,7 +11,7 @@ template_search_sequence:
   min_seq_identity: 0.3
   min_coverage: 0.7
   sensitivity: 7.5
-  max_hits: 200
+  max_hits: 500
   threads: 8
   rcsb_dir: ~/DB/RCSB/raw/mmCIF_data
   rcsb_db_path: ~/DB/RCSB/processed/rcsb_index.db

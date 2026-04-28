@@ -630,7 +630,7 @@ class TemplateSearchSequenceConfig:
     min_seq_identity: float = 0.3
     min_coverage: float = 0.7
     sensitivity: float = 7.5
-    max_hits: int = 200
+    max_hits: int = 500
     threads: int = 8
     extra_args: list[str] = field(default_factory=list)
     # Multi-track docking: template ligand filtering + template-guided docking
@@ -654,7 +654,7 @@ class TemplateSearchSequenceConfig:
             min_seq_identity=float(data.get("min_seq_identity", 0.3)),
             min_coverage=float(data.get("min_coverage", 0.7)),
             sensitivity=float(data.get("sensitivity", 7.5)),
-            max_hits=int(data.get("max_hits", 200)),
+            max_hits=int(data.get("max_hits", 500)),
             threads=int(data.get("threads", 8)),
             extra_args=[str(arg) for arg in data.get("extra_args", [])],
             rcsb_dir=str(data.get("rcsb_dir", "~/DB/RCSB/raw/mmCIF_data")),

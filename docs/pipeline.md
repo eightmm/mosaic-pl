@@ -91,7 +91,7 @@ flowchart LR
 ```
 
 - **Tool**: `mmseqs easy-search` (488k RCSB 서열 DB, preindexed at `data/search_dbs/sequence/rcsb_seqDB`)
-- **Parameter**: `min_seq_identity=0.3`, `min_coverage=0.7`, `sensitivity=7.5`, `max_hits=200`
+- **Parameter**: `min_seq_identity=0.3`, `min_coverage=0.7`, `sensitivity=7.5`, `max_hits=500`
 - **Output**: `outputs/template_search_sequence/mmseqs_hits.tsv` (14-col MMseqs2 default format)
 - **소요 시간**: ~3초
 
