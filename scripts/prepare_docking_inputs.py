@@ -294,10 +294,35 @@ def select_best_model(output_root: Path) -> tuple[str, Path]:
     return (best[0], best[1])
 
 
-def run_p2rank(pdb_path: Path, output_dir: Path) -> tuple[list[float], list[float]] | None:
-    """Run P2Rank binding site prediction and return (center, size) of top pocket."""
-    import subprocess
+def _parse_p2rank_predictions(pred_file: Path) -> tuple[list[float], list[float]] | None:
+    """Parse P2Rank predictions CSV → top-pocket (center, size). Returns None on empty."""
     import csv
+    with open(pred_file) as f:
+        reader = csv.DictReader(f, skipinitialspace=True)
+        for row in reader:
+            row = {k.strip(): v.strip() for k, v in row.items()}
+            cx = float(row["center_x"])
+            cy = float(row["center_y"])
+            cz = float(row["center_z"])
+            box_side = 22.5
+            print(f"  P2Rank pocket 1: center=[{cx:.1f}, {cy:.1f}, {cz:.1f}], score={row['score'].strip()}")
+            return ([cx, cy, cz], [box_side, box_side, box_side])
+    return None
+
+
+def run_p2rank(
+    pdb_path: Path,
+    output_dir: Path,
+    reuse_cache: bool = False,
+) -> tuple[list[float], list[float]] | None:
+    """Run P2Rank binding site prediction and return (center, size) of top pocket.
+
+    When ``reuse_cache`` is True and a previous predictions CSV exists, the
+    binary is skipped and the cached CSV is parsed directly. Safe across
+    reruns because P2Rank is deterministic for a given receptor PDB and the
+    receptor PDB is itself deterministic from the aligned cofold cif.
+    """
+    import subprocess
 
     prank_bin = Path(__file__).resolve().parent.parent / ".local" / "bin" / "prank"
     if not prank_bin.exists():
@@ -305,6 +330,12 @@ def run_p2rank(pdb_path: Path, output_dir: Path) -> tuple[list[float], list[floa
         return None
 
     p2rank_out = output_dir / "p2rank"
+    pred_file = p2rank_out / f"{pdb_path.name}_predictions.csv"
+
+    if reuse_cache and pred_file.exists():
+        print(f"  P2Rank cache hit ({pred_file.name}) — skipping prediction")
+        return _parse_p2rank_predictions(pred_file)
+
     try:
         subprocess.run(
             [str(prank_bin), "predict", "-f", str(pdb_path), "-o", str(p2rank_out)],
@@ -314,31 +345,28 @@ def run_p2rank(pdb_path: Path, output_dir: Path) -> tuple[list[float], list[floa
         print(f"  P2Rank failed: {e}")
         return None
 
-    # Parse predictions CSV
-    pred_file = p2rank_out / f"{pdb_path.name}_predictions.csv"
     if not pred_file.exists():
         print("  P2Rank produced no predictions file.")
         return None
 
-    with open(pred_file) as f:
-        reader = csv.DictReader(f, skipinitialspace=True)
-        for row in reader:
-            # Normalize keys (P2Rank pads headers with spaces)
-            row = {k.strip(): v.strip() for k, v in row.items()}
-            # First row = top-ranked pocket
-            cx = float(row["center_x"])
-            cy = float(row["center_y"])
-            cz = float(row["center_z"])
-            box_side = 22.5
-            print(f"  P2Rank pocket 1: center=[{cx:.1f}, {cy:.1f}, {cz:.1f}], score={row['score'].strip()}")
-            return ([cx, cy, cz], [box_side, box_side, box_side])
-
-    print("  P2Rank found no pockets.")
-    return None
+    parsed = _parse_p2rank_predictions(pred_file)
+    if parsed is None:
+        print("  P2Rank found no pockets.")
+    return parsed
 
 
-def run_swinsite(pdb_path: Path, output_dir: Path) -> tuple[list[float], list[float]] | None:
-    """Run SwinSite binding site prediction and return (center, size) of top pocket."""
+def run_swinsite(
+    pdb_path: Path,
+    output_dir: Path,
+    reuse_cache: bool = False,
+) -> tuple[list[float], list[float]] | None:
+    """Run SwinSite binding site prediction and return (center, size) of top pocket.
+
+    When ``reuse_cache`` is True and the SwinSite results dir from a prior
+    run is on disk, the GPU prediction is skipped and the cached pocket
+    PDBs are parsed directly. Safe across reruns because SwinSite output
+    is deterministic for a given receptor PDB.
+    """
     repo_root = Path(__file__).resolve().parent.parent
     swinsite_dir = repo_root / "external" / "swinsite"
     pred_python = repo_root / ".venvs" / "pred" / "bin" / "python"
@@ -348,6 +376,12 @@ def run_swinsite(pdb_path: Path, output_dir: Path) -> tuple[list[float], list[fl
         return None
 
     swinsite_out = output_dir / "swinsite"
+    cached_results = swinsite_out / "results" / "input" / "receptor"
+
+    if reuse_cache and cached_results.exists() and any(cached_results.glob("*_score_*.pdb")):
+        print(f"  SwinSite cache hit ({cached_results}) — skipping GPU prediction")
+        return _parse_swinsite_results(cached_results)
+
     # SwinSite expects input_dir/<sample_name>/protein.pdb
     input_dir = swinsite_out / "input"
     sample_dir = input_dir / "receptor"
@@ -374,22 +408,29 @@ def run_swinsite(pdb_path: Path, output_dir: Path) -> tuple[list[float], list[fl
         print(f"  SwinSite failed: {e}")
         return None
 
-    # Parse SwinSite output. File layout (observed in runs/22mj_input/...):
-    #   results/input/receptor/
-    #     grid0_score_0.7219.pdb     ← HETATM UNL grid points of pocket volume
-    #     grid1_score_0.3136.pdb
-    #     pocket0_score_0.7219.pdb   ← protein residues near the pocket
-    #     pocket1_score_0.3136.pdb
-    # ``grid*`` files give the cleanest pocket centroid (they are literally
-    # the predicted pocket cloud); their filenames carry a score suffix we
-    # sort on to pick the highest-confidence pocket. The old parser used a
-    # ``pocket_*.pdb`` glob which never matched (files have a score suffix,
-    # no underscore), so every run silently dropped SwinSite.
     results_dir = swinsite_out / "results" / "input" / "receptor"
     if not results_dir.exists():
         print("  SwinSite produced no output.")
         return None
+    return _parse_swinsite_results(results_dir)
 
+
+def _parse_swinsite_results(results_dir: Path) -> tuple[list[float], list[float]] | None:
+    """Parse a SwinSite results directory → top-pocket (center, size).
+
+    Layout (observed in runs/22mj_input/...):
+        results_dir/
+            grid0_score_0.7219.pdb     ← HETATM UNL grid points (pocket volume)
+            grid1_score_0.3136.pdb
+            pocket0_score_0.7219.pdb   ← protein residues near the pocket
+            pocket1_score_0.3136.pdb
+
+    ``grid*`` files give the cleanest pocket centroid (they're literally the
+    predicted pocket cloud); the filename score suffix sorts highest-confidence
+    pocket first. Falls back to ``pocket*`` files if grids are missing.
+
+    Returns ``None`` when no scored pocket files are present.
+    """
     import re as _re
     score_re = _re.compile(r"_score_([0-9.]+)\.pdb$")
 
@@ -400,8 +441,6 @@ def run_swinsite(pdb_path: Path, output_dir: Path) -> tuple[list[float], list[fl
         except ValueError:
             return -1.0
 
-    # Prefer grid files (pocket-volume point cloud). Fall back to pocket
-    # files (near-pocket protein residues) if grids are missing.
     grid_files = sorted(results_dir.glob("grid*_score_*.pdb"), key=_score, reverse=True)
     pocket_files = sorted(results_dir.glob("pocket*_score_*.pdb"), key=_score, reverse=True)
     candidates = grid_files or pocket_files
@@ -707,6 +746,13 @@ def main() -> int:
     parser.add_argument("--use-p2rank", action="store_true", default=True,
                         help="Use P2Rank for binding site prediction (default: true).")
     parser.add_argument("--no-p2rank", action="store_true", help="Disable P2Rank binding site prediction.")
+    parser.add_argument("--reuse-binding-site-cache", action="store_true",
+                        help="Reuse existing P2Rank/SwinSite outputs from a prior run "
+                             "instead of re-invoking the binaries. Lets the prep step "
+                             "run on a CPU-only node when the cache was already "
+                             "populated by an earlier GPU run. Cache is keyed implicitly "
+                             "by path; safe across reruns since receptor.pdb is "
+                             "deterministic from _aligned.cif.")
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -826,16 +872,22 @@ def main() -> int:
         print("  WARNING: no cofolding ligand clusters passed "
               f"min_members={COFOLD_CLUSTER_MIN_MEMBERS} filter")
 
-    # 4b. SwinSite (ML-based surface pocket predictor, needs GPU)
+    # 4b. SwinSite (ML-based surface pocket predictor, needs GPU unless cache reused)
     print("  Running SwinSite binding site prediction...")
-    swinsite_result = run_swinsite(pdb_path, args.output_dir)
+    swinsite_result = run_swinsite(
+        pdb_path, args.output_dir,
+        reuse_cache=args.reuse_binding_site_cache,
+    )
     if swinsite_result:
         binding_site_results["swinsite"] = swinsite_result
 
     # 4c. P2Rank (surface geometry-based)
     if not args.no_p2rank:
         print("  Running P2Rank binding site prediction...")
-        p2rank_result = run_p2rank(pdb_path, args.output_dir)
+        p2rank_result = run_p2rank(
+            pdb_path, args.output_dir,
+            reuse_cache=args.reuse_binding_site_cache,
+        )
         if p2rank_result:
             binding_site_results["p2rank"] = p2rank_result
 
