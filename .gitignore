@@ -33,6 +33,30 @@ slurm-*.err
 experiments/**/_eval_work/
 experiments/**/_per_metric_work/
 experiments/**/_validate_*.log
+experiments/**/_validate_*.json
+experiments/**/_supplement_*.log
+experiments/**/_cluster_work/
+
+# Auto-generated input YAMLs (built from CSV by batch_prepare_*.sh)
+experiments/**/pipeline/
+
+# Heavy eval artifacts (regenerated from runs)
+experiments/**/per_pose_scores.csv
+experiments/**/evaluation.json
+experiments/**/rerun_runs.txt
+
+# Collected/staged poses + final submissions (large, regenerable)
+experiments/poses_unified/
+experiments/poses_unified_collect.log
+experiments/submissions/
+
+# casp16_test bulky archives
+experiments/casp16_test/**/*.tgz
+experiments/casp16_test/**/*.tar.gz
+experiments/casp16_test/**/evaluation.json
+
+# Local backup files from in-place patches
+experiments/runs/**/*.bak
 
 # OS
 .DS_Store
