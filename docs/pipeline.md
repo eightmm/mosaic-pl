@@ -27,11 +27,11 @@ flowchart TB
     end
 
     AL["2.5 Frame alignment\nKabsch CA → *_aligned.cif"]
-    PREP["3. Docking prep\n13 binding-site sources"]
+    PREP["3. Docking prep\n3 predictors + ≤10 template consensus"]
 
     subgraph S5["4. Docking (multi-track)"]
         direction LR
-        T1["Track 1\ncofold-based\nVina/ADG × 13 × 5 + PxDock"]
+        T1["Track 1\ncofold-based\nVina/ADG × ≤13 × 5 + PxDock"]
         T2["Track 2\ntemplate-box\n(any template)"]
         T3["Track 3\nlig-align\n(MCS ≥ 0.5)"]
     end
@@ -70,8 +70,8 @@ template-search-sequence (mmseqs)
   → template-search-structure (foldseek, query = best cofold cif)
     └── bridge: union filter → pocket extraction → pocket clustering
   → bridge: align cofolding outputs (Kabsch to common frame) → *_aligned.cif
-  → bridge: docking prep (13 binding-site sources + receptor / ligand prep)
-  → docking (Track 1: Vina/ADG × 13 sources × 5 seeds, PxDock × 1)
+  → bridge: docking prep (3 predictor + ≤10 template-consensus = 최대 13 binding-site sources)
+  → docking (Track 1: Vina/ADG × ≤13 sources × 5 seeds, PxDock × 1)
   → multi-track docking (Track 2 + Track 3, conditional)
   → ion placement (conditional)
   → post-analysis (BA-Pred + RMSD-Pred, staged poses)
@@ -213,22 +213,43 @@ Cofolding 출력에서 docking 입력을 자동 생성. `scripts/prepare_docking
 - SMILES → 3D conformer: RDKit `EmbedMolecule(ETKDGv3)` + `MMFFOptimizeMolecule(maxIters=500)`
 - SDF → PDBQT: meeko `MoleculePreparation`
 
-#### Binding-site sources (13 개, 각각 독립 docking variant 로 fan-out)
+#### Binding-site sources
 
-| Source | 갯수 | 기원 | 비고 |
-|---|---:|---|---|
-| `cofolding` | 1 | co-fold 모델이 직접 놓은 ligand 의 heavy-atom centroid | 가장 직접적인 신호 |
-| `swinsite` | 1 | Swin-Unet ML pocket predictor (GPU) | 못 찾으면 variant clean-skip |
-| `p2rank` | 1 | Surface-based geometric (CPU, JDK 21) | 못 찾으면 variant clean-skip |
-| `template_consensus_1..10` | up to 10 | `cluster_template_pockets.py` 의 top-K cluster centroid | `n_members ≥ 2` 만 등록 (singleton 제외 — alternate/spurious site 일 가능성 ↑) |
+Track 1 docking 의 box center 후보를 **predictor (고정 3 개) + template-consensus (조건부 최대 10 개) = 최대 13 개**
+로 fan-out. 각 source 는 **독립된 docking variant** 로 실행되어 한 predictor 가 잘못된 pocket 을 잡아도 다른 source 가 backup. 어떤 source 가 winner 인지는 사후 ranker (`compute_submission_scores.py`) 가 판정.
 
-- **`_DOCKING_BOX_SOURCES`** in `src/casp17/adapters.py`: cofolding/swinsite/p2rank + template_consensus_1..10. `prepare_vina` / `prepare_autodock_gpu` 가 이 튜플을 순회하며 하나씩 `PreparedModelRun` emit
-- 각 variant 는 생성 시점에 `BOX_SOURCE='...'` 가 runner script 에 baked-in. 런타임에 `summary['binding_site_predictions'][BOX_SOURCE]['center']` 를 읽어 box 설정. 해당 source 가 missing 이면 (e.g. template hit 없는 타겟의 `template_consensus_*`) **`sys.exit(0)` clean skip**
-- **Unified box**: 22.5 Å × 22.5 Å × 22.5 Å, grid spacing 0.375 Å (전 docking tool 공통)
-- **Fallback box pick** (PxDock 같은 단일-box 도구용): `cofolding > template_consensus_N (n_unique_pdb ≥ 2 인 strong consensus) > swinsite > p2rank > weak consensus`
-- **Output**: `inputs/docking/docking_prep_summary.json`
+**A. Predictor sources — 항상 시도 (3 개)**
 
-> **Design rationale**: 한 binding-site predictor 가 잘못된 pocket 을 잡아도 (e.g. CASP16 L2001 에서 swinsite no-pocket / p2rank 37 Å off / cofold centroid 35 Å off) **template-consensus** 가 RCSB 의 검증된 binding pose 좌표를 독립 backup 으로 제공. n_unique_pdb ≥ 2 multi-template 합의면 노이즈 극복력이 좋다.
+| Source | 기원 | Skip 조건 |
+|---|---|---|
+| `cofolding` | co-fold 모델이 직접 놓은 ligand 의 heavy-atom centroid | 거의 없음 (cofold 출력에 ligand 가 항상 포함) |
+| `swinsite` | Swin-Unet ML pocket predictor (GPU, `.venvs/pred`) | predictor 가 pocket 을 못 찾으면 해당 variant 만 `sys.exit(0)` |
+| `p2rank` | Surface-based geometric (JDK 21) | 위와 동일 |
+
+**B. Template-consensus sources — 조건부 (0 ~ 10 개)**
+
+Stage 1-5 에서 만든 `template_pocket_clusters.json` 의 top-K cluster centroid 를 `template_consensus_1..10`
+이름으로 등록. 등록 조건은 `prepare_docking_inputs.py::_add_template_consensus_sources`:
+
+- **`n_members ≥ 2`** (= `TEMPLATE_CONSENSUS_MIN_MEMBERS`) — singleton cluster 는 alternate/spurious site 일 가능성이 커서 제외
+- **최대 10 개** (= `TEMPLATE_CONSENSUS_TOP_K`) — `evidence_score` desc 정렬 후 상위만
+- 실제 등록 수는 타겟별로 다름:
+  - Template hit 없거나 모든 cluster 가 singleton → 0 개 → 총 source 3
+  - Template hit 풍부 (e.g. 잘 알려진 fold) → 5–10 개 → 총 source 8–13
+
+**Variant fan-out (`src/casp17/adapters.py::_DOCKING_BOX_SOURCES`)**
+
+`prepare_vina` / `prepare_autodock_gpu` 가 위 13-source 튜플을 순회하며 각각 `PreparedModelRun` 을 emit.
+각 variant 는 생성 시점에 `BOX_SOURCE='cofolding'|...|'template_consensus_10'` 이 runner script 에 baked-in →
+런타임에 `summary['binding_site_predictions'][BOX_SOURCE]['center']` 를 읽어 box 설정.
+**해당 source 가 missing 이면 `sys.exit(0)` clean skip** (실패가 아니라 정상 종료) — 그래서 자료 부족한 타겟이라도 파이프라인이 멈추지 않음.
+
+**기타**:
+- **Unified box**: 22.5 Å × 22.5 Å × 22.5 Å, grid spacing 0.375 Å (Vina/ADG/PxDock 공통)
+- **Fallback box pick** — PxDock 처럼 단일-box 만 받는 도구용 priority: `cofolding > template_consensus_N (n_unique_pdb ≥ 2 인 strong consensus) > swinsite > p2rank > weak consensus`
+- **Output**: `inputs/docking/docking_prep_summary.json` 의 `binding_site_predictions` 딕셔너리 (key = source name, value = `{center, size, metadata}`)
+
+> **Design rationale**: 한 binding-site predictor 가 잘못된 pocket 을 잡아도 (e.g. CASP16 L2001 에서 swinsite no-pocket / p2rank 37 Å off / cofold centroid 35 Å off — 같은 fold 의 모든 모델이 동일하게 빗나감) **template-consensus** 가 RCSB 의 실험적으로 검증된 binding pose 좌표를 독립 backup 으로 제공. `n_unique_pdb ≥ 2` 인 multi-template 합의는 단일 predictor 노이즈를 효과적으로 극복.
 
 ---
 
@@ -238,14 +259,14 @@ Cofolding 출력에서 docking 입력을 자동 생성. `scripts/prepare_docking
 
 #### Track 1 — Cofolding-based docking (항상)
 
-Cofolding best model 을 receptor, **13 binding-site source 각각을 독립 box 로** 사용.
-Vina + AutoDock-GPU 가 **13 × 2 = 26 variant** 로 병렬 실행.
-PxDock 은 cache-map 재생성 비용 때문에 **단일 run** (priority-picked source).
+Cofolding best model 을 receptor, **위에서 등록된 binding-site source (3 predictor + 0~10 consensus = 최대 13) 각각을 독립 box 로** 사용.
+Vina + AutoDock-GPU 가 **최대 13 × 2 = 26 variant** 로 병렬 실행 (실제 수 = 등록된 source 수).
+PxDock 은 cache-map 재생성 비용 때문에 **단일 run** (priority-picked fallback box).
 
 | Tool | Variants | Type | Time/seed | Output |
 |---|---|---|---:|---|
-| Vina | `vina_<source>` × 13 | Python API (CPU) | ~3 s | `outputs/vina_<source>/seed_<seed>/docked.pdbqt` |
-| AutoDock-GPU | `autodock-gpu_<source>` × 13 | CUDA binary | ~10 s | `outputs/autodock_gpu_<source>/seed_<seed>/docked.dlg` |
+| Vina | `vina_<source>` × ≤13 | Python API (CPU) | ~3 s | `outputs/vina_<source>/seed_<seed>/docked.pdbqt` |
+| AutoDock-GPU | `autodock-gpu_<source>` × ≤13 | CUDA binary | ~10 s | `outputs/autodock_gpu_<source>/seed_<seed>/docked.dlg` |
 | Protenix-Dock | (single, no fan-out) | CPU force field | ~5–30 min | `outputs/protenix_dock/poses_*.sdf + *_out.json` |
 
 - 모든 tool 은 `docking_prep_summary.json` 에서 receptor / ligand / box 를 runtime 에 읽음
@@ -297,7 +318,7 @@ flowchart TB
 
 | Track | Receptor | Box source | Method | Entry |
 |---|---|---|---|---|
-| 1 | cofold best (`_aligned`) | 13 sources | Vina + ADG + PxDock | always |
+| 1 | cofold best (`_aligned`) | ≤13 (3 predictor + 0~10 consensus) | Vina + ADG + PxDock | always |
 | 2 | template PDB (RCSB, USalign-aligned to cofold frame) | template ligand centroid | Vina + ADG + PxDock | `num_ligands > 0` |
 | 3 | template PDB (same as Track 2) | MCS anchor alignment | lig-align | per-template `best_mcs_coverage ≥ mcs_threshold` |
 
@@ -460,7 +481,7 @@ echo "----------------------"
 | **Template pocket extraction** | filter 직후 | **`extract_template_pockets.py`** | USalign per hit → bound-ligand centroid → cofold frame |
 | **Template pocket clustering** | extraction 직후 | **`cluster_template_pockets.py`** | single-link 5 Å, top-K → `template_consensus_*` source |
 | **Frame alignment** | cofolding 끝, docking 직전 | **`align_cofolding_outputs.py`** | Kabsch CA → `*_aligned.cif` |
-| Docking prep | alignment → docking | `prepare_docking_inputs.py` | 모델 자동 선택 + 13 binding-site source 등록 + 파일 변환 |
+| Docking prep | alignment → docking | `prepare_docking_inputs.py` | 모델 자동 선택 + 최대 13 binding-site source (3 predictor + ≤10 consensus) 등록 + 파일 변환 |
 | Multi-track docking | docking 직후 (조건부) | `run_multi_track_docking.py` | Track 2 (any template) + Track 3 (MCS ≥ 0.5). Multi-char chain id 단일 letter 정규화 |
 | Ion placement | multi-track 직후 (조건부) | `collect_template_ions.py` | template alignment → ion 위치 cluster |
 | Score aggregation | post-analysis 후 | `compute_submission_scores.py` | BA/RMSD/Boltz 집계 + diversity-aware top-5 |
@@ -547,7 +568,7 @@ gantt
 | **Total** | **53:26** | **52:08** | Track 2/3 + ion 모두 활성 시 +8–20 min 추가 |
 
 > Cofolding 합산 36 분 ≈ 전체 ~67 %. Track 1 docking ~13 분 ≈ ~25 %.
-> 13-source fan-out 은 Vina/ADG 단일 seed 시간 영향이 작아 (Vina 3 s × 13 src × 5 seed ≈ 200 s, ADG 10 s × 13 × 5 ≈ 650 s) wall-clock 영향 대부분 PxDock 이 결정.
+> Source fan-out (최대 13 개) 의 wall-clock 영향은 작음 — Vina 3 s × 13 src × 5 seed ≈ 200 s, ADG 10 s × 13 × 5 ≈ 650 s. 전체 docking 시간은 PxDock 이 결정.
 
 ### 3-4. Shared utility modules
 
@@ -588,7 +609,7 @@ experiments/runs/<target>/
 │   ├── protenix_input.json                         # Protenix JSON
 │   ├── alphafold3_input.json                       # AF3 JSON (+ MSA from Boltz bridge)
 │   ├── docking/
-│   │   ├── docking_prep_summary.json                 # receptor / ligand / box paths + 13 sources
+│   │   ├── docking_prep_summary.json                 # receptor / ligand / box paths + binding_site_predictions (≤13 sources)
 │   │   ├── receptor.pdb / .pdbqt / receptor_protonated.pdb
 │   │   ├── ligand_L.sdf / .pdbqt
 │   │   ├── p2rank/                                   # P2Rank pocket predictions
@@ -613,9 +634,9 @@ experiments/runs/<target>/
 │   │   └── _extract_work/                            # extracted CIFs cache
 │   ├── boltz2/ boltz2x/ protenix/ alphafold3/      # Stage 2: 25 structs/model
 │   │   └── seed_42/ seed_101/ ...                    # per-seed (AF3 는 native multi-seed)
-│   ├── vina_<source>/                              # Stage 4 Track 1: 13 variants × 5 seeds
+│   ├── vina_<source>/                              # Stage 4 Track 1: ≤13 variants × 5 seeds (registered sources only)
 │   │   └── seed_42/ ... ligand_L/docked.pdbqt
-│   ├── autodock_gpu_<source>/                      # Stage 4 Track 1: 13 variants × 5 seeds
+│   ├── autodock_gpu_<source>/                      # Stage 4 Track 1: ≤13 variants × 5 seeds
 │   │   └── seed_42/ ... ligand_L/docked.dlg
 │   ├── protenix_dock/                              # Stage 4 Track 1: single, priority-picked
 │   │   ├── poses_<lid>.sdf                           # multi-pose SDF
