@@ -12,50 +12,44 @@ End-to-end pipeline: **단백질 서열 + 리간드 SMILES 의 unified YAML 한 
 flowchart TB
     INPUT["Unified YAML\n(protein FASTA + ligand SMILES)"]
 
-    MM["1a. mmseqs2\nsequence search\n(rcsb_seqDB, 488k seqs)\n→ mmseqs_hits.tsv"]
+    MM["1a. mmseqs2\nrcsb_seqDB (488k seqs)\n→ mmseqs_hits.tsv"]
 
     subgraph S2["2. Co-folding (5 seeds × 5 samples = 25/model)"]
         direction LR
         B2["Boltz-2"] --- B2X["Boltz-2x"] --- PTX["Protenix"] --- AF3["AF3"]
     end
 
-    FS["1b. foldseek\nstructure search\n(rcsb_structDB, 251k structs)\nquery = best cofold cif\n→ foldseek_hits.tsv"]
+    FS["1b. foldseek\nrcsb_structDB (251k structs)\nquery = best cofold cif\n→ foldseek_hits.tsv"]
 
     subgraph SB["Template bridges (auto)"]
-        direction TB
-        F1["Union filter\nby (pdb_id, chain_id)\nNO MCS gate"]
-        F2["Pocket extraction\n(USalign per hit\n→ ligand centroid in cofold frame)"]
-        F3["Pocket clustering\n(single-link 5 Å)\n→ template_consensus_1..10"]
-        F1 --> F2 --> F3
+        direction LR
+        F1["Union filter\n(pdb_id, chain_id)\nNO MCS gate"] --> F2["Pocket extract\n(USalign per hit)"] --> F3["Top-K consensus\ntemplate_consensus_1..10"]
     end
 
-    AL["Frame alignment\n*_aligned.cif (Kabsch CA)"]
-    PREP["Docking prep\n13 binding-site sources"]
+    AL["2.5 Frame alignment\nKabsch CA → *_aligned.cif"]
+    PREP["3. Docking prep\n13 binding-site sources"]
 
-    subgraph S5["3. Docking"]
-        direction TB
-        T1["Track 1 — cofold-based\nVina + ADG × 13 sources × 5 seeds\n+ PxDock × 1"]
-        T2["Track 2 — template-box\n(any template, no MCS gate)"]
-        T3["Track 3 — lig-align\n(MCS ≥ 0.5 only)"]
+    subgraph S5["4. Docking (multi-track)"]
+        direction LR
+        T1["Track 1\ncofold-based\nVina/ADG × 13 × 5 + PxDock"]
+        T2["Track 2\ntemplate-box\n(any template)"]
+        T3["Track 3\nlig-align\n(MCS ≥ 0.5)"]
     end
 
-    ION["Ion placement\n(conditional)"]
-    POST["Post-analysis\nBA-Pred + RMSD-Pred"]
-    LG[".lg submission\nMODEL 1..5"]
+    ION["5. Ion placement\n(conditional)"]
+    POST["6. Post-analysis\nBA-Pred + RMSD-Pred"]
+    LG["7. CASP17 LG submission\nMODEL 1..5"]
 
     INPUT --> MM
     INPUT --> S2
-    S2 -->|"best cofold cif\n(query_model_priority)"| FS
-    MM --> F1
-    FS --> F1
+    S2 -->|"best cofold cif"| FS
+    MM --> SB
+    FS --> SB
+    S2 --> AL
     SB --> PREP
-    S2 --> AL --> PREP
-    PREP --> T1
-    SB --> T2 & T3
-    AL --> T2 & T3
-    SB --> ION
-    AL --> ION
-    T1 & T2 & T3 --> POST
+    AL --> PREP
+    PREP --> S5
+    S5 --> ION
     ION --> POST
     POST --> LG
 
@@ -64,6 +58,8 @@ flowchart TB
     style F3 fill:#ffd54f,color:#000
     style LG fill:#66bb6a,color:#000
 ```
+
+> 위 다이어그램은 main trunk (실행 순서) 만 표시합니다. Track 2/3 은 template bridges (`filtered_hits.tsv`) 와 frame-aligned cofold cif 를 둘 다 읽고, Ion placement 도 마찬가지 (cofold cif + template hits) — 자세한 입력 의존성은 각 stage 본문 참조.
 
 **Wrapper execution order** (`build_wrapper_shell_script` 가 emit):
 
