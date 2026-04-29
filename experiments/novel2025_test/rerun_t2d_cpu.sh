@@ -55,9 +55,10 @@ echo "============================================================"
 # 1. prepare-wrapper
 echo "[$TARGET] prepare-wrapper"
 uv run casp17-pl prepare-wrapper \
-    -i "$INPUT_YAML" \
-    -c "$CONFIG" \
-    --output-root experiments/runs >/dev/null \
+    --input "$INPUT_YAML" \
+    --config "$CONFIG" \
+    --output-root experiments/runs \
+    --backend slurm >/dev/null \
     || { echo "[$TARGET] prepare-wrapper failed — abort"; exit 1; }
 
 # 2. foldseek if missing

@@ -75,9 +75,10 @@ echo "============================================================"
 # outputs touched), so it's safe to call before downstream stages.
 echo "[$TARGET] re-prepare wrapper (regenerates scripts + variant runners)"
 uv run casp17-pl prepare-wrapper \
-    -i "$INPUT_YAML" \
-    -c "$CONFIG" \
-    --output-root experiments/runs >/dev/null \
+    --input "$INPUT_YAML" \
+    --config "$CONFIG" \
+    --output-root experiments/runs \
+    --backend slurm >/dev/null \
     || { echo "[$TARGET] prepare-wrapper failed — abort"; exit 1; }
 
 # ------------------------------------------------------------ 2. Foldseek (now the runner script exists)
