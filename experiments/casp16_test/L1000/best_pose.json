@@ -1,0 +1,130 @@
+[
+  {
+    "target": "L1001",
+    "protein_ca_rmsd": 1.029,
+    "n_total_poses": 208,
+    "vina": {
+      "n": 50,
+      "best_rmsd": 0.575,
+      "best_source": "vina_seed_101#2",
+      "median_rmsd": 2.155,
+      "n_under_2A": 24,
+      "n_under_4A": 50
+    },
+    "adg": {
+      "n": 50,
+      "best_rmsd": 0.639,
+      "best_source": "autodock_gpu_seed_101#0",
+      "median_rmsd": 2.296,
+      "n_under_2A": 9,
+      "n_under_4A": 50
+    },
+    "pxdock": {
+      "n": 8,
+      "best_rmsd": 0.458,
+      "best_source": "poses#4",
+      "median_rmsd": 1.992,
+      "n_under_2A": 5,
+      "n_under_4A": 8
+    },
+    "boltz2": {
+      "n": 25,
+      "best_rmsd": 0.21,
+      "best_source": "boltz_input/boltz_input_model_4_aligned.cif#0",
+      "median_rmsd": 0.323,
+      "n_under_2A": 25,
+      "n_under_4A": 25
+    },
+    "boltz2x": {
+      "n": 25,
+      "best_rmsd": 0.198,
+      "best_source": "boltz_input/boltz_input_model_3_aligned.cif#0",
+      "median_rmsd": 0.304,
+      "n_under_2A": 25,
+      "n_under_4A": 25
+    },
+    "protenix": {
+      "n": 25,
+      "best_rmsd": 0.989,
+      "best_source": "predictions/L1001_input_sample_3_aligned.cif#0",
+      "median_rmsd": 1.952,
+      "n_under_2A": 17,
+      "n_under_4A": 25
+    },
+    "af3": {
+      "n": 25,
+      "best_rmsd": 1.065,
+      "best_source": "seed-42_sample-0/L1001_input_seed-42_sample-0_model_aligned.cif#0",
+      "median_rmsd": 1.951,
+      "n_under_2A": 13,
+      "n_under_4A": 25
+    },
+    "overall_best_rmsd": 0.198,
+    "overall_under_2A": 118,
+    "overall_under_4A": 208
+  },
+  {
+    "target": "L1002",
+    "status": "no docking receptor"
+  },
+  {
+    "target": "L1003",
+    "status": "no docking receptor"
+  },
+  {
+    "target": "L1004",
+    "status": "no docking receptor"
+  },
+  {
+    "target": "L1005",
+    "status": "no docking receptor"
+  },
+  {
+    "target": "L1006",
+    "status": "no docking receptor"
+  },
+  {
+    "target": "L1007",
+    "status": "no docking receptor"
+  },
+  {
+    "target": "L1008",
+    "status": "no docking receptor"
+  },
+  {
+    "target": "L1009",
+    "status": "no docking receptor"
+  },
+  {
+    "target": "L1010",
+    "status": "no docking receptor"
+  },
+  {
+    "target": "L1011",
+    "status": "no docking receptor"
+  },
+  {
+    "target": "L1012",
+    "status": "no docking receptor"
+  },
+  {
+    "target": "L1013",
+    "status": "no docking receptor"
+  },
+  {
+    "target": "L1014",
+    "status": "no docking receptor"
+  },
+  {
+    "target": "L1015",
+    "status": "no docking receptor"
+  },
+  {
+    "target": "L1016",
+    "status": "no docking receptor"
+  },
+  {
+    "target": "L1017",
+    "status": "no docking receptor"
+  }
+]
