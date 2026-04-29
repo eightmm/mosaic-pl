@@ -37,6 +37,69 @@ SKIP_TYPES = {"crystallization_aid"}
 # reliably via their CCD lookup than via free-form SMILES.
 CCD_TYPES = {"metal", "ion", "metal_cluster"}
 
+# Boltz affinity module hard-cap. Ligands with more heavy atoms than this
+# crash the whole cofolding run (``Error: The ligand for affinity is too
+# large``). When the primary candidate exceeds this, we drop the
+# ``properties.affinity`` block so cofolding structure prediction still
+# runs — just without the affinity readout.
+BOLTZ_AFFINITY_MAX_HEAVY_ATOMS = 128
+
+
+def _heavy_atom_count(smi: str) -> int:
+    """Return the heavy-atom count for a SMILES, or -1 if unparseable.
+
+    Used for (a) detecting monoatomic ions that should be routed through a
+    CCD code instead of SMILES, and (b) gating the Boltz affinity block on
+    the primary ligand's size."""
+    try:
+        from rdkit import Chem
+        from rdkit.RDLogger import DisableLog
+        DisableLog("rdApp.*")
+    except Exception:
+        return -1
+    mol = Chem.MolFromSmiles(smi or "")
+    if mol is None:
+        return -1
+    return sum(1 for a in mol.GetAtoms() if a.GetSymbol() != "H")
+
+
+# Elements Boltz refuses to accept in free-form SMILES. Any ligand whose
+# SMILES contains one of these atoms (e.g. ``[Fe]56`` inside the heme
+# porphyrin macrocycle) gets silently rejected as ``Molecule is excluded``
+# at input processing time, which kills every cofolding seed. Routing
+# these through the ``ccd:`` field instead lets Boltz use its internal
+# CCD geometry dictionary, which handles the metal coordination correctly.
+_METAL_ELEMENTS = frozenset({
+    "Li", "Na", "K", "Rb", "Cs",
+    "Be", "Mg", "Ca", "Sr", "Ba",
+    "Al", "Ga", "Sn", "Pb", "Bi",
+    "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn",
+    "Y", "Zr", "Nb", "Mo", "Tc", "Ru", "Rh", "Pd", "Ag", "Cd",
+    "Hf", "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg",
+})
+
+
+def _contains_metal(smi: str) -> bool:
+    """True if the SMILES parses and contains any metal atom.
+
+    Driven by the Boltz exclusion behaviour: free-form SMILES with
+    transition-metal atoms (heme ``[Fe]``, cobalamin ``[Co++]``, zinc
+    fingers, etc.) are rejected. The CCD route handles these correctly
+    when the candidate has a known CCD code."""
+    try:
+        from rdkit import Chem
+        from rdkit.RDLogger import DisableLog
+        DisableLog("rdApp.*")
+    except Exception:
+        return False
+    mol = Chem.MolFromSmiles(smi or "")
+    if mol is None:
+        return False
+    for atom in mol.GetAtoms():
+        if atom.GetSymbol() in _METAL_ELEMENTS:
+            return True
+    return False
+
 
 def split_field(row, key):
     return (row.get(key) or "").split("|")
@@ -61,18 +124,33 @@ def _smart_split_smiles(raw, expected_count=None):
     except Exception:
         return tokens  # no RDKit → fall back to naive split
 
-    def valid(s):
-        return bool(s) and Chem.MolFromSmiles(s) is not None
+    def _mol(s):
+        return Chem.MolFromSmiles(s) if s else None
+
+    def _heavy(mol):
+        return sum(1 for a in mol.GetAtoms() if a.GetSymbol() != "H") if mol else 0
 
     out, buf = [], ""
-    for tok in tokens:
+    n_tok = len(tokens)
+    for idx, tok in enumerate(tokens):
         if not tok:
             if buf:
                 out.append(buf); buf = ""
             continue
         cand = (buf + tok) if buf else tok
-        if valid(cand):
-            out.append(cand); buf = ""
+        mol = _mol(cand)
+        more_to_come = idx + 1 < n_tok
+        if mol is not None:
+            # Single-atom ions (e.g. ``[Co++]``) are often ring-closure-split
+            # from the larger molecule they coordinate — e.g. cyanocobalamin
+            # emits as ``[Co++]|1|2|3|N4C5=...``. Emitting the ion alone and
+            # leaving the ring-closure digits to start the next chunk
+            # produces a garbled second SMILES. Keep extending while there
+            # are still tokens to consume.
+            if _heavy(mol) <= 1 and more_to_come:
+                buf = cand
+            else:
+                out.append(cand); buf = ""
         else:
             buf = cand
     if buf:
@@ -114,7 +192,15 @@ def build_sequences_block(row):
             }
         })
 
-    # Candidate ligands: these come first, drug-like, use SMILES.
+    # Candidate ligands: these come first and are usually drug-like, so we
+    # prefer SMILES for atom-resolution flexibility. We route to the
+    # ``ccd:`` field instead in three situations that would otherwise
+    # crash cofolding:
+    #   - Monoatomic ion SMILES (``[Zn++]``, etc.) — Boltz excludes them.
+    #   - SMILES containing a metal atom (heme, cobalamin, …) — same.
+    #   - Heavy-atom count > Boltz affinity cap — the structure prediction
+    #     itself still runs (affinity block gets dropped separately in
+    #     ``build_yaml``), but CCD is more reliable for giant cofactors.
     cand_ccds = [c for c in split_field(row, "candidate_ccd_codes") if c]
     cand_smis = [s for s in _smart_split_smiles(row.get("candidate_smiles") or "",
                                                 expected_count=len(cand_ccds)) if s]
@@ -124,7 +210,11 @@ def build_sequences_block(row):
     for ccd, smi in zip(cand_ccds, cand_smis):
         lig_counter += 1
         lid = "L" if lig_counter == 1 else f"L{lig_counter}"
-        entries.append({"ligand": {"id": lid, "smiles": smi}})
+        heavy = _heavy_atom_count(smi)
+        if heavy == 1 or _contains_metal(smi):
+            entries.append({"ligand": {"id": lid, "ccd": ccd}})
+        else:
+            entries.append({"ligand": {"id": lid, "smiles": smi}})
         added_ccds.add(ccd)
         if binder_ccd is None:
             binder_ccd = ccd
@@ -145,7 +235,10 @@ def build_sequences_block(row):
             continue  # already included as a candidate
         x_counter += 1
         xid = f"X{x_counter}"
-        if typ in CCD_TYPES:
+        # Mirror the candidate-side routing: non-candidate ligands with a
+        # metal atom in their SMILES must also go through ``ccd:`` or Boltz
+        # rejects the whole complex (``Molecule is excluded``).
+        if typ in CCD_TYPES or _contains_metal(smi):
             entries.append({"ligand": {"id": xid, "ccd": ccd}})
         else:
             entries.append({"ligand": {"id": xid, "smiles": smi}})
@@ -155,12 +248,32 @@ def build_sequences_block(row):
 
 
 def build_yaml(row) -> dict:
-    return {
+    # Guard the affinity block: when the primary candidate ligand has more
+    # heavy atoms than Boltz's affinity module can handle, omit the block so
+    # structure prediction still runs (without the affinity readout).
+    cand_smis_raw = _smart_split_smiles(
+        row.get("candidate_smiles") or "",
+        expected_count=len([c for c in split_field(row, "candidate_ccd_codes") if c]),
+    )
+    primary_smi = next((s for s in cand_smis_raw if s), "")
+    primary_heavy = _heavy_atom_count(primary_smi)
+    doc: dict = {
         "version": 1,
         "seed": 42,
         "sequences": build_sequences_block(row),
-        "properties": [{"affinity": {"binder": "L"}}],
     }
+    # Keep affinity on valid drug-like ligands only. The affinity module
+    # requires a ``smiles:`` binder: it cannot score CCD-only ligands
+    # (monoatomic ions, heme, cobalamin, …) and it errors out on ligands
+    # larger than ``BOLTZ_AFFINITY_MAX_HEAVY_ATOMS``. In both of those
+    # cases the affinity block is silently dropped so structure prediction
+    # still runs.
+    if (
+        1 < primary_heavy <= BOLTZ_AFFINITY_MAX_HEAVY_ATOMS
+        and not _contains_metal(primary_smi)
+    ):
+        doc["properties"] = [{"affinity": {"binder": "L"}}]
+    return doc
 
 
 def eligible(row) -> bool:

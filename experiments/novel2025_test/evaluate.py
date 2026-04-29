@@ -25,6 +25,8 @@ from pathlib import Path
 import gemmi
 import numpy as np
 from rdkit import Chem
+from rdkit.Chem import rdFMCS
+from rdkit.Chem.AllChem import AssignBondOrdersFromTemplate
 
 _REPO_SRC = Path(__file__).resolve().parents[2] / "src"
 if str(_REPO_SRC) not in sys.path:
@@ -41,6 +43,215 @@ from casp17.geometry import (  # noqa: E402
 )
 from casp17.lg_format import parse_lg  # noqa: E402
 
+
+# The RCSB TSV uses ``|`` both as multi-ligand separator AND as an
+# intra-SMILES separator for HEM-like organometallics. See
+# experiments/novel2025_test/build_inputs.py::_smart_split_smiles for the
+# full write-up. Duplicated here (not imported) to keep evaluate.py
+# self-contained and avoid a cross-script import chain.
+def _smart_split_smiles(raw: str, expected_count: int | None = None) -> list[str]:
+    tokens = (raw or "").split("|")
+
+    def _mol(s: str):
+        return Chem.MolFromSmiles(s) if s else None
+
+    def _heavy(mol):
+        return sum(1 for a in mol.GetAtoms() if a.GetSymbol() != "H") if mol else 0
+
+    out: list[str] = []
+    buf = ""
+    n_tok = len(tokens)
+    for idx, tok in enumerate(tokens):
+        if not tok:
+            if buf:
+                out.append(buf)
+                buf = ""
+            continue
+        cand = (buf + tok) if buf else tok
+        mol = _mol(cand)
+        more_to_come = idx + 1 < n_tok
+        if mol is not None:
+            if _heavy(mol) <= 1 and more_to_come:
+                buf = cand
+            else:
+                out.append(cand)
+                buf = ""
+        else:
+            buf = cand
+    if buf:
+        out.append(buf)
+
+    if expected_count is not None and expected_count > 0 and len(out) != expected_count:
+        if len(tokens) == expected_count:
+            return tokens
+    return out
+
+
+def _prune_template_to_match(raw_mol: Chem.Mol, template: Chem.Mol) -> Chem.Mol | None:
+    """Build a reduced template containing only the atoms that appear in
+    ``raw_mol``. Used when a crystal ligand is covalently linked (e.g. NAG
+    in a glycan loses its O1) so the template's heavy-atom count exceeds
+    the crystal's and ``AssignBondOrdersFromTemplate`` fails with
+    "No matching found".
+
+    Uses MCS (element-based, bond-order-agnostic) to find the common
+    substructure, then deletes the unmatched template atoms. Returns None
+    if the MCS is too small or the pruned template cannot be sanitized.
+    """
+    mcs = rdFMCS.FindMCS(
+        [raw_mol, template],
+        atomCompare=rdFMCS.AtomCompare.CompareElements,
+        bondCompare=rdFMCS.BondCompare.CompareAny,
+        ringMatchesRingOnly=False,
+        completeRingsOnly=False,
+        matchValences=False,
+        timeout=30,
+    )
+    if mcs.numAtoms < max(4, raw_mol.GetNumAtoms() - 2):
+        return None
+    patt = Chem.MolFromSmarts(mcs.smartsString)
+    if patt is None:
+        return None
+    match = template.GetSubstructMatch(patt)
+    if not match or len(match) != raw_mol.GetNumAtoms():
+        return None
+    keep = set(match)
+    rw = Chem.RWMol(template)
+    for i in sorted(range(rw.GetNumAtoms()), reverse=True):
+        if i not in keep:
+            rw.RemoveAtom(i)
+    try:
+        Chem.SanitizeMol(rw)
+    except Exception:
+        return None
+    return rw.GetMol()
+
+
+def _reassign_with_fallback(raw_mol: Chem.Mol | None, template: Chem.Mol) -> tuple[Chem.Mol | None, Chem.Mol]:
+    """Attempt ``AssignBondOrdersFromTemplate`` with an MCS-pruned template
+    fallback when atom counts disagree.
+
+    Returns ``(reassigned_mol, effective_template)`` — ``effective_template``
+    is what was actually used (pruned or original), so callers can reuse it
+    on the partner molecule (e.g. prune the predicted ligand the same way
+    before computing RMSD).
+    """
+    if raw_mol is None:
+        return None, template
+    if raw_mol.GetNumAtoms() == template.GetNumAtoms():
+        try:
+            return AssignBondOrdersFromTemplate(template, raw_mol), template
+        except Exception:
+            return None, template
+    pruned = _prune_template_to_match(raw_mol, template)
+    if pruned is None:
+        return None, template
+    try:
+        return AssignBondOrdersFromTemplate(pruned, raw_mol), pruned
+    except Exception:
+        return None, pruned
+
+
+def _sanitize_loose(mol: Chem.Mol | None) -> Chem.Mol | None:
+    """Best-effort sanitize that skips valence/aromaticity checks so
+    organometallics (HEM Fe, B12 Co) and partial structures still yield
+    usable Mol objects. Returns the same mol if all attempts fail.
+    """
+    if mol is None:
+        return None
+    try:
+        Chem.SanitizeMol(
+            mol,
+            sanitizeOps=(
+                Chem.SANITIZE_ALL ^ Chem.SANITIZE_PROPERTIES ^ Chem.SANITIZE_KEKULIZE
+            ),
+        )
+    except Exception:
+        try:
+            mol.UpdatePropertyCache(strict=False)
+        except Exception:
+            pass
+    return mol
+
+
+def _mcs_rmsd(pred: Chem.Mol, ref: Chem.Mol) -> float | None:
+    """Compute heavy-atom RMSD over the MCS atom mapping — no rigid-body
+    re-alignment of the ligand.
+
+    Used when ``pose_rmsd`` (which requires a full substructure match of
+    one mol inside the other) returns nan. Accepts partial overlaps
+    (small MCS), so the RMSD reflects placement quality on whichever
+    atoms the two molecules share.
+    """
+    if pred is None or ref is None:
+        return None
+    try:
+        mcs = rdFMCS.FindMCS(
+            [pred, ref],
+            atomCompare=rdFMCS.AtomCompare.CompareElements,
+            bondCompare=rdFMCS.BondCompare.CompareAny,
+            matchValences=False,
+            ringMatchesRingOnly=False,
+            completeRingsOnly=False,
+            timeout=30,
+        )
+    except Exception:
+        return None
+    if mcs.numAtoms < 4:
+        return None
+    patt = Chem.MolFromSmarts(mcs.smartsString)
+    if patt is None:
+        return None
+    p_match = pred.GetSubstructMatch(patt)
+    r_matches = ref.GetSubstructMatches(patt, uniquify=False)
+    if not p_match or not r_matches:
+        return None
+    pconf = pred.GetConformer()
+    rconf = ref.GetConformer()
+    best = math.inf
+    for rm in r_matches[:1000]:
+        d2 = 0.0
+        for pi, ri in zip(p_match, rm):
+            pp = pconf.GetAtomPosition(pi)
+            rr = rconf.GetAtomPosition(ri)
+            d2 += (pp.x - rr.x) ** 2 + (pp.y - rr.y) ** 2 + (pp.z - rr.z) ** 2
+        best = min(best, math.sqrt(d2 / len(p_match)))
+    return float(best)
+
+
+def _largest_template_matching_fragment(mol: Chem.Mol, template: Chem.Mol) -> Chem.Mol | None:
+    """Select the connected fragment whose atom count best matches
+    ``template`` — exact match preferred, otherwise the largest.
+
+    Multi-ligand LG rows sometimes carry a phantom extra fragment in a
+    single MDL block (e.g. 8s7n MODEL-1 has FAD+EOL concatenated → 65
+    atoms vs FAD template 53). Picking the correct fragment is required
+    before bond reassignment.
+    """
+    frags = Chem.GetMolFrags(mol, asMols=True, sanitizeFrags=False)
+    if len(frags) <= 1:
+        return mol
+    tmpl_n = template.GetNumAtoms()
+    exact = [f for f in frags if f.GetNumAtoms() == tmpl_n]
+    if exact:
+        return exact[0]
+    # Fall back to MCS size — larger fragment is not always the ligand we want.
+    best_frag, best_score = None, -1
+    for f in frags:
+        try:
+            mcs = rdFMCS.FindMCS(
+                [f, template],
+                atomCompare=rdFMCS.AtomCompare.CompareElements,
+                bondCompare=rdFMCS.BondCompare.CompareAny,
+                timeout=10,
+            )
+            score = mcs.numAtoms
+        except Exception:
+            score = f.GetNumAtoms()
+        if score > best_score:
+            best_frag, best_score = f, score
+    return best_frag
+
 ROOT = Path(__file__).parent
 TSV = Path("/home/jaemin/DB/RCSB/processed/seqid_zones_2025_nonredundant.tsv")
 RCSB_DB = Path("/home/jaemin/DB/RCSB/processed/rcsb_index.db")
@@ -52,12 +263,15 @@ def load_targets() -> dict[str, dict]:
     out = {}
     with TSV.open() as fh:
         for row in csv.DictReader(fh, delimiter="\t"):
+            ccds = row["candidate_ccd_codes"].split("|")
+            smis = _smart_split_smiles(row.get("candidate_smiles") or "",
+                                       expected_count=len(ccds))
             out[row["pdb_id"]] = {
                 "seq_zone": row["seq_zone"],
                 "max_seq_identity": float(row.get("max_seq_identity") or 0),
                 "deposition_date": row.get("deposition_date", ""),
-                "candidate_ccd_codes": row["candidate_ccd_codes"].split("|"),
-                "candidate_smiles": row["candidate_smiles"].split("|"),
+                "candidate_ccd_codes": ccds,
+                "candidate_smiles": smis,
                 "ligand_ccd_codes": row["ligand_ccd_codes"].split("|"),
                 "sequences": row["sequences"].split("|"),
                 "organism": row.get("organism_name", ""),
@@ -301,9 +515,18 @@ def write_pred_protein_pdb(atom_lines: list[str], out_pdb: Path) -> bool:
     return True
 
 
-def load_crystal_ligand(cif: Path, target_ccd: str, template: Chem.Mol) -> Chem.Mol | None:
-    """Extract the first residue named ``target_ccd`` as an RDKit Mol
-    with bond orders reassigned from the SMILES template."""
+def load_crystal_ligand(
+    cif: Path, target_ccd: str, template: Chem.Mol
+) -> tuple[Chem.Mol | None, Chem.Mol]:
+    """Extract the first residue named ``target_ccd`` as an RDKit Mol.
+
+    Returns ``(ref_lig_mol, effective_template)``. The preferred path
+    reassigns bond orders from ``template`` (and from an MCS-pruned
+    template when the crystal has fewer atoms, e.g. glycan-linked NAG).
+    If reassignment fails — organometallics like HEM/B12 trip RDKit's
+    valence checker — we fall back to a loosely-sanitized raw Mol so the
+    evaluator can still compute an MCS-based RMSD downstream.
+    """
     st = gemmi.read_structure(str(cif))
     lig_lines: list[str] = []
     serial = 1
@@ -327,9 +550,14 @@ def load_crystal_ligand(cif: Path, target_ccd: str, template: Chem.Mol) -> Chem.
                 break
         break
     if not lig_lines:
-        return None
+        return None, template
     raw = Chem.MolFromPDBBlock("".join(lig_lines) + "END\n", removeHs=True, sanitize=False)
-    return reassign_bonds(raw, template)
+    if raw is None:
+        return None, template
+    reassigned, eff = _reassign_with_fallback(raw, template)
+    if reassigned is not None:
+        return reassigned, eff
+    return _sanitize_loose(raw), template
 
 
 def evaluate_target(pdb_id: str, meta: dict, lg_path: Path, work_dir: Path) -> dict:
@@ -354,7 +582,7 @@ def evaluate_target(pdb_id: str, meta: dict, lg_path: Path, work_dir: Path) -> d
         out["error"] = "crystal protein dump failed"
         return out
 
-    ref_lig = load_crystal_ligand(cif, ccd, template)
+    ref_lig, eff_template = load_crystal_ligand(cif, ccd, template)
     if ref_lig is None:
         out["error"] = f"exper ligand {ccd} parse/reassign failed"
         return out
@@ -380,16 +608,39 @@ def evaluate_target(pdb_id: str, meta: dict, lg_path: Path, work_dir: Path) -> d
         entry["tm_score"] = round(tm, 3)
         entry["protein_rmsd_usalign"] = round(prot_rmsd, 3)
         pred_raw = mol_from_mdl_body(m["mdl_text"])
-        pred_mol = reassign_bonds(pred_raw, template)
+        if pred_raw is not None:
+            # Multi-ligand LG rows occasionally pack two ligands into one
+            # MDL block — keep the fragment whose atom count matches the
+            # template (or has the largest MCS overlap).
+            pred_raw = _largest_template_matching_fragment(pred_raw, eff_template)
+        if pred_raw is None:
+            entry["error"] = "pred ligand parse/reassign failed"
+            out["models"].append(entry)
+            continue
+        pred_mol, _ = _reassign_with_fallback(pred_raw, eff_template)
+        if pred_mol is None:
+            # Fall back to the loosely-sanitized raw mol so MCS-RMSD can
+            # still run on pred/ref atom overlap (e.g. B12 MODEL-1 has a
+            # 27-atom pred vs 91-atom crystal).
+            pred_mol = _sanitize_loose(pred_raw)
         if pred_mol is None:
             entry["error"] = "pred ligand parse/reassign failed"
             out["models"].append(entry)
             continue
         transform_mol(pred_mol, R, t)
+        rmsd = None
         try:
-            entry["ligand_rmsd"] = round(pose_rmsd(pred_mol, ref_lig), 3)
-        except Exception as e:
-            entry["error"] = f"rmsd err: {e}"
+            r = pose_rmsd(pred_mol, ref_lig)
+            if not math.isnan(r):
+                rmsd = r
+        except Exception:
+            pass
+        if rmsd is None:
+            rmsd = _mcs_rmsd(pred_mol, ref_lig)
+        if rmsd is None:
+            entry["error"] = "rmsd unresolved"
+        else:
+            entry["ligand_rmsd"] = round(rmsd, 3)
         out["models"].append(entry)
 
     rmsds = [m.get("ligand_rmsd") for m in out["models"] if isinstance(m.get("ligand_rmsd"), float)]
