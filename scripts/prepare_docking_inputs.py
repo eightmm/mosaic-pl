@@ -518,6 +518,95 @@ def _extract_cofolding_ligand_centroid(cif_path: Path) -> list[float] | None:
         return None
 
 
+# Cofold-ligand cluster knobs (Stage 4 binding-site source registration). All
+# four models × 5 seeds × 5 samples = 100 placements live in the same frame
+# after Stage 2.5 alignment, so a single-link cluster on their centroids
+# captures multi-pocket / inter-model disagreement signal that the old
+# "best-model single-centroid" extraction discarded.
+COFOLD_CLUSTER_CUTOFF = 5.0       # Å — same as template-pocket cluster
+COFOLD_CLUSTER_MIN_MEMBERS = 5    # out of ~100 placements
+COFOLD_CLUSTER_TOP_K = 3
+
+
+def _extract_cofolding_ligand_clusters(run_dir: Path) -> list[dict]:
+    """Cluster ligand centroids across every aligned cofolding CIF.
+
+    Iterates ``outputs/{boltz2,boltz2x,protenix,alphafold3}/**/*_aligned.cif``
+    (typically 4 models × 25 seeds = 100 placements, all in the same
+    coordinate frame after ``align_cofolding_outputs.py``), pulls the
+    heavy-atom ligand centroid from each, and runs greedy single-link
+    clustering with a ``COFOLD_CLUSTER_CUTOFF`` Å cutoff.
+
+    Returns the top-``COFOLD_CLUSTER_TOP_K`` clusters with at least
+    ``COFOLD_CLUSTER_MIN_MEMBERS`` placements, sorted by ``n_members``
+    descending. Each entry::
+
+        {"centroid": [x, y, z],
+         "n_members": int,
+         "n_unique_models": int,
+         "models": [str, ...]}
+
+    Well-converged targets collapse all 100 placements into a single cluster
+    → returns one entry (matches the legacy single-centroid behaviour). Multi-
+    pocket / inter-model-disagreement targets get 2–3 cluster centroids → each
+    becomes its own ``cofolding_N`` binding-site source so docking covers every
+    pocket the cofold ensemble agrees on.
+
+    The MIN_MEMBERS filter drops single-placement strays (alternate / spurious
+    sites). Real binding pockets typically attract ≥ 5 of 100 placements; the
+    threshold is conservative because any signal below that is unlikely to
+    survive even one round of seed/sample re-rolling.
+    """
+    placements: list[tuple[list[float], str]] = []
+    for model in ("boltz2", "boltz2x", "protenix", "alphafold3"):
+        model_dir = run_dir / "outputs" / model
+        if not model_dir.exists():
+            continue
+        for cif in sorted(model_dir.rglob("*_aligned.cif")):
+            c = _extract_cofolding_ligand_centroid(cif)
+            if c is not None:
+                placements.append((c, model))
+
+    if not placements:
+        return []
+
+    cutoff_sq = COFOLD_CLUSTER_CUTOFF ** 2
+    clusters: list[dict] = []
+    for centroid, model in placements:
+        joined = False
+        for cl in clusters:
+            cx, cy, cz = cl["centroid"]
+            d2 = (centroid[0] - cx) ** 2 + (centroid[1] - cy) ** 2 + (centroid[2] - cz) ** 2
+            if d2 <= cutoff_sq:
+                cl["points"].append(centroid)
+                cl["models"].append(model)
+                n = len(cl["points"])
+                cl["centroid"] = [
+                    sum(p[0] for p in cl["points"]) / n,
+                    sum(p[1] for p in cl["points"]) / n,
+                    sum(p[2] for p in cl["points"]) / n,
+                ]
+                joined = True
+                break
+        if not joined:
+            clusters.append({"centroid": list(centroid),
+                             "points": [list(centroid)],
+                             "models": [model]})
+
+    out = []
+    for cl in clusters:
+        if len(cl["points"]) < COFOLD_CLUSTER_MIN_MEMBERS:
+            continue
+        out.append({
+            "centroid": [round(x, 4) for x in cl["centroid"]],
+            "n_members": len(cl["points"]),
+            "n_unique_models": len(set(cl["models"])),
+            "models": sorted(set(cl["models"])),
+        })
+    out.sort(key=lambda d: -d["n_members"])
+    return out[:COFOLD_CLUSTER_TOP_K]
+
+
 TEMPLATE_CONSENSUS_TOP_K = 10
 TEMPLATE_CONSENSUS_MIN_MEMBERS = 2
 TEMPLATE_CONSENSUS_BOX_SIZE = [22.5, 22.5, 22.5]
@@ -710,14 +799,32 @@ def main() -> int:
     box_method = "fallback"
     binding_site_results = {}
 
-    # 4a. Cofolding predicted ligand centroid (most direct signal — the
-    #     cofolding model already placed the ligand in what it thinks is the
-    #     binding pocket). Extract from the selected CIF.
-    cofold_center = _extract_cofolding_ligand_centroid(structure)
-    if cofold_center is not None:
-        default_size = [22.5, 22.5, 22.5]
-        binding_site_results["cofolding"] = (cofold_center, default_size)
-        print(f"  Cofolding ligand centroid: {cofold_center}")
+    # 4a. Cofolding predicted ligand centroids — cluster across every
+    #     aligned cofold cif (4 models × 25 seeds = 100 placements after
+    #     Stage 2.5 alignment). Each top-K cluster centroid becomes its
+    #     own ``cofolding_N`` binding-site source so docking covers all
+    #     pockets the cofold ensemble agrees on. Well-converged targets
+    #     collapse into a single cluster (= legacy behaviour); multi-
+    #     pocket / inter-model-disagreement targets get 2-3 sources.
+    default_size = [22.5, 22.5, 22.5]
+    cofold_clusters = _extract_cofolding_ligand_clusters(args.run_dir)
+    for rank, cl in enumerate(cofold_clusters, start=1):
+        src_name = f"cofolding_{rank}"
+        binding_site_results[src_name] = (
+            cl["centroid"],
+            list(default_size),
+            {
+                "n_members": cl["n_members"],
+                "n_unique_models": cl["n_unique_models"],
+                "models": cl["models"],
+                "cluster_rank": rank,
+            },
+        )
+        print(f"  Cofolding cluster #{rank}: {cl['centroid']} "
+              f"(n_members={cl['n_members']}, models={cl['models']})")
+    if not cofold_clusters:
+        print("  WARNING: no cofolding ligand clusters passed "
+              f"min_members={COFOLD_CLUSTER_MIN_MEMBERS} filter")
 
     # 4b. SwinSite (ML-based surface pocket predictor, needs GPU)
     print("  Running SwinSite binding site prediction...")
@@ -744,8 +851,9 @@ def main() -> int:
     # docking variant downstream — this picks only the legacy single-box
     # field). Strong template-consensus pockets (n_unique_pdb≥2) win over
     # swinsite/p2rank because multi-template agreement is the highest-quality
-    # binding-site signal we have when seq+struct templates align.
-    priority = ["cofolding"]
+    # binding-site signal we have when seq+struct templates align. Within
+    # cofold sources, cofolding_1 (largest cluster) is preferred.
+    priority = [f"cofolding_{i}" for i in range(1, COFOLD_CLUSTER_TOP_K + 1)]
     for src in consensus_sources:
         info = binding_site_results.get(src)
         if isinstance(info, tuple) and len(info) >= 3 and info[2].get("n_unique_pdb", 0) >= 2:

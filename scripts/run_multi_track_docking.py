@@ -459,13 +459,20 @@ def main() -> int:
             cof_path = data.get("cofolding_structure")
             if cof_path and Path(cof_path).exists():
                 cofold_ref_cif = Path(cof_path)
-            # Track 1's box_method == "cofolding" gives us the cofold
+            # Track 1's box_method == "cofolding_*" gives us the cofold
             # ligand centroid; on multimers that's the chain we want
-            # Track 2 to dock against too.
-            bs = (data.get("binding_site_predictions") or {}).get("cofolding") or {}
-            anchor = bs.get("center") or (data.get("box_center")
-                                          if data.get("box_method") == "cofolding"
-                                          else None)
+            # Track 2 to dock against too. cofolding_1 is the largest
+            # cluster (most placements) so it's the canonical anchor;
+            # if missing (low-confidence target), fall back to whatever
+            # cofolding_N is registered.
+            bs_preds = data.get("binding_site_predictions") or {}
+            cofold_keys = sorted(k for k in bs_preds.keys() if k.startswith("cofolding_"))
+            bs = bs_preds[cofold_keys[0]] if cofold_keys else {}
+            anchor = bs.get("center") or (
+                data.get("box_center")
+                if str(data.get("box_method", "")).startswith("cofolding")
+                else None
+            )
             if anchor and len(anchor) == 3:
                 cofold_lig_anchor = [float(v) for v in anchor]
         except Exception:

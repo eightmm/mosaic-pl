@@ -772,7 +772,15 @@ def _load_docking_prep_summary(run_dir: Path) -> dict[str, Any] | None:
 
 
 _DOCKING_BOX_SOURCES = (
-    "cofolding",
+    # Cofolding clusters — top-K of single-link clustering across all aligned
+    # cofold cifs (4 models × 25 seeds = 100 placements). Well-converged
+    # targets only fill cofolding_1; multi-pocket / inter-model-disagreement
+    # targets register 2-3. Variants with no matching source clean-skip at
+    # runtime, so a target that only produces one cluster behaves like the
+    # legacy single-cofolding-source pipeline.
+    "cofolding_1",
+    "cofolding_2",
+    "cofolding_3",
     "swinsite",
     "p2rank",
     # Template-consensus pockets (top-K from spatial cluster of bound-ligand
@@ -803,12 +811,15 @@ def prepare_vina(
     """Emit one PreparedModelRun per binding-site source.
 
     Instead of dispatching docking from a single box center (the old
-    priority-picked "best" prediction), we create three independent variants —
-    ``vina_cofolding``, ``vina_swinsite``, ``vina_p2rank`` — each reading its
-    designated center from ``docking_prep_summary.binding_site_predictions``
-    at runtime. Variants whose predictor yielded no pocket exit cleanly so
-    the pipeline does not fail; downstream post-analysis simply sees fewer
-    pose files for that tool key.
+    priority-picked "best" prediction), we create independent variants per
+    source listed in ``_DOCKING_BOX_SOURCES``: ``vina_cofolding_{1..3}``
+    (top-K cofold ligand clusters), ``vina_swinsite``, ``vina_p2rank``,
+    and ``vina_template_consensus_{1..10}`` (top-K template-consensus
+    pockets). Each reads its designated center from
+    ``docking_prep_summary.binding_site_predictions`` at runtime. Variants
+    whose predictor yielded no pocket exit cleanly so the pipeline does
+    not fail; downstream post-analysis simply sees fewer pose files for
+    that tool key.
     """
     if not config.vina.enabled:
         return []

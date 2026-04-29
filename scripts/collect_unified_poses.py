@@ -57,7 +57,7 @@ from compute_submission_scores import (  # noqa: E402
 # Source / pose-name parsers                                                  #
 # --------------------------------------------------------------------------- #
 
-_BOX_SOURCES = ("cofolding", "swinsite", "p2rank", "template_consensus_")
+_BOX_SOURCES = ("cofolding_", "swinsite", "p2rank", "template_consensus_")
 _RE_SEED = re.compile(r"_seed[_-](\d+)")
 _RE_POSE_TAIL = re.compile(r"_(\d+)$")
 _RE_SAMPLE = re.compile(r"sample[_-](\d+)")

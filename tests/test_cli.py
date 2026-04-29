@@ -315,7 +315,9 @@ def test_prepare_vina_and_validate_docking_stage(tmp_path: Path) -> None:
     prepared = prepare_vina_run(common, config, tmp_path, "slurm")
     names = [m.model_name for m in prepared.model_runs]
     assert names == [
-        "vina_cofolding",
+        "vina_cofolding_1",
+        "vina_cofolding_2",
+        "vina_cofolding_3",
         "vina_swinsite",
         "vina_p2rank",
         "vina_template_consensus_1",
@@ -476,15 +478,20 @@ def test_prepare_docking_run_combines_vina_and_protenix_dock(tmp_path: Path) -> 
 
     prepared = prepare_docking_run(common, config, tmp_path, "slurm")
     model_names = [m.model_name for m in prepared.model_runs]
-    # Vina fans out into one variant per binding-site source: 3 predictor
-    # sources (cofolding/swinsite/p2rank) + 10 template-consensus pocket
-    # centroids (top-K cluster centers from mmseqs+foldseek union).
+    # Vina fans out into one variant per binding-site source:
+    #   - 3 cofold-cluster sources (top-K of cofolding ligand clusters
+    #     across 4 models × 25 seeds, registered as cofolding_{1,2,3})
+    #   - 2 predictor sources (swinsite, p2rank)
+    #   - 10 template-consensus pocket centroids (top-K cluster centers
+    #     from mmseqs+foldseek union)
+    expected_cofold = {f"vina_cofolding_{i}" for i in range(1, 4)}
     expected_consensus = {f"vina_template_consensus_{i}" for i in range(1, 11)}
-    assert {"vina_cofolding", "vina_swinsite", "vina_p2rank"}.issubset(set(model_names))
+    assert expected_cofold.issubset(set(model_names))
+    assert {"vina_swinsite", "vina_p2rank"}.issubset(set(model_names))
     assert expected_consensus.issubset(set(model_names))
     assert "protenix-dock" in model_names
-    # 13 vina variants + 1 protenix-dock; autodock_gpu disabled in this fixture.
-    assert len(prepared.model_runs) == 14
+    # 15 vina variants + 1 protenix-dock; autodock_gpu disabled in this fixture.
+    assert len(prepared.model_runs) == 16
 
 
 def test_write_example_config_includes_protenix_dock(tmp_path: Path) -> None:
