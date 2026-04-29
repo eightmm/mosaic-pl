@@ -12,26 +12,24 @@ End-to-end pipeline: **단백질 서열 + 리간드 SMILES 의 unified YAML 한 
 flowchart TB
     INPUT["Unified YAML\n(protein FASTA + ligand SMILES)"]
 
-    subgraph S1["1. Template Search (mmseqs ∪ foldseek)"]
-        direction LR
-        MM["mmseqs\nrcsb_seqDB"]
-        FS["foldseek\nrcsb_structDB"]
-    end
+    MM["1a. mmseqs2\nsequence search\n(rcsb_seqDB, 488k seqs)\n→ mmseqs_hits.tsv"]
 
     subgraph S2["2. Co-folding (5 seeds × 5 samples = 25/model)"]
         direction LR
         B2["Boltz-2"] --- B2X["Boltz-2x"] --- PTX["Protenix"] --- AF3["AF3"]
     end
 
+    FS["1b. foldseek\nstructure search\n(rcsb_structDB, 251k structs)\nquery = best cofold cif\n→ foldseek_hits.tsv"]
+
     subgraph SB["Template bridges (auto)"]
         direction TB
-        F1["Union filter\nby (pdb_id, chain_id)"]
-        F2["Pocket extraction\n(USalign per hit)"]
+        F1["Union filter\nby (pdb_id, chain_id)\nNO MCS gate"]
+        F2["Pocket extraction\n(USalign per hit\n→ ligand centroid in cofold frame)"]
         F3["Pocket clustering\n(single-link 5 Å)\n→ template_consensus_1..10"]
         F1 --> F2 --> F3
     end
 
-    AL["Frame alignment\n*_aligned.cif"]
+    AL["Frame alignment\n*_aligned.cif (Kabsch CA)"]
     PREP["Docking prep\n13 binding-site sources"]
 
     subgraph S5["3. Docking"]
@@ -47,8 +45,9 @@ flowchart TB
 
     INPUT --> MM
     INPUT --> S2
-    S2 --> FS
-    MM & FS --> SB
+    S2 -->|"best cofold cif\n(query_model_priority)"| FS
+    MM --> F1
+    FS --> F1
     SB --> PREP
     S2 --> AL --> PREP
     PREP --> T1
@@ -60,6 +59,8 @@ flowchart TB
     ION --> POST
     POST --> LG
 
+    style MM fill:#4fc3f7,color:#000
+    style FS fill:#4fc3f7,color:#000
     style F3 fill:#ffd54f,color:#000
     style LG fill:#66bb6a,color:#000
 ```
