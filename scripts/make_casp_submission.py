@@ -267,6 +267,74 @@ def pose_to_mdl(
     )
 
 
+def extract_cofolded_ligand_mdl(
+    cif_path: Path,
+    output_mol: Path,
+    title: str | None = None,
+) -> Path | None:
+    """Fallback when no docking poses exist — extract the ligand as predicted
+    by the cofolding model and emit an MDL block. Returns the path on success,
+    or ``None`` if extraction fails (e.g. CIF has no ligand atoms).
+
+    Docking can legitimately produce zero poses on pathological SMILES
+    (very large/flexible ligands where RDKit/ETKDG refuses to embed, or
+    Vina/ADG cannot even parse the PDBQT). In that case the cofolding
+    model's own bound-pose prediction is the only pose we have, so we use
+    it as MODEL 1 with a low LSCORE to signal the fallback path.
+
+    Uses gemmi for CIF → ligand-only PDB and RDKit for PDB → MDL (no obabel
+    dependency, keeps the submission path runnable on the master node where
+    openbabel may not be installed).
+    """
+    import gemmi
+    from rdkit import Chem
+
+    structure = gemmi.read_structure(str(cif_path))
+    tmp_pdb = output_mol.with_suffix(".lig.pdb")
+    lig_lines: list[str] = []
+    atom_idx = 0
+    for model in structure:
+        for chain in model:
+            for residue in chain:
+                if residue.name in {"HOH", "WAT", "DOD"}:
+                    continue
+                tab = gemmi.find_tabulated_residue(residue.name)
+                if tab and tab.is_amino_acid():
+                    continue
+                for atom in residue:
+                    atom_idx += 1
+                    el = (atom.element.name or atom.name.strip()[:1]).upper()
+                    # Columns match the PDB HETATM record format exactly so
+                    # RDKit's PDB reader assigns the right element.
+                    lig_lines.append(
+                        f"HETATM{atom_idx:5d} {atom.name:<4.4s} {residue.name:<3.3s} "
+                        f"A{residue.seqid.num:4d}    "
+                        f"{atom.pos.x:8.3f}{atom.pos.y:8.3f}{atom.pos.z:8.3f}"
+                        f"  1.00{atom.b_iso:6.2f}          {el:>2s}"
+                    )
+        break
+    if not lig_lines:
+        return None
+
+    tmp_pdb.write_text("\n".join(lig_lines) + "\nEND\n")
+
+    mol = Chem.MolFromPDBFile(str(tmp_pdb), removeHs=False, sanitize=False)
+    tmp_pdb.unlink(missing_ok=True)
+    if mol is None or mol.GetNumAtoms() == 0:
+        return None
+    try:
+        Chem.SanitizeMol(
+            mol,
+            sanitizeOps=Chem.SANITIZE_ALL ^ Chem.SANITIZE_KEKULIZE ^ Chem.SANITIZE_PROPERTIES,
+        )
+    except Exception:
+        pass
+    if title:
+        mol.SetProp("_Name", title)
+    output_mol.write_text(Chem.MolToMolBlock(mol, kekulize=False))
+    return output_mol
+
+
 def _sdf_to_mdl(
     sdf_path: Path,
     output_mol: Path,
@@ -343,25 +411,41 @@ def build_lg_submission(
     target_id: str,
     author: str,
     method: str,
-    protein_pdb_lines: list[str],
     models: list[dict],
-    ligand_number: int,
-    ligand_name: str,
     parent: str = "N/A",
-    remark: str = "",
 ) -> str:
-    """Assemble CASP17 LG format submission text (multi-model).
+    """Assemble CASP17 LG format submission text per docs/casp17_lg_format.md.
 
-    ``models`` is a list of dicts, each containing at least ``ligand_mdl``
-    (the MDL V2000 text for that model's pose) and optionally ``lscore``.
-    Models are emitted in list order as ``MODEL 1``, ``MODEL 2``, … The
-    protein ATOM block is shared across all models (same cofolding receptor
-    frame), so we only emit it once per MODEL block to stay compatible with
-    the CASP LG parser, which expects a complete PARENT/ATOM/TER/LIGAND set
-    inside each MODEL.
+    Each entry in ``models`` is one complete prediction snapshot:
+
+        {
+          "protein_pdb_lines": list[str],    # ATOM/HETATM/TER rows, receptor
+          "parent": str | None,              # overrides top-level parent
+          "remark": str | None,              # optional REMARK inside MODEL
+          "ligands": [                       # one entry per ligand of target
+            {
+              "ligand_number": int,          # e.g. 1, 2
+              "ligand_name": str,            # e.g. "LIG"
+              "ligand_mdl": str,             # MDL V2000 body, should end "M  END"
+              "lscore": float | None,        # optional, [0,1]
+            },
+            ...
+          ],
+          "affinity_nM": float | None,       # optional, per-MODEL
+        }
+
+    For multi-ligand targets each MODEL MUST carry every ligand of the target
+    (this is the CASP LG spec — a MODEL is the "whole complex at rank k").
+    The function emits up to 5 MODELs with their own PARENT/ATOM/TER/LIGAND*/
+    AFFNTY/END structure. MODEL 1 = primary prediction.
     """
     if not models:
         raise ValueError("build_lg_submission requires at least one model")
+    if len(models) > 5:
+        raise ValueError(
+            f"LG format allows at most 5 MODEL blocks; got {len(models)}. "
+            "Truncate to top-5 before calling."
+        )
 
     lines = [
         "PFRMAT LG",
@@ -371,27 +455,41 @@ def build_lg_submission(
         "METHOD -------------",
     ]
 
-    # Ensure protein has a terminator row we can reuse.
-    protein_block = list(protein_pdb_lines)
-    if not protein_block or not protein_block[-1].startswith("TER"):
-        protein_block.append("TER")
-
     for idx, model in enumerate(models, start=1):
+        ligand_entries = model.get("ligands") or []
+        if not ligand_entries:
+            raise ValueError(f"MODEL {idx} has no ligand entries")
+
         lines.append(f"MODEL {idx}")
+        remark = model.get("remark")
         if remark:
             lines.append(f"REMARK {remark}")
-        lines.append(f"PARENT {parent}")
+        lines.append(f"PARENT {model.get('parent') or parent}")
+
+        # Receptor coordinates (ensure TER terminates chain)
+        protein_block = list(model.get("protein_pdb_lines") or [])
+        if not protein_block or not protein_block[-1].startswith("TER"):
+            protein_block.append("TER")
         lines.extend(protein_block)
-        lines.append(f"LIGAND {ligand_number:03d} {ligand_name}")
-        if model.get("lscore") is not None:
-            lines.append(f"LSCORE {model['lscore']:.3f}")
 
-        mdl_text = (model.get("ligand_mdl") or "").rstrip()
-        if not mdl_text.endswith("M  END"):
-            mdl_text += "\nM  END"
-        lines.append(mdl_text)
+        # One LIGAND block per ligand
+        for lig in ligand_entries:
+            ligand_number = int(lig["ligand_number"])
+            ligand_name = str(lig["ligand_name"])
+            lines.append(f"LIGAND {ligand_number:03d} {ligand_name}")
+            if lig.get("lscore") is not None:
+                lines.append(f"LSCORE {float(lig['lscore']):.3f}")
+            mdl_text = (lig.get("ligand_mdl") or "").rstrip()
+            if not mdl_text.endswith("M  END"):
+                mdl_text += "\nM  END"
+            lines.append(mdl_text)
 
-    lines.append("END")
+        # Per-MODEL AFFNTY before END
+        if model.get("affinity_nM") is not None:
+            lines.append(f"AFFNTY {float(model['affinity_nM']):.3f} aa")
+
+        lines.append("END")
+
     return "\n".join(lines) + "\n"
 
 
@@ -399,36 +497,102 @@ def build_lg_submission_with_affinity(
     target_id: str,
     author: str,
     method: str,
-    protein_pdb_lines: list[str],
     models: list[dict],
-    ligand_number: int,
-    ligand_name: str,
-    affinity_nM: float | None = None,
     parent: str = "N/A",
-    remark: str = "",
 ) -> str:
-    """Assemble LG submission with optional AFFNTY record (per-complex)."""
-    result = build_lg_submission(
+    """Thin alias retained for call-site compatibility — AFFNTY is now carried
+    per-MODEL inside the ``models`` list, not as a top-level argument.
+    """
+    return build_lg_submission(
         target_id=target_id,
         author=author,
         method=method,
-        protein_pdb_lines=protein_pdb_lines,
         models=models,
-        ligand_number=ligand_number,
-        ligand_name=ligand_name,
         parent=parent,
-        remark=remark,
     )
-    if affinity_nM is None:
-        return result
-    # Insert AFFNTY before the final END (per-complex, not per-MODEL)
-    lines = result.rstrip().splitlines()
-    if lines[-1] == "END":
-        lines.insert(-1, f"AFFNTY {affinity_nM:.3f} aa")
-    else:
-        lines.append(f"AFFNTY {affinity_nM:.3f} aa")
-        lines.append("END")
-    return "\n".join(lines) + "\n"
+
+
+def _load_target_ligands(run_dir: Path) -> list[dict]:
+    """Read ``inputs/docking/docking_prep_summary.json`` and return the
+    normalized ligand list the submission needs.
+
+    Each entry has ``{"ligand_id": "L"|"L2"|..., "ligand_number": int,
+    "ligand_name": str}``. ``ligand_number`` is derived from position in
+    the summary (1-indexed — matches the SMILES file's convention).
+    ``ligand_name`` defaults to ``"LIG"`` per CASP convention but callers
+    can override via CLI.
+    """
+    summary_path = run_dir / "inputs" / "docking" / "docking_prep_summary.json"
+    if not summary_path.exists():
+        return []
+    try:
+        data = json.loads(summary_path.read_text())
+    except Exception as e:
+        print(f"  WARNING: could not parse {summary_path}: {e}")
+        return []
+    ligs = data.get("ligands") or []
+    out = []
+    for i, lig in enumerate(ligs, start=1):
+        out.append({
+            "ligand_id": str(lig.get("id") or f"L{i}"),
+            "ligand_number": i,
+            "ligand_name": "LIG",
+        })
+    return out
+
+
+def _select_poses_for_ligand(
+    ligand_id: str,
+    candidate_pool: list,
+    k: int,
+    rmsd_threshold: float,
+    primary: bool,
+) -> list:
+    """Pick up to ``k`` diverse poses for one ligand from the shared pool.
+
+    Filters ``candidate_pool`` by ``PoseScore.ligand_id`` matching the given
+    ``ligand_id``. For backwards compatibility (older runs / legacy dirs
+    whose poses have ``ligand_id is None``), the primary ligand inherits
+    untagged poses.
+    """
+    from compute_submission_scores import select_diverse_top_k  # type: ignore
+
+    filtered = [
+        p for p in candidate_pool
+        if (p.ligand_id == ligand_id) or (primary and p.ligand_id is None)
+    ]
+    if not filtered:
+        return []
+    return select_diverse_top_k(
+        filtered, k=k, rmsd_threshold=rmsd_threshold,
+    )
+
+
+def _cofold_fallback_mdl(
+    cif_path: Path,
+    workdir: Path,
+    ligand_id: str,
+    model_idx: int,
+    protein_model: str,
+) -> str | None:
+    """Extract this ligand from the cofolding CIF and return its MDL body.
+
+    Returns ``None`` if extraction fails. Writes a per-ligand, per-MODEL
+    MOL file under ``workdir`` to keep artifacts around for debugging.
+
+    Current implementation extracts the first non-protein residue from the
+    CIF and returns that — which is OK for single-ligand targets but
+    **ambiguous for multi-ligand**. Full per-ligand CIF extraction is
+    Task 4's responsibility; for now non-primary ligands may get the same
+    (first-ligand) MDL if the CIF doesn't clearly separate them.
+    """
+    mol_path = workdir / f"ligand_{ligand_id}_model{model_idx}.mol"
+    extracted = extract_cofolded_ligand_mdl(
+        cif_path, mol_path, title=f"cofolded_{protein_model}_{ligand_id}",
+    )
+    if extracted is None:
+        return None
+    return extracted.read_text()
 
 
 def main() -> int:
@@ -437,10 +601,8 @@ def main() -> int:
                         help="Pipeline run directory (experiments/runs/<target>)")
     parser.add_argument("--target-id", type=str, required=True,
                         help="CASP target identifier (e.g., L2001)")
-    parser.add_argument("--ligand-name", type=str, required=True,
-                        help="Ligand name from SMILES file (e.g., 761)")
-    parser.add_argument("--ligand-number", type=int, default=1,
-                        help="Ligand number within target (default: 1)")
+    parser.add_argument("--ligand-name", type=str, default="LIG",
+                        help="Ligand name from SMILES file (default: LIG per CASP convention)")
     parser.add_argument("--author", type=str, required=True,
                         help="CASP registration code (XXXX-XXXX-XXXX)")
     parser.add_argument("--method", type=str, required=True,
@@ -455,14 +617,12 @@ def main() -> int:
                         choices=["auto", "vina", "autodock_gpu", "protenix_dock",
                                  "template", "lig_align"],
                         help="Ligand pose source (default: auto = from scores)")
-    parser.add_argument("--lscore", type=float, default=None,
-                        help="Manual LSCORE override for MODEL 1 [0-1]")
     parser.add_argument("--top-k", type=int, default=5,
                         help="Number of MODELs to emit (default 5, CASP LG allows 1-5)")
     parser.add_argument("--diversity-rmsd", type=float, default=2.0,
                         help="Minimum pairwise heavy-atom RMSD (Å) between MODELs (default 2.0)")
     parser.add_argument("--affinity-nM", type=float, default=None,
-                        help="Manual AFFNTY override (Kd in nM)")
+                        help="Manual AFFNTY override (Kd in nM, applied to every MODEL)")
     parser.add_argument("--include-affinity", action="store_true",
                         help="Include AFFNTY record (auto-computed from scores)")
     parser.add_argument("--output", type=Path, required=True,
@@ -477,7 +637,7 @@ def main() -> int:
     # 1. Aggregate scores first — used for pose selection and LSCORE/AFFNTY
     import sys as _sys
     _sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from compute_submission_scores import aggregate
+    from compute_submission_scores import aggregate, _split_pose_name  # type: ignore
 
     print(f"Aggregating scores from {run_dir}...")
     scores = aggregate(run_dir)
@@ -495,12 +655,25 @@ def main() -> int:
     protein_lines = extract_pdb_atom_lines(protein_pdb)
     print(f"  Protein atoms: {len(protein_lines)}")
 
-    # 3. Select diverse top-k ligand poses
-    print(f"\nSelecting ligand poses (source={args.pose_source}, top_k={args.top_k}, "
-          f"diversity>={args.diversity_rmsd}Å)...")
+    # 3. Discover all ligands of the target
+    target_ligands = _load_target_ligands(run_dir)
+    if not target_ligands:
+        print("  WARNING: no ligands found in docking_prep_summary.json. "
+              "Submission will emit a single LIGAND block using CLI defaults.")
+        target_ligands = [{"ligand_id": "L", "ligand_number": 1, "ligand_name": args.ligand_name}]
+    else:
+        for lig in target_ligands:
+            lig["ligand_name"] = args.ligand_name
+    ligand_summary = ", ".join(
+        f"{lig['ligand_id']}(#{lig['ligand_number']:03d})" for lig in target_ligands
+    )
+    print(f"  Ligands: {ligand_summary}")
 
-    from compute_submission_scores import select_diverse_top_k, _split_pose_name
-
+    # 4. Per-ligand pose selection
+    #
+    # Build a candidate pool once; filter per ligand. Today's pool is
+    # effectively primary-ligand-only (docking runners dock prep[0]); later
+    # the pool will carry per-ligand poses keyed by ligand_id.
     if args.pose_source == "auto":
         candidate_pool = scores.pose_scores
     else:
@@ -509,69 +682,116 @@ def main() -> int:
             print(f"  WARNING: no poses with source={args.pose_source}, falling back to all sources")
             candidate_pool = scores.pose_scores
 
-    selected = select_diverse_top_k(
-        candidate_pool,
-        k=args.top_k,
-        rmsd_threshold=args.diversity_rmsd,
-    )
-    if not selected:
-        raise RuntimeError(
-            "No poses selected — check that post-analysis TSVs exist and that "
-            "outputs/analysis/poses/ contains the staged pose files."
+    print(f"\nSelecting per-ligand top-{args.top_k} poses (diversity >= {args.diversity_rmsd}Å)...")
+    per_ligand_selected: dict[str, list] = {}
+    for i, lig in enumerate(target_ligands):
+        primary = (i == 0)
+        chosen = _select_poses_for_ligand(
+            lig["ligand_id"], candidate_pool,
+            k=args.top_k, rmsd_threshold=args.diversity_rmsd,
+            primary=primary,
         )
+        per_ligand_selected[lig["ligand_id"]] = chosen
+        note = "(primary)" if primary else ""
+        if not chosen:
+            note += " (no scored poses → cofold fallback)" if not primary else " (no scored poses)"
+        print(f"  {lig['ligand_id']}: {len(chosen)} scored poses {note}")
 
-    models: list[dict] = []
-    top_sources: list[str] = []
-    for i, pose in enumerate(selected, start=1):
-        _, rec_idx = _split_pose_name(pose.pose_name)
-        pose_path = pose.pose_file
-        mdl_file = workdir / f"ligand_model{i}.mol"
-        pose_to_mdl(pose_path, mdl_file, pose_index=rec_idx, title=pose.pose_name)
-        mdl_text = mdl_file.read_text()
-        model_lscore = pose.lscore
-        if i == 1 and args.lscore is not None:
-            model_lscore = args.lscore  # user override applies to MODEL 1 only
-        models.append({
-            "ligand_mdl": mdl_text,
-            "lscore": model_lscore,
-            "source": pose.source,
-            "pose_name": pose.pose_name,
-            "ba_pred_pkd": pose.ba_pred_pkd,
-            "rmsd_pred": pose.rmsd_pred,
-        })
-        top_sources.append(pose.source)
-        print(f"  MODEL {i}: {pose.source}/{pose.pose_name} "
-              f"pKd={pose.ba_pred_pkd} pRMSD={pose.rmsd_pred} LSCORE={model_lscore}")
-        print(f"           file={pose_path} record={rec_idx} mdl_lines={len(mdl_text.splitlines())}")
-
-    if len(selected) < args.top_k:
-        print(f"  NOTE: only {len(selected)} of {args.top_k} MODELs satisfy the "
-              f"diversity threshold (>= {args.diversity_rmsd}Å). Submission has "
-              f"{len(selected)} MODELs.")
-
-    # 4. Affinity
+    # 5. Affinity — one value computed from the primary ligand's ensemble,
+    #    written to every MODEL.
     affinity_nM = args.affinity_nM
     if args.include_affinity and affinity_nM is None and scores.ensemble_affinity_nM is not None:
         affinity_nM = scores.ensemble_affinity_nM
         print(f"\nAFFNTY (ensemble): {affinity_nM:.3g} nM "
               f"(log10={scores.ensemble_log_kd_nM:.3f})")
 
-    # 5. Assemble LG submission
-    source_tag = "+".join(dict.fromkeys(top_sources)) or "auto"
-    method_full = f"{args.method} [protein={protein_model}, pose={source_tag}, top{len(selected)}]"
-    remark = args.remark or f"{protein_model} + {source_tag} (top-{len(selected)})"
+    # 6. Assemble up to top_k MODELs, each carrying every ligand.
+    models: list[dict] = []
+    source_summary: list[str] = []
+    for model_idx in range(args.top_k):
+        ligand_entries = []
+        for lig in target_ligands:
+            scored = per_ligand_selected.get(lig["ligand_id"], [])
+            if scored and model_idx < len(scored):
+                pose = scored[model_idx]
+                _, rec_idx = _split_pose_name(pose.pose_name)
+                mdl_file = workdir / f"ligand_{lig['ligand_id']}_model{model_idx+1}.mol"
+                try:
+                    pose_to_mdl(pose.pose_file, mdl_file, pose_index=rec_idx, title=pose.pose_name)
+                    mdl_text = mdl_file.read_text()
+                    source_summary.append(pose.source)
+                    ligand_entries.append({
+                        "ligand_number": lig["ligand_number"],
+                        "ligand_name": lig["ligand_name"],
+                        "ligand_mdl": mdl_text,
+                        "lscore": pose.lscore,
+                    })
+                    continue
+                except Exception as e:
+                    print(f"  WARNING: pose_to_mdl failed for "
+                          f"{lig['ligand_id']}/MODEL {model_idx+1}: {e} — using cofold fallback")
+            # No scored pose for this (ligand, MODEL) slot → cofold fallback
+            mdl_text = _cofold_fallback_mdl(
+                cif_path, workdir, lig["ligand_id"], model_idx + 1, protein_model,
+            )
+            if mdl_text is None:
+                if model_idx == 0 and not ligand_entries:
+                    raise RuntimeError(
+                        f"No docking poses AND cofold extraction failed for "
+                        f"{lig['ligand_id']} — cannot produce MODEL 1."
+                    )
+                # Secondary MODELs can simply carry fewer entries, but CASP
+                # requires every MODEL to carry every ligand. If we can't
+                # emit one, skip this MODEL entirely (stop growing the list).
+                break
+            source_summary.append(f"cofold_{protein_model}")
+            ligand_entries.append({
+                "ligand_number": lig["ligand_number"],
+                "ligand_name": lig["ligand_name"],
+                "ligand_mdl": mdl_text,
+                "lscore": 0.10,
+            })
 
-    submission = build_lg_submission_with_affinity(
+        # Only accept MODEL if all ligands are represented
+        if len(ligand_entries) != len(target_ligands):
+            print(f"  MODEL {model_idx+1}: incomplete (got {len(ligand_entries)}/"
+                  f"{len(target_ligands)} ligands), stopping.")
+            break
+
+        models.append({
+            "protein_pdb_lines": protein_lines,
+            "parent": args.parent,
+            "remark": args.remark or f"{protein_model} snapshot {model_idx+1}",
+            "ligands": ligand_entries,
+            "affinity_nM": affinity_nM,
+        })
+        entry_summary = " + ".join(
+            f"{e['ligand_number']:03d}:LSCORE={e['lscore']:.3f}"
+            if e['lscore'] is not None else f"{e['ligand_number']:03d}:LSCORE=N/A"
+            for e in ligand_entries
+        )
+        print(f"  MODEL {model_idx+1}: {entry_summary}")
+
+    if not models:
+        raise RuntimeError("No MODELs could be assembled — nothing to write.")
+    if len(models) < args.top_k:
+        print(f"  NOTE: only {len(models)} of {args.top_k} MODELs available; "
+              "submission truncated.")
+
+    # 7. Write LG
+    source_tag = "+".join(dict.fromkeys(source_summary)) or "auto"
+    method_full = (
+        f"{args.method} [protein={protein_model}, "
+        f"pose={source_tag}, models={len(models)}, "
+        f"ligands={len(target_ligands)}]"
+    )
+
+    submission = build_lg_submission(
         target_id=args.target_id,
         author=args.author,
         method=method_full,
-        protein_pdb_lines=protein_lines,
         models=models,
-        ligand_number=args.ligand_number,
-        ligand_name=args.ligand_name,
-        affinity_nM=affinity_nM,
         parent=args.parent,
-        remark=remark,
     )
 
     args.output.write_text(submission)
@@ -579,13 +799,9 @@ def main() -> int:
     print(f"  LG submission written: {args.output}")
     print(f"  Size: {len(submission):,} bytes")
     print(f"  Lines: {len(submission.splitlines()):,}")
-    print(f"  MODELs: {len(models)}")
-    for i, m in enumerate(models, start=1):
-        sc = m["lscore"]
-        sc_txt = f"{sc:.3f}" if sc is not None else "N/A"
-        print(f"    MODEL {i}: {m['source']}/{m['pose_name']} LSCORE={sc_txt}")
+    print(f"  MODELs: {len(models)}  Ligands/MODEL: {len(target_ligands)}")
     if affinity_nM is not None:
-        print(f"  AFFNTY: {affinity_nM:.3g} nM")
+        print(f"  AFFNTY per MODEL: {affinity_nM:.3g} nM")
     print(f"{'='*60}")
 
     return 0

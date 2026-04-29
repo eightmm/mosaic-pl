@@ -73,6 +73,86 @@ def _write_list_file(paths: list[Path], list_path: Path) -> Path | None:
     return list_path
 
 
+_USALIGN_BIN = Path(__file__).resolve().parent.parent / ".local" / "bin" / "USalign"
+
+
+def _usalign_transform(src_pdb: Path, ref_pdb: Path) -> tuple[list[list[float]], list[float]] | None:
+    """Return (R, t) such that ``X_ref = t + R @ X_src`` for each atom.
+
+    Runs USalign on the two receptor PDBs and parses the rotation matrix.
+    Returns ``None`` if USalign fails or the matrix file is not written
+    (low sequence overlap / disjoint chains). Callers should treat a
+    failure as "skip the transform and leave the pose untouched".
+    """
+    if not _USALIGN_BIN.exists():
+        return None
+    if not (src_pdb.exists() and ref_pdb.exists()):
+        return None
+    try:
+        import tempfile
+        with tempfile.NamedTemporaryFile("r", suffix=".txt", delete=True) as mat_f:
+            mat_path = mat_f.name
+        proc = subprocess.run(
+            [str(_USALIGN_BIN), str(src_pdb), str(ref_pdb), "-m", mat_path],
+            capture_output=True, text=True, timeout=120,
+        )
+        if proc.returncode != 0 or not Path(mat_path).exists():
+            return None
+        R = [[0.0] * 3 for _ in range(3)]
+        t = [0.0, 0.0, 0.0]
+        for line in Path(mat_path).read_text().splitlines():
+            parts = line.split()
+            if len(parts) != 5 or parts[0] not in ("0", "1", "2"):
+                continue
+            i = int(parts[0])
+            t[i] = float(parts[1])
+            R[i][0] = float(parts[2])
+            R[i][1] = float(parts[3])
+            R[i][2] = float(parts[4])
+        Path(mat_path).unlink(missing_ok=True)
+        # Sanity: if every row is zero the parse failed.
+        if all(abs(v) < 1e-12 for row in R for v in row):
+            return None
+        return R, t
+    except Exception:
+        return None
+
+
+def _apply_transform_to_sdf(sdf_path: Path, R: list[list[float]], t: list[float]) -> bool:
+    """Apply rigid transform ``X' = t + R @ X`` to every conformer in ``sdf_path``
+    and rewrite the file in place. Returns True on success.
+
+    Used to map template-docked poses (in the template receptor's crystal
+    frame) into the cofold receptor's frame, so downstream BA-Pred runs
+    and the final CASP LG MODEL block see the pose and the receptor in
+    one consistent coordinate system.
+    """
+    try:
+        from rdkit import Chem
+        from rdkit.Geometry import Point3D
+        from rdkit import RDLogger
+        RDLogger.DisableLog("rdApp.*")
+        supp = Chem.SDMolSupplier(str(sdf_path), removeHs=False, sanitize=False)
+        mols = [m for m in supp if m is not None]
+        if not mols:
+            return False
+        for mol in mols:
+            for conf in mol.GetConformers():
+                for i in range(mol.GetNumAtoms()):
+                    p = conf.GetAtomPosition(i)
+                    x = R[0][0] * p.x + R[0][1] * p.y + R[0][2] * p.z + t[0]
+                    y = R[1][0] * p.x + R[1][1] * p.y + R[1][2] * p.z + t[1]
+                    z = R[2][0] * p.x + R[2][1] * p.y + R[2][2] * p.z + t[2]
+                    conf.SetAtomPosition(i, Point3D(x, y, z))
+        writer = Chem.SDWriter(str(sdf_path))
+        for mol in mols:
+            writer.write(mol)
+        writer.close()
+        return True
+    except Exception:
+        return False
+
+
 def _pxdock_json_to_sdf(json_path: Path, sdf_path: Path) -> Path | None:
     """Convert a Protenix-Dock ``*_out.json`` pose file to a multi-pose SDF.
 
@@ -123,9 +203,17 @@ def _pxdock_json_to_sdf(json_path: Path, sdf_path: Path) -> Path | None:
 
     writer = Chem.SDWriter(str(sdf_path))
     written = 0
+    dropped_outliers = 0
     for i, pose in enumerate(poses):
         xyz = pose.get("ligand", {}).get("xyz")
         if not xyz or len(xyz) < len(ordered_indices):
+            continue
+        # PxDock's minimization can numerically blow up on a small fraction
+        # of poses, producing coords up to 1e7 Å. These poison RMSD scoring
+        # and any submission MDL we build from them. 200 Å is well outside
+        # any plausible binding-site frame; anything past that is garbage.
+        if any(abs(c) > 200.0 for triple in xyz[: len(ordered_indices)] for c in triple):
+            dropped_outliers += 1
             continue
         conf = Chem.Conformer(n_atoms)
         # Initialize all atoms to origin, then overlay mapped atoms.
@@ -152,6 +240,8 @@ def _pxdock_json_to_sdf(json_path: Path, sdf_path: Path) -> Path | None:
         except OSError:
             pass
         return None
+    if dropped_outliers:
+        print(f"    protenix_dock: dropped {dropped_outliers} pose(s) with |coord| > 200 Å")
     print(f"    protenix_dock: converted {written} poses → {sdf_path.name}")
     return sdf_path
 
@@ -179,13 +269,17 @@ def find_receptor_pdbs(run_dir: Path) -> dict[str, Path]:
     return receptors
 
 
-def _extract_cofolding_ligand(cif_path: Path, template_mol):
-    """Extract the ligand from an aligned cofolding CIF with correct bond orders.
+def _extract_cofolding_ligand(cif_path: Path, template_mol, ligand_id: str = "L"):
+    """Extract ONE specific ligand (by id) from an aligned cofolding CIF.
 
-    Reads HETATM-like atoms (chain ``L`` or residues named LIG*/UNK/UNL) via
-    gemmi, builds a minimal PDB block, parses with RDKit, then assigns bond
-    orders from ``template_mol`` (built from the input ligand SDF/SMILES so
-    the atom graph is authoritative). Returns an RDKit Mol or None.
+    ``ligand_id`` is the CommonInput ligand id (``"L"``, ``"L2"``, ...) which
+    is also the chain label used by Boltz/Protenix/AF3 in their aligned
+    output CIFs. We first try an exact chain-name match, then fall back to
+    heavy-atom count matching against the template graph (for models that
+    rename the chain — e.g. AF3 sometimes uses ``A``/``B``/``C``).
+
+    Returns an RDKit Mol with bond orders assigned from ``template_mol``,
+    or ``None`` if no matching ligand chain is found.
     """
     try:
         import gemmi  # type: ignore
@@ -197,31 +291,60 @@ def _extract_cofolding_ligand(cif_path: Path, template_mol):
         st = gemmi.read_structure(str(cif_path))
     except Exception:
         return None
-    lines = []
-    serial = 1
+
+    target_heavy = template_mol.GetNumHeavyAtoms()
+
+    # Pass 1: collect candidate ligand chains. A chain is "ligand-like" if
+    # any residue has non-protein heteroatom nature.
+    candidates: list[tuple[str, list]] = []  # (chain_name, atoms)
     for model in st:
         for chain in model:
+            heavy_atoms = []
             for res in chain:
-                is_lig = (
+                is_lig_res = (
                     res.name in ("LIG", "LIG1", "UNL", "UNK")
                     or getattr(res, "het_flag", "") == "H"
-                    or chain.name == "L"
+                    or chain.name == ligand_id
                 )
-                if not is_lig:
+                if not is_lig_res:
                     continue
                 for atom in res:
                     if atom.element.name == "H":
                         continue
-                    x, y, z = atom.pos.x, atom.pos.y, atom.pos.z
-                    elem = atom.element.name
-                    lines.append(
-                        f"HETATM{serial:>5d} {atom.name:>4s} LIG L"
-                        f"{1:>4d}    {x:>8.3f}{y:>8.3f}{z:>8.3f}  1.00  0.00          {elem:>2s}\n"
-                    )
-                    serial += 1
+                    heavy_atoms.append(atom)
+            if heavy_atoms:
+                candidates.append((chain.name, heavy_atoms))
         break
-    if not lines:
+
+    if not candidates:
         return None
+
+    # Pick chain by id match first, else by heavy-atom-count match, else first.
+    selected = None
+    for name, atoms in candidates:
+        if name == ligand_id:
+            selected = atoms
+            break
+    if selected is None:
+        for _, atoms in candidates:
+            if len(atoms) == target_heavy:
+                selected = atoms
+                break
+    if selected is None:
+        # Single-ligand legacy fallback
+        if len(candidates) == 1:
+            selected = candidates[0][1]
+        else:
+            return None
+
+    lines = []
+    for i, atom in enumerate(selected, start=1):
+        x, y, z = atom.pos.x, atom.pos.y, atom.pos.z
+        elem = atom.element.name
+        lines.append(
+            f"HETATM{i:>5d} {atom.name:>4s} LIG L"
+            f"{1:>4d}    {x:>8.3f}{y:>8.3f}{z:>8.3f}  1.00  0.00          {elem:>2s}\n"
+        )
     raw = Chem.MolFromPDBBlock("".join(lines) + "END\n", removeHs=True, sanitize=False)
     if raw is None:
         return None
@@ -231,98 +354,149 @@ def _extract_cofolding_ligand(cif_path: Path, template_mol):
         return None
 
 
+def _load_ligand_templates(run_dir: Path) -> dict[str, "object"]:
+    """Load per-ligand template mols from ``inputs/docking/ligand_*.sdf``.
+
+    Returns ``{lig_id: template_heavy_mol}`` where ``lig_id`` is derived
+    from the filename stem (``ligand_L.sdf`` → ``L``, ``ligand_L2.sdf`` →
+    ``L2``). Template is heavy-atom-only to match extraction output.
+    """
+    try:
+        from rdkit import Chem  # type: ignore
+    except Exception:
+        return {}
+    templates: dict[str, object] = {}
+    for cand in sorted((run_dir / "inputs" / "docking").glob("ligand_*.sdf")):
+        stem = cand.stem  # e.g. "ligand_L" or "ligand_L2"
+        lig_id = stem[len("ligand_"):] if stem.startswith("ligand_") else stem
+        mol = next(iter(Chem.SDMolSupplier(str(cand), removeHs=False, sanitize=True)), None)
+        if mol is None:
+            continue
+        templates[lig_id] = Chem.RemoveHs(mol)
+    return templates
+
+
 def _stage_cofolding_poses(run_dir: Path, staged_dir: Path) -> dict[str, Path]:
     """Extract aligned ligand poses from cofolding CIFs into multi-pose SDFs.
 
-    Writes ``staged_dir / cofold_{model}.sdf`` for each cofolding tool that
-    produced aligned outputs. Returns ``{tool_key: sdf_path}`` for successfully
-    written SDFs, where ``tool_key`` is ``cofold_boltz2``/``cofold_boltz2x``/
-    ``cofold_protenix``/``cofold_af3`` so downstream BA-Pred/RMSD-Pred tsvs
-    carry the cofolding provenance in their filenames.
+    Multi-ligand support: iterates every ligand found in
+    ``inputs/docking/ligand_*.sdf`` and extracts that specific ligand from
+    each cofolding CIF. Output key is ``cofold_{model}_{lig_id}`` — e.g.
+    ``cofold_boltz2_L``, ``cofold_protenix_L2`` — so BA-Pred / RMSD-Pred
+    TSVs distinguish per-ligand poses downstream.
 
-    The bond-order template is loaded from ``inputs/docking/ligand_*.sdf``
-    (meeko-prepped from input SMILES) which has the authoritative molecular
-    graph; cofolding CIFs alone don't encode bond orders.
+    Returns ``{tool_key: sdf_path}`` for all (model, ligand) pairs that
+    yielded at least one pose. Bond orders come from the per-ligand SDF
+    template (authoritative graph from meeko/RDKit prep).
     """
     try:
         from rdkit import Chem  # type: ignore
     except Exception:
         return {}
 
-    # Load template from the docking prep ligand (authoritative bond graph).
-    template = None
-    for cand in sorted((run_dir / "inputs" / "docking").glob("ligand_*.sdf")):
-        template = next(iter(Chem.SDMolSupplier(str(cand), removeHs=False, sanitize=True)), None)
-        if template is not None:
-            break
-    if template is None:
+    templates = _load_ligand_templates(run_dir)
+    if not templates:
         print("  cofold: no ligand template SDF, skipping cofolding pose extraction")
         return {}
-    template_heavy = Chem.RemoveHs(template)
 
-    patterns = {
-        "cofold_boltz2": ("boltz2", "*_aligned.cif"),
-        "cofold_boltz2x": ("boltz2x", "*_aligned.cif"),
-        "cofold_protenix": ("protenix", "*_aligned.cif"),
-        "cofold_af3": ("alphafold3", "*_aligned.cif"),
+    model_patterns = {
+        "boltz2": "*_aligned.cif",
+        "boltz2x": "*_aligned.cif",
+        "protenix": "*_aligned.cif",
+        "alphafold3": "*_aligned.cif",
+    }
+    model_short = {
+        "boltz2": "boltz2", "boltz2x": "boltz2x",
+        "protenix": "protenix", "alphafold3": "af3",
     }
     written: dict[str, Path] = {}
-    for key, (subdir, pat) in patterns.items():
+
+    for subdir, pat in model_patterns.items():
         cifs = sorted((run_dir / "outputs" / subdir).rglob(pat))
         if not cifs:
             continue
-        sdf_path = staged_dir / f"{key}.sdf"
-        writer = Chem.SDWriter(str(sdf_path))
-        n = 0
-        for cif in cifs:
-            mol = _extract_cofolding_ligand(cif, template_heavy)
-            if mol is None:
-                continue
-            # Set a meaningful _Name so downstream MDL blocks (in the CASP
-            # LG submission) carry the pose source instead of RDKit's
-            # generic "RDKit          3D" default title. BA-Pred reads
-            # _Name directly while RMSD-Pred appends a record index on top
-            # of it, producing a double-indexed name (``cofold_af3_0_0``);
-            # compute_submission_scores._canonicalize collapses that to
-            # ``cofold_af3_0`` so the two tools still join 1-1.
-            mol.SetProp("_Name", f"{key}_{n}")
-            writer.write(mol)
-            n += 1
-        writer.close()
-        if n > 0:
-            written[key] = sdf_path
-            print(f"  {key}: {n} cofolding poses → {sdf_path.name}")
-        else:
-            sdf_path.unlink(missing_ok=True)
+        short = model_short[subdir]
+        for lig_id, template_heavy in templates.items():
+            key = f"cofold_{short}_{lig_id}"
+            sdf_path = staged_dir / f"{key}.sdf"
+            writer = Chem.SDWriter(str(sdf_path))
+            n = 0
+            for cif in cifs:
+                mol = _extract_cofolding_ligand(cif, template_heavy, ligand_id=lig_id)
+                if mol is None:
+                    continue
+                mol.SetProp("_Name", f"{key}_{n}")
+                writer.write(mol)
+                n += 1
+            writer.close()
+            if n > 0:
+                written[key] = sdf_path
+                print(f"  {key}: {n} cofolding poses → {sdf_path.name}")
+            else:
+                sdf_path.unlink(missing_ok=True)
     return written
 
 
+def _discover_ligand_ids(run_dir: Path) -> list[str]:
+    """Return the list of ligand ids known to this run.
+
+    Primary source is ``inputs/docking/docking_prep_summary.json``. Falls
+    back to scanning ``inputs/docking/ligand_*.sdf`` names, and finally to
+    ``["L"]`` if nothing else is available.
+    """
+    summary = run_dir / "inputs" / "docking" / "docking_prep_summary.json"
+    if summary.exists():
+        try:
+            data = json.loads(summary.read_text())
+            ids = [str(lig.get("id")) for lig in (data.get("ligands") or []) if lig.get("id")]
+            if ids:
+                return ids
+        except Exception:
+            pass
+    sdfs = sorted((run_dir / "inputs" / "docking").glob("ligand_*.sdf"))
+    if sdfs:
+        return [p.stem[len("ligand_"):] for p in sdfs if p.stem.startswith("ligand_")] or ["L"]
+    return ["L"]
+
+
+def _discover_pose_under_ligand_dir(
+    seed_dir: Path, lig_id: str, filename: str,
+) -> Path | None:
+    """Locate a pose file honoring both new per-ligand layout and legacy flat layout.
+
+    New layout (post multi-ligand refactor): ``seed_dir/ligand_{id}/{filename}``.
+    Legacy: ``seed_dir/{filename}`` (docking ran on only the first ligand). The
+    legacy file is mapped to whichever ligand id is "primary" (first in list).
+    """
+    new = seed_dir / f"ligand_{lig_id}" / filename
+    if new.exists():
+        return new
+    return None
+
+
 def find_ligand_files(run_dir: Path) -> dict[str, Path]:
-    """Collect pose files per source (docking + cofolding), for BA-Pred/RMSD-Pred.
+    """Collect pose files per (tool, ligand), for BA-Pred/RMSD-Pred.
 
-    Returns a mapping ``tool_key -> pose_input``. ``pose_input`` is either a
-    concrete pose file (SDF/DLG/PDBQT) or a ``.txt`` list of per-seed staged
-    poses. BA-Pred and RMSD-Pred both accept all of these formats.
+    Keys are ``{tool_variant}_{lig_id}`` — e.g. ``vina_cofolding_L``,
+    ``autodock_gpu_swinsite_L2``, ``protenix_dock_L``. This lets the
+    scoring aggregator partition poses per ligand so the final top-5
+    submission can pick ONE pose per ligand per MODEL (CASP LG spec: a
+    MODEL is the whole complex, all ligands together).
 
-    Cofolding aligned poses are extracted from ``*_aligned.cif`` and staged as
-    ``analysis/poses/cofold_{model}.sdf`` so the same scorer that picks the
-    final top-5 sees cofolding candidates alongside docking outputs.
-
-    The raw input SDF (``inputs/docking/ligand_*.sdf``) is intentionally
-    excluded: its conformer comes from RDKit's SMILES embedding and is not
-    aligned with the receptor, which makes BA-Pred's 8Å protein-context
-    extraction return an empty mol and crash. Docking outputs only.
+    Legacy layout (single-ligand docking runs that predate the multi-ligand
+    refactor) is handled by treating the whole seed directory's output as
+    the primary ligand (first entry in the summary).
     """
     ligands: dict[str, Path] = {}
     analysis_dir = run_dir / "outputs" / "analysis"
     staged_dir = analysis_dir / "poses"
     staged_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Vina: auto-discover per binding-site variant (vina / vina_cofolding /
-    #     vina_swinsite / vina_p2rank). Each variant's seed_*/docked.pdbqt is
-    #     staged under a unique key so BA-Pred/RMSD-Pred and top-5 selection
-    #     can rank poses across binding-site hypotheses independently.
+    lig_ids = _discover_ligand_ids(run_dir)
+    primary_lig = lig_ids[0] if lig_ids else "L"
     outputs_dir = run_dir / "outputs"
+
+    # --- Vina: per binding-site variant × per ligand × per seed ---
     vina_variant_dirs = sorted(
         [outputs_dir / "vina"]
         + [d for d in outputs_dir.glob("vina_*") if d.is_dir()]
@@ -330,24 +504,31 @@ def find_ligand_files(run_dir: Path) -> dict[str, Path]:
     for var_dir in vina_variant_dirs:
         if not var_dir.exists():
             continue
-        tool_key = var_dir.name  # "vina" or "vina_<source>"
-        seed_poses: list[Path] = []
-        for seed_dir in sorted(var_dir.glob("seed_*")):
-            pdbqt = seed_dir / "docked.pdbqt"
-            staged = _stage_pose_file(pdbqt, staged_dir, f"{tool_key}_{seed_dir.name}")
-            if staged is not None:
-                seed_poses.append(staged)
-        if not seed_poses:
-            flat = var_dir / "docked.pdbqt"
-            staged = _stage_pose_file(flat, staged_dir, f"{tool_key}_flat")
-            if staged is not None:
-                seed_poses.append(staged)
-        if seed_poses:
-            lst = _write_list_file(seed_poses, analysis_dir / f"{tool_key}_poses.txt")
-            if lst is not None:
-                ligands[tool_key] = lst
+        variant = var_dir.name
+        for lig_id in lig_ids:
+            tool_key = f"{variant}_{lig_id}"
+            seed_poses: list[Path] = []
+            for seed_dir in sorted(var_dir.glob("seed_*")):
+                pose = _discover_pose_under_ligand_dir(seed_dir, lig_id, "docked.pdbqt")
+                if pose is None and lig_id == primary_lig:
+                    legacy = seed_dir / "docked.pdbqt"
+                    if legacy.exists():
+                        pose = legacy
+                if pose is not None:
+                    staged = _stage_pose_file(pose, staged_dir, f"{tool_key}_{seed_dir.name}")
+                    if staged is not None:
+                        seed_poses.append(staged)
+            if not seed_poses and lig_id == primary_lig:
+                flat = var_dir / "docked.pdbqt"
+                staged = _stage_pose_file(flat, staged_dir, f"{tool_key}_flat")
+                if staged is not None:
+                    seed_poses.append(staged)
+            if seed_poses:
+                lst = _write_list_file(seed_poses, analysis_dir / f"{tool_key}_poses.txt")
+                if lst is not None:
+                    ligands[tool_key] = lst
 
-    # --- AutoDock-GPU: same auto-discovery over autodock_gpu{,_<source>} dirs ---
+    # --- AutoDock-GPU: same per-ligand, per-seed iteration ---
     adg_variant_dirs = sorted(
         [outputs_dir / "autodock_gpu"]
         + [d for d in outputs_dir.glob("autodock_gpu_*") if d.is_dir()]
@@ -355,41 +536,116 @@ def find_ligand_files(run_dir: Path) -> dict[str, Path]:
     for var_dir in adg_variant_dirs:
         if not var_dir.exists():
             continue
-        tool_key = var_dir.name
-        seed_poses = []
-        for seed_dir in sorted(var_dir.glob("seed_*")):
-            dlg = seed_dir / "docking.dlg"
-            staged = _stage_pose_file(dlg, staged_dir, f"{tool_key}_{seed_dir.name}")
-            if staged is not None:
-                seed_poses.append(staged)
-        if not seed_poses:
-            flat = var_dir / "docking.dlg"
-            staged = _stage_pose_file(flat, staged_dir, f"{tool_key}_flat")
-            if staged is not None:
-                seed_poses.append(staged)
-        if seed_poses:
-            lst = _write_list_file(seed_poses, analysis_dir / f"{tool_key}_poses.txt")
-            if lst is not None:
-                ligands[tool_key] = lst
+        variant = var_dir.name
+        for lig_id in lig_ids:
+            tool_key = f"{variant}_{lig_id}"
+            seed_poses = []
+            for seed_dir in sorted(var_dir.glob("seed_*")):
+                pose = _discover_pose_under_ligand_dir(seed_dir, lig_id, "docking.dlg")
+                if pose is None and lig_id == primary_lig:
+                    legacy = seed_dir / "docking.dlg"
+                    if legacy.exists():
+                        pose = legacy
+                if pose is not None:
+                    staged = _stage_pose_file(pose, staged_dir, f"{tool_key}_{seed_dir.name}")
+                    if staged is not None:
+                        seed_poses.append(staged)
+            if not seed_poses and lig_id == primary_lig:
+                flat = var_dir / "docking.dlg"
+                staged = _stage_pose_file(flat, staged_dir, f"{tool_key}_flat")
+                if staged is not None:
+                    seed_poses.append(staged)
+            if seed_poses:
+                lst = _write_list_file(seed_poses, analysis_dir / f"{tool_key}_poses.txt")
+                if lst is not None:
+                    ligands[tool_key] = lst
 
-    # --- Protenix-Dock: JSON -> multi-record SDF ---
-    pxdock_dir = run_dir / "outputs" / "protenix_dock"
+    # --- Protenix-Dock: JSON -> multi-record SDF, per-ligand when available ---
+    pxdock_dir = outputs_dir / "protenix_dock"
     if pxdock_dir.exists():
-        # Prefer any pre-existing SDF if PxDock ever emits one.
-        existing_sdf = next(pxdock_dir.rglob("*.sdf"), None)
-        if existing_sdf is not None:
-            ligands["protenix_dock"] = existing_sdf
-        else:
-            out_json = next((p for p in pxdock_dir.glob("*_out.json")), None)
+        for lig_id in lig_ids:
+            lig_dir = pxdock_dir / f"ligand_{lig_id}"
+            source_dir = lig_dir if lig_dir.is_dir() else (pxdock_dir if lig_id == primary_lig else None)
+            if source_dir is None:
+                continue
+            existing_sdf = next(source_dir.rglob("*.sdf"), None)
+            if existing_sdf is not None:
+                ligands[f"protenix_dock_{lig_id}"] = existing_sdf
+                continue
+            out_json = next((p for p in source_dir.glob("*_out.json")), None)
             if out_json is not None:
-                sdf_path = pxdock_dir / "poses.sdf"
+                sdf_path = source_dir / "poses.sdf"
                 converted = _pxdock_json_to_sdf(out_json, sdf_path)
                 if converted is not None:
-                    ligands["protenix_dock"] = converted
+                    ligands[f"protenix_dock_{lig_id}"] = converted
 
-    # --- Cofolding aligned ligand poses (boltz2/2x/protenix/af3) ---
+    # --- Cofolding aligned ligand poses (per-ligand: cofold_{model}_{lig_id}) ---
     cofold_sdfs = _stage_cofolding_poses(run_dir, staged_dir)
     ligands.update(cofold_sdfs)
+
+    # --- Template-based docking poses (Track 2 + Track 3) ---
+    # Multi-track docking runs against the primary ligand only, so all
+    # template poses are attached to ``primary_lig``. Each template_dir is
+    # ``outputs/template_docking/<template_pdb_id>/{vina,autodock_gpu,lig_align}/``.
+    # Filename conventions (fixed upstream in prepare_template_docking.py /
+    # run_multi_track_docking.py):
+    #   vina           → docked.pdbqt
+    #   autodock_gpu   → docked.dlg      (NOT ``docking.dlg`` — that was a typo)
+    #   lig_align      → *.sdf           (produced by lig_align.run_pipeline)
+    #
+    # Template docking runs in the TEMPLATE receptor's crystal frame, which
+    # generally does not overlap the cofold receptor. Before staging we
+    # compute one USalign(template_receptor → cofold_receptor) rigid transform
+    # per template and rewrite every staged pose SDF in the cofold frame.
+    # This keeps BA-Pred's pocket-extraction and the final CASP LG MODEL
+    # block (which embeds the cofold receptor) in one consistent frame.
+    template_root = outputs_dir / "template_docking"
+    cofold_receptor_pdb = run_dir / "inputs" / "docking" / "receptor.pdb"
+    if template_root.exists():
+        for template_dir in sorted(template_root.iterdir()):
+            if not template_dir.is_dir():
+                continue
+            pdb_id = template_dir.name
+            tpl_receptor_pdb = (
+                run_dir / "inputs" / "template_docking" / f"template_{pdb_id}" / "receptor.pdb"
+            )
+            transform = None
+            if cofold_receptor_pdb.exists() and tpl_receptor_pdb.exists():
+                transform = _usalign_transform(tpl_receptor_pdb, cofold_receptor_pdb)
+                if transform is None:
+                    print(f"  WARN: USalign failed for template {pdb_id}; "
+                          f"poses kept in template frame (BA-Pred likely to fail).")
+
+            def _stage_and_align(src: Path, tool_key: str) -> Path | None:
+                staged = _stage_pose_file(src, staged_dir, tool_key)
+                if staged is None:
+                    return None
+                if transform is not None and staged.suffix.lower() == ".sdf":
+                    R, t = transform
+                    if not _apply_transform_to_sdf(staged, R, t):
+                        print(f"  WARN: transform application failed for {staged.name}")
+                return staged
+
+            vina_pdbqt = template_dir / "vina" / "docked.pdbqt"
+            if vina_pdbqt.exists():
+                tool_key = f"template_{pdb_id}_vina_{primary_lig}"
+                staged = _stage_and_align(vina_pdbqt, tool_key)
+                if staged is not None:
+                    ligands[tool_key] = staged
+            adg_dlg = template_dir / "autodock_gpu" / "docked.dlg"
+            if adg_dlg.exists():
+                tool_key = f"template_{pdb_id}_adg_{primary_lig}"
+                staged = _stage_and_align(adg_dlg, tool_key)
+                if staged is not None:
+                    ligands[tool_key] = staged
+            lig_align_dir = template_dir / "lig_align"
+            if lig_align_dir.exists():
+                mcs_sdf = next(lig_align_dir.glob("*.sdf"), None)
+                if mcs_sdf is not None:
+                    tool_key = f"template_{pdb_id}_lig_align_{primary_lig}"
+                    staged = _stage_and_align(mcs_sdf, tool_key)
+                    if staged is not None:
+                        ligands[tool_key] = staged
 
     return ligands
 
