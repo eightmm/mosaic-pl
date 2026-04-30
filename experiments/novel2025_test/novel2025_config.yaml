@@ -42,6 +42,9 @@ boltz:
   model: boltz2
   accelerator: gpu
   devices: 1
+  # Auto-overridden to false when msa_pipeline.enabled=true (adapters.py).
+  # The unified pipeline supplies a shared a3m so ColabFold round-trip is
+  # neither needed nor desired.
   use_msa_server: true
   override: true
   no_kernels: false
@@ -56,7 +59,9 @@ protenix:
   binary: .venvs/protenix/bin/protenix
   model_name: protenix_base_default_v1.0.0
   kalign_binary_path: .local/bin/kalign
-  use_msa: true              # Protenix fetches its own MSA (msa_server_mode: protenix)
+  # When msa_pipeline.enabled=true the adapter forces msa_server_mode=none
+  # and points unpairedMsaPath / templatesPath at the shared AF3 a3m.
+  use_msa: true
   dtype: bf16
   trimul_kernel: cuequivariance
   triatt_kernel: cuequivariance
@@ -111,3 +116,22 @@ slurm:
   mem: 96G
   time: 12:00:00
   extra_sbatch_args: []
+
+# Unified MSA pipeline — runs AF3's data pipeline (jackhmmer + hmmsearch +
+# template search) once per target and feeds the same a3m + cif templates
+# into all three cofolding tools (validated 2026-04-30 on 7hqq: 4 templates
+# materialised under shared_msa/templates/, all three tools converged on
+# 5X04 / 2ESS / 2OWN / 4GAK, MSA depth ~3.7M chars each). Replaces the
+# per-tool ColabFold round-trip. CPU-heavy: jackhmmer scan ~30-90 min/target
+# (52 min observed at 295 aa, 8 cpu).
+msa_pipeline:
+  enabled: true
+  db_dir: /home/jaemin/DB/AlphaFold3
+  jackhmmer_binary_path: .local/bin/jackhmmer
+  hmmsearch_binary_path: .local/bin/hmmsearch
+  hmmbuild_binary_path: .local/bin/hmmbuild
+  nhmmer_binary_path: .local/bin/nhmmer
+  hmmalign_binary_path: .local/bin/hmmalign
+  max_template_date: "2025-01-01"
+  n_cpu: 8
+  max_templates: 4

@@ -66,7 +66,7 @@ flowchart TB
 ```
 template-search-sequence (mmseqs)
   → co-folding (Boltz-2 → Boltz-2x → Protenix → AF3) with MSA cross-tool reuse
-    └── bridge: Boltz MSA → Protenix unpaired / AF3 a3m
+    └── bridge: AF3 unified MSA (jackhmmer + hmmsearch + templates) → Boltz / Protenix / AF3 모두 동일 a3m + cif 공유 (msa_pipeline.enabled=true)
   → template-search-structure (foldseek, query = best cofold cif)
     └── bridge: union filter → pocket extraction → pocket clustering
   → bridge: align cofolding outputs (Kabsch to common frame) → *_aligned.cif
@@ -558,9 +558,11 @@ echo "----------------------"
 
 | Bridge | 위치 | Script | 역할 |
 |---|---|---|---|
-| Boltz MSA cross-seed | Boltz seed 1 → 이후 seed + Boltz-2x | `script_builder.py` (인라인) | seed 1 의 `msa/` 디렉토리 재사용 |
-| Boltz MSA → Protenix | Boltz → Protenix | `script_builder.py` (heredoc) | `uniref.a3m` → Protenix `unpairedMsaPath` 주입 |
-| Boltz MSA → AF3 | Boltz → AF3 | `bridge_boltz_msa_to_af3.py` | CSV → A3M + JSON 패치 (`pairedMsa=""`, `templates=[]`) |
+| **AF3 unified MSA pipeline** | cofolding 직전 (msa_pipeline.enabled=true 시) | `script_builder.py::_emit_msa_pipeline_bridge` + AF3 `run_alphafold.py --run_data_pipeline=true` | jackhmmer + hmmsearch 한 번 실행, ~30-90 분/타겟 (CPU) |
+| **Distribute MSA + templates** | AF3 data pipeline 직후 | `bridge_distribute_msa_templates.py` | unpairedMsa/pairedMsa → `shared_msa/{chain}_{kind}.a3m`; inline `templates[*].mmcif` → `shared_msa/templates/<pdb>.cif`; Boltz YAML / Protenix JSON / AF3 input 셋 모두 동일 a3m + cif 가리키게 패치 |
+| Boltz MSA cross-seed *(legacy)* | Boltz seed 1 → 이후 seed + Boltz-2x | `script_builder.py` (인라인) | msa_pipeline OFF 일 때만; seed 1 의 `msa/` 디렉토리 재사용 |
+| Boltz MSA → Protenix *(legacy)* | Boltz → Protenix | `script_builder.py` (heredoc) | msa_pipeline OFF fallback — Boltz `uniref.a3m` → Protenix `unpairedMsaPath` |
+| Boltz MSA → AF3 *(legacy)* | Boltz → AF3 | `bridge_boltz_msa_to_af3.py` | msa_pipeline OFF fallback — CSV → A3M + JSON 패치 (`pairedMsa=""`, `templates=[]`) |
 | **Template filter (union)** | mmseqs + foldseek 끝난 후 | **`run_template_filter.py`** | mmseqs ∪ foldseek by `(pdb_id, chain_id)` |
 | **Template pocket extraction** | filter 직후 | **`extract_template_pockets.py`** | USalign per hit → bound-ligand centroid → cofold frame |
 | **Template pocket clustering** | extraction 직후 | **`cluster_template_pockets.py`** | greedy first-match (running weighted centroid), 5 Å, top-K → `template_consensus_*` source |
