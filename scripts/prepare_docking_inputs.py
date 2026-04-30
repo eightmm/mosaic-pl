@@ -645,7 +645,7 @@ def run_swinsite(
         )
     except Exception as e:
         print(f"  SwinSite failed: {e}")
-        return None
+        return []
 
     results_dir = swinsite_out / "results" / "input" / "receptor"
     if not results_dir.exists():
@@ -815,7 +815,7 @@ def extract_smiles_from_json(input_json: Path) -> list[tuple[str, str]]:
 
 def _extract_cofolding_ligand_centroid(
     cif_path: Path,
-    dockable_chains: set[str] | None = None,
+    dockable_chains: set[str],
 ) -> list[float] | None:
     """Extract the heavy-atom centroid of the **dockable ligand** in a cofolding CIF.
 
@@ -830,28 +830,23 @@ def _extract_cofolding_ligand_centroid(
     Args:
         cif_path: cofold CIF.
         dockable_chains: chain ids declared as ligands (with SMILES) in the
-            input YAML. Atoms outside these chains are ignored. ``None``
-            falls back to the legacy "any non-polymer" behaviour with a
-            warning so reruns notice the regression.
+            input. Empty set returns ``None`` (no SMILES ligand to dock).
 
     Returns ``[x, y, z]`` or ``None`` when no qualifying atoms are found.
     """
+    if not dockable_chains:
+        return None
     try:
         import gemmi
         st = gemmi.read_structure(str(cif_path))
         coords: list[tuple[float, float, float]] = []
-        legacy = dockable_chains is None
-        if legacy:
-            print(f"  WARNING: cofold centroid for {cif_path.name} called without "
-                  "dockable_chains; legacy 'any non-polymer' average used")
         for model in st:
             for chain in model:
-                # Restrict to dockable chains when caller provided them.
-                # LIG-prefixed residues stay as a backstop for cofold
-                # outputs that don't pin a chain id (rare).
-                if not legacy and chain.name not in dockable_chains:
+                if chain.name not in dockable_chains:
                     continue
                 for res in chain:
+                    # LIG-prefixed residue name kept as a backstop for cofold
+                    # outputs that don't pin entity_type properly (rare).
                     is_ligand = (
                         res.entity_type == gemmi.EntityType.NonPolymer
                         or res.name.startswith("LIG")
@@ -876,9 +871,9 @@ def _extract_cofolding_ligand_centroid(
 
 # Cofold-ligand cluster knobs (Stage 4 binding-site source registration). All
 # four models × 5 seeds × 5 samples = 100 placements live in the same frame
-# after Stage 2.5 alignment, so a single-link cluster on their centroids
-# captures multi-pocket / inter-model disagreement signal that the old
-# "best-model single-centroid" extraction discarded.
+# after Stage 2.5 alignment, so a greedy first-match centroid cluster on
+# their positions captures multi-pocket / inter-model disagreement signal
+# that the old "best-model single-centroid" extraction discarded.
 COFOLD_CLUSTER_CUTOFF = 5.0       # Å — same as template-pocket cluster
 # MIN_MEMBERS scales with the actual placement count instead of being
 # hardcoded for a 100-placement default (4 models × 5 seeds × 5 samples).
@@ -894,7 +889,7 @@ COFOLD_CLUSTER_TOP_K = 3
 
 def _extract_cofolding_ligand_clusters(
     run_dir: Path,
-    dockable_chains: set[str] | None = None,
+    dockable_chains: set[str],
 ) -> list[dict]:
     """Cluster ligand centroids across every aligned cofolding CIF.
 
@@ -1129,9 +1124,8 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, required=True, help="Output directory for docking inputs.")
     parser.add_argument("--model", type=str, default="auto", choices=["auto", "boltz", "protenix", "alphafold3"],
                         help="Which cofolding model to use. 'auto' selects by confidence score.")
-    parser.add_argument("--use-p2rank", action="store_true", default=True,
-                        help="Use P2Rank for binding site prediction (default: true).")
-    parser.add_argument("--no-p2rank", action="store_true", help="Disable P2Rank binding site prediction.")
+    parser.add_argument("--no-p2rank", action="store_true",
+                        help="Disable P2Rank binding site prediction (default: enabled).")
     parser.add_argument("--reuse-binding-site-cache", action="store_true",
                         help="Reuse existing P2Rank/SwinSite outputs from a prior run "
                              "instead of re-invoking the binaries. Lets the prep step "
@@ -1228,6 +1222,12 @@ def main() -> int:
                         dockable_chains.add(str(lig["id"]))
         except Exception as e:
             print(f"  WARNING: could not parse dockable chain ids from YAML: {e}")
+    elif args.input_json and args.input_json.exists():
+        # Protenix/AF3 JSON-only input — same dockable filter (SMILES ligand)
+        # so the cofold cluster centroid average doesn't drift into metals/
+        # cofactors. Without this the legacy "any non-polymer" path would fire.
+        for lig_id, _smi in extract_smiles_from_json(args.input_json):
+            dockable_chains.add(lig_id)
     if dockable_chains:
         print(f"  Dockable ligand chains (will be stripped from receptor): "
               f"{sorted(dockable_chains)}")
@@ -1278,7 +1278,7 @@ def main() -> int:
           f"{sorted({c for c, _ in ca_atoms})})")
 
     cofold_clusters = _extract_cofolding_ligand_clusters(
-        args.run_dir, dockable_chains=dockable_chains or None,
+        args.run_dir, dockable_chains=dockable_chains,
     )
     for rank, cl in enumerate(cofold_clusters, start=1):
         src_name = f"cofolding_{rank}"

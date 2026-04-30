@@ -3,7 +3,7 @@
 
 After ``extract_template_pockets.py`` produces ``template_pockets.json`` (a
 flat list of bound-ligand centroids in the cofolding frame), this script
-runs single-link agglomerative clustering by Euclidean distance and emits
+runs greedy first-match clustering on the running weighted centroid and emits
 the top-K cluster centroids with evidence scores. Each centroid becomes a
 ``template_consensus_N`` source in ``docking_prep_summary.binding_site_predictions``
 downstream.

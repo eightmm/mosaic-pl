@@ -403,25 +403,26 @@ def prepare_ligand_files(smiles: str, lig_id: str, output_dir: Path) -> tuple[Pa
 
 
 def extract_smiles_from_yaml(yaml_path: Path) -> list[tuple[str, str]]:
-    """Extract (ligand_id, smiles) from unified YAML."""
-    results = []
-    text = yaml_path.read_text()
-    current_id, in_ligand = None, False
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("- ligand:") or stripped == "ligand:":
-            in_ligand = True
-            current_id = None
+    """Extract (ligand_id, smiles) from unified YAML.
+
+    Uses ``yaml.safe_load`` so multi-line / quoted-scalar SMILES survive
+    intact. The previous line-based parser was fragile to quoting and
+    extension fields downstream of the ligand block.
+    """
+    import yaml as _yaml
+    data = _yaml.safe_load(yaml_path.read_text()) or {}
+    results: list[tuple[str, str]] = []
+    for entry in data.get("sequences", []) or []:
+        if not isinstance(entry, dict) or "ligand" not in entry:
             continue
-        if in_ligand:
-            if stripped.startswith("id:"):
-                current_id = stripped.split(":", 1)[1].strip()
-            elif stripped.startswith("smiles:"):
-                smiles = stripped.split(":", 1)[1].strip().strip("'\"")
-                results.append((current_id or "L", smiles))
-                in_ligand = False
-            elif stripped.startswith("- ") or (stripped and not stripped.startswith((" ", "#"))):
-                in_ligand = False
+        lig = entry.get("ligand") or {}
+        smiles = lig.get("smiles")
+        if not smiles:
+            continue
+        lig_id = lig.get("id", "L")
+        if isinstance(lig_id, list):
+            lig_id = lig_id[0] if lig_id else "L"
+        results.append((str(lig_id), str(smiles)))
     return results
 
 
@@ -490,7 +491,7 @@ def select_cluster_representative_templates(
         return []
     clusters = cl_data.get("clusters") or []
 
-    # Group pockets by cluster_index (single-link cluster builder writes
+    # Group pockets by cluster_index (greedy centroid cluster builder writes
     # this onto each pocket record). Fallback: euclidean nearest centroid.
     by_cluster: dict[int, list[dict]] = {}
     for p in pockets:

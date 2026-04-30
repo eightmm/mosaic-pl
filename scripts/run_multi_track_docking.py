@@ -425,25 +425,26 @@ def run_lig_align_on_template(
 
 
 def extract_target_smiles(input_yaml: Path) -> list[tuple[str, str]]:
-    """Extract (ligand_id, SMILES) from unified input YAML."""
-    results = []
-    text = input_yaml.read_text()
-    current_id, in_ligand = None, False
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("- ligand:") or stripped == "ligand:":
-            in_ligand = True
-            current_id = None
+    """Extract (ligand_id, SMILES) from unified input YAML.
+
+    Uses ``yaml.safe_load`` so quoted/multi-line SMILES and trailing
+    block-scalar metadata don't break parsing the way a line-by-line
+    walker did.
+    """
+    import yaml as _yaml
+    data = _yaml.safe_load(input_yaml.read_text()) or {}
+    results: list[tuple[str, str]] = []
+    for entry in data.get("sequences", []) or []:
+        if not isinstance(entry, dict) or "ligand" not in entry:
             continue
-        if in_ligand:
-            if stripped.startswith("id:"):
-                current_id = stripped.split(":", 1)[1].strip()
-            elif stripped.startswith("smiles:"):
-                smiles = stripped.split(":", 1)[1].strip().strip("'\"")
-                results.append((current_id or "L", smiles))
-                in_ligand = False
-            elif stripped.startswith("- ") or (stripped and not stripped.startswith((" ", "#"))):
-                in_ligand = False
+        lig = entry.get("ligand") or {}
+        smiles = lig.get("smiles")
+        if not smiles:
+            continue
+        lig_id = lig.get("id", "L")
+        if isinstance(lig_id, list):
+            lig_id = lig_id[0] if lig_id else "L"
+        results.append((str(lig_id), str(smiles)))
     return results
 
 

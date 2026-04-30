@@ -128,7 +128,7 @@ template-search-sequence (mmseqs)
 #### 1-5. Pocket clustering (top-K consensus)
 
 - **Script**: `scripts/cluster_template_pockets.py`
-- **Algorithm**: greedy single-link, distance ≤ `--cutoff` (default **5.0 Å**, druglike pocket 직경 ~10–15 Å)
+- **Algorithm**: greedy first-match (each new pocket joins the *first* existing cluster whose running weighted centroid is within `--cutoff`; otherwise spawns new). Default cutoff **5.0 Å** (druglike pocket 직경 ~10–15 Å). 입력 순서가 결과에 영향 — extract 단계가 evidence-sorted 이라서 강한 hit 이 cluster seed 가 됨. *Lance-Williams 진짜 single-link 은 아니다*
 - **Per-pocket weight**: `(in_mmseqs + in_foldseek) + max(alignment_tmscore, qtmscore, pident/100)` — 범위 ≈ [0, 3]. mmseqs-only hit 은 foldseek qtm=0 이어도 USalign actual TM 으로 평가 받음
 - **Cluster centroid**: weighted mean (가중치 합 0 fallback 시 unweighted)
 - **Cluster `evidence_score`**: `Σ weight`. 정렬 후 top-K (`--top-k 5` default) 보존
@@ -247,7 +247,7 @@ Track 1 docking 의 box center 후보를 **3 카테고리 = 최대 19 개** 로 
 
 **A. Cofold clusters — 조건부 (1 ~ 3 개)**
 
-`cofolding_1`, `cofolding_2`, `cofolding_3` 은 **모든 4 모델 × 25 seeds = 100 placements** 의 heavy-atom ligand centroid 를 single-link 5 Å clustering 한 top-K 결과.
+`cofolding_1`, `cofolding_2`, `cofolding_3` 은 **모든 4 모델 × 25 seeds = 100 placements** 의 heavy-atom ligand centroid 를 5 Å greedy first-match clustering (running mean centroid) 한 top-K 결과.
 **Stage 2.5 frame alignment 가 100 cif 를 단일 reference frame 으로 align 한 다음**에 클러스터링하므로 좌표 비교가 의미를 가짐 (`align_cofolding_outputs.py::main` 이 `rglob("*.cif")` 으로 4 모델 × per-seed 모든 cif 를 align).
 
 등록 조건 (`prepare_docking_inputs.py::_extract_cofolding_ligand_clusters`):
@@ -299,7 +299,7 @@ Stage 1-5 에서 만든 `template_pocket_clusters.json` 의 top-K cluster centro
   - **`source_status`** (commit `5fb2039`+) — observability 용 진단 블록. 어느 카테고리의 source 가 등록 0 이었는지 (silent skip 추적), `n_cofold_placements_total`, `cofold_min_members_floor`, `n_dropped_ligands_at_prep`, `dockable_chains_from_yaml` 모두 한 곳. RNA target 처럼 swinsite/p2rank 가 비어 있는 케이스 즉시 파악 가능
 
 > **Design rationale**:
-> 1. **Cofold clusters** — co-fold 25 seeds × 4 models 가 단일 frame 에서 어디에 ligand 를 놓는지가 가장 직접적 신호. 단일 best cifoldcentroid 만 쓰던 옛 design 은 multi-pocket / inter-model 불일치를 잡지 못함. `cluster_template_pockets.py` 와 동일 single-link 알고리즘을 재사용해 0 cost 에 가까운 확장.
+> 1. **Cofold clusters** — co-fold 25 seeds × 4 models 가 단일 frame 에서 어디에 ligand 를 놓는지가 가장 직접적 신호. 단일 best cifold centroid 만 쓰던 옛 design 은 multi-pocket / inter-model 불일치를 잡지 못함. `cluster_template_pockets.py` 와 동일 greedy first-match centroid 알고리즘을 재사용해 0 cost 에 가까운 확장.
 > 2. **Template-consensus 가 backup** — 한 cofold cluster 가 잘못된 pocket 을 잡아도 (e.g. CASP16 L2001: 100 placements 가 모두 35 Å off — 같은 fold 의 모든 모델이 동일하게 빗나감) RCSB 의 실험적으로 검증된 binding pose 좌표가 독립 backup 으로 제공됨.
 
 ---
@@ -542,7 +542,7 @@ echo "----------------------"
 | Boltz MSA → AF3 | Boltz → AF3 | `bridge_boltz_msa_to_af3.py` | CSV → A3M + JSON 패치 (`pairedMsa=""`, `templates=[]`) |
 | **Template filter (union)** | mmseqs + foldseek 끝난 후 | **`run_template_filter.py`** | mmseqs ∪ foldseek by `(pdb_id, chain_id)` |
 | **Template pocket extraction** | filter 직후 | **`extract_template_pockets.py`** | USalign per hit → bound-ligand centroid → cofold frame |
-| **Template pocket clustering** | extraction 직후 | **`cluster_template_pockets.py`** | single-link 5 Å, top-K → `template_consensus_*` source |
+| **Template pocket clustering** | extraction 직후 | **`cluster_template_pockets.py`** | greedy first-match (running weighted centroid), 5 Å, top-K → `template_consensus_*` source |
 | **Frame alignment** | cofolding 끝, docking 직전 | **`align_cofolding_outputs.py`** | Kabsch CA → `*_aligned.cif` |
 | Docking prep | alignment → docking | `prepare_docking_inputs.py` | 모델 자동 선택 + 최대 19 binding-site source (≤3 cofold cluster + ≤6 predictor top-K + ≤10 consensus) 등록 + 파일 변환 |
 | Multi-track docking | docking 직후 (조건부) | `run_multi_track_docking.py` | Track 2 (any template) + Track 3 (MCS ≥ 0.5). Multi-char chain id 단일 letter 정규화 |

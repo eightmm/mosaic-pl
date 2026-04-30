@@ -631,6 +631,13 @@ def find_ligand_files(run_dir: Path) -> dict[str, Path]:
                         print(f"  WARN: transform application failed for {staged.name}")
                 return staged
 
+            # Legacy single-ligand template-docking layouts predate the
+            # ligand_<id>/ sub-dir refactor. They map to ``primary_lig`` only,
+            # which silently dropped second ligands on multi-ligand targets.
+            # Gate the fallback to single-ligand targets so multi-ligand
+            # legacy outputs surface as a warning instead of misattributed.
+            single_ligand_target = len(lig_ids) <= 1
+
             # Vina: per-ligand sub-dir (new) or single-ligand legacy layout.
             for vina_dir in (template_dir / "vina").glob("ligand_*"):
                 lig_id = vina_dir.name[len("ligand_"):]
@@ -641,12 +648,16 @@ def find_ligand_files(run_dir: Path) -> dict[str, Path]:
                     if staged is not None:
                         ligands[tool_key] = staged
             legacy_vina = template_dir / "vina" / "docked.pdbqt"
-            if legacy_vina.exists():
+            if legacy_vina.exists() and single_ligand_target:
                 tool_key = f"template_{pdb_id}_vina_{primary_lig}"
                 if tool_key not in ligands:
                     staged = _stage_and_align(legacy_vina, tool_key)
                     if staged is not None:
                         ligands[tool_key] = staged
+            elif legacy_vina.exists():
+                print(f"  WARN: legacy template_docking/{pdb_id}/vina/ "
+                      f"output but target has {len(lig_ids)} ligands; skipping "
+                      "(re-run multi-track docking to materialize per-ligand outputs).")
 
             # AutoDock-GPU: same per-ligand pattern.
             for adg_dir in (template_dir / "autodock_gpu").glob("ligand_*"):
@@ -658,12 +669,15 @@ def find_ligand_files(run_dir: Path) -> dict[str, Path]:
                     if staged is not None:
                         ligands[tool_key] = staged
             legacy_adg = template_dir / "autodock_gpu" / "docked.dlg"
-            if legacy_adg.exists():
+            if legacy_adg.exists() and single_ligand_target:
                 tool_key = f"template_{pdb_id}_adg_{primary_lig}"
                 if tool_key not in ligands:
                     staged = _stage_and_align(legacy_adg, tool_key)
                     if staged is not None:
                         ligands[tool_key] = staged
+            elif legacy_adg.exists():
+                print(f"  WARN: legacy template_docking/{pdb_id}/autodock_gpu/ "
+                      f"output but target has {len(lig_ids)} ligands; skipping.")
 
             # lig-align: per-ligand sub-dir or legacy.
             lig_align_root = template_dir / "lig_align"
@@ -676,14 +690,16 @@ def find_ligand_files(run_dir: Path) -> dict[str, Path]:
                         staged = _stage_and_align(mcs_sdf, tool_key)
                         if staged is not None:
                             ligands[tool_key] = staged
-                # Legacy: SDFs directly under lig_align/ (single-ligand)
                 legacy_mcs = next(lig_align_root.glob("*.sdf"), None)
-                if legacy_mcs is not None:
+                if legacy_mcs is not None and single_ligand_target:
                     tool_key = f"template_{pdb_id}_lig_align_{primary_lig}"
                     if tool_key not in ligands:
                         staged = _stage_and_align(legacy_mcs, tool_key)
                         if staged is not None:
                             ligands[tool_key] = staged
+                elif legacy_mcs is not None:
+                    print(f"  WARN: legacy template_docking/{pdb_id}/lig_align/*.sdf "
+                          f"output but target has {len(lig_ids)} ligands; skipping.")
 
     return ligands
 

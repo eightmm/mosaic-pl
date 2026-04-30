@@ -772,7 +772,7 @@ def _load_docking_prep_summary(run_dir: Path) -> dict[str, Any] | None:
 
 
 _DOCKING_BOX_SOURCES = (
-    # Cofolding clusters — top-K of single-link clustering across all aligned
+    # Cofolding clusters — top-K of greedy first-match centroid clustering across all aligned
     # cofold cifs (4 models × 25 seeds = 100 placements). Well-converged
     # targets only fill cofolding_1; multi-pocket / inter-model-disagreement
     # targets register 2-3. Variants with no matching source clean-skip at
