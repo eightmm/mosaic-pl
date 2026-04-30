@@ -273,13 +273,60 @@ def cif_to_receptor_pdb(
     return output_pdb
 
 
+_NUCLEIC_RESIDUES_T2 = {
+    "A", "U", "G", "C", "RA", "RU", "RG", "RC",
+    "DA", "DT", "DG", "DC", "T", "DI", "I",
+}
+
+
+def _has_nucleic_acid_pdb(pdb_path: Path) -> bool:
+    """RNA/DNA residue check on a PDB path (Track 2 receptor variant)."""
+    if not pdb_path.exists():
+        return False
+    for line in pdb_path.read_text().splitlines():
+        if line.startswith(("ATOM", "HETATM")):
+            res = line[17:20].strip().upper()
+            if res in _NUCLEIC_RESIDUES_T2:
+                return True
+    return False
+
+
 def prepare_receptor_pdbqt(pdb_path: Path, output_dir: Path) -> tuple[Path, Path]:
-    """Run pdb2pqr and convert to PDBQT."""
+    """Run pdb2pqr and convert to PDBQT.
+
+    Nucleic acid receptors (RNA/DNA) get routed through obabel because
+    pdb2pqr's AMBER FF silently drops nucleotide residues. Mirrors the
+    behaviour in ``prepare_docking_inputs.pdb_to_pdbqt``.
+    """
     pqr_path = output_dir / "receptor.pqr"
     pdbqt_path = output_dir / "receptor.pdbqt"
     protonated_pdb = output_dir / "receptor_protonated.pdb"
 
-    # pdb2pqr
+    # Nucleic acid path: obabel one-shot.
+    if _has_nucleic_acid_pdb(pdb_path):
+        repo_root = Path(__file__).resolve().parent.parent
+        obabel = repo_root / ".venvs" / "pred" / "bin" / "obabel"
+        if obabel.exists():
+            print(f"  Nucleic acid detected → obabel path for {pdb_path.name}")
+            try:
+                subprocess.run(
+                    [str(obabel), str(pdb_path), "-O", str(pdbqt_path),
+                     "-p", "7.4", "--partialcharge", "gasteiger", "-xr"],
+                    check=True, capture_output=True, text=True, timeout=120,
+                )
+                # Track 2 also needs a protonated PDB for PxDock; obabel
+                # gives us both via two calls (pdbqt path + .pdb path).
+                subprocess.run(
+                    [str(obabel), str(pdb_path), "-O", str(protonated_pdb),
+                     "-p", "7.4"],
+                    check=True, capture_output=True, text=True, timeout=120,
+                )
+                return protonated_pdb, pdbqt_path
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+                    FileNotFoundError) as e:
+                print(f"  obabel failed: {e}; falling back to pdb2pqr (likely to drop nucleic)")
+
+    # pdb2pqr (protein path)
     try:
         subprocess.run(
             [sys.executable, "-m", "pdb2pqr", "--ff=AMBER", "--ffout=AMBER",

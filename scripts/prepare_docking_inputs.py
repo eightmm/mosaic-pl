@@ -224,6 +224,75 @@ def pqr_to_protonated_pdb(pqr_path: Path, output_path: Path) -> Path:
     return output_path
 
 
+# Nucleic acid residue names (DNA + RNA + standard variants). When the
+# receptor PDB contains any of these we route through obabel for
+# protonation + PDBQT instead of pdb2pqr — pdb2pqr's AMBER FF doesn't
+# parameterize nucleotides reliably and either fails outright or strips
+# the entire nucleic chain.
+_NUCLEIC_RESIDUES = {
+    # RNA standard
+    "A", "U", "G", "C",
+    # RNA explicit prefix (rare in cofold cifs but seen in some PDBs)
+    "RA", "RU", "RG", "RC",
+    # DNA standard
+    "DA", "DT", "DG", "DC",
+    # DNA legacy single-letter (T = thymine)
+    "T",
+    # Modified backbones
+    "DI", "I",
+}
+
+
+def _has_nucleic_acid(pdb_path: Path) -> bool:
+    """Return True when the PDB has any standard RNA/DNA residue.
+
+    Looked up by residue name (cols 17-20 of ATOM/HETATM lines). Used to
+    decide whether to route receptor protonation through obabel instead
+    of pdb2pqr; protein-only receptors keep the pdb2pqr path so existing
+    behaviour stays unchanged.
+    """
+    if not pdb_path.exists():
+        return False
+    for line in pdb_path.read_text().splitlines():
+        if line.startswith(("ATOM", "HETATM")):
+            res = line[17:20].strip().upper()
+            if res in _NUCLEIC_RESIDUES:
+                return True
+    return False
+
+
+def _pdb_to_pdbqt_obabel(pdb_path: Path, output_path: Path) -> bool:
+    """Single-step PDB → PDBQT for receptors with nucleic acids.
+
+    obabel handles both protein and nucleotide residues, adds hydrogens
+    at pH 7.4, assigns Gasteiger charges, and writes AD4 atom types.
+    Used as a fallback path because pdb2pqr's AMBER FF doesn't cover
+    nucleic acids.
+
+    Returns True on success.
+    """
+    import subprocess
+    obabel = Path(__file__).resolve().parent.parent / ".venvs" / "pred" / "bin" / "obabel"
+    if not obabel.exists():
+        print(f"  WARNING: obabel not found at {obabel}; nucleic-acid receptor unsupported")
+        return False
+    try:
+        subprocess.run(
+            [
+                str(obabel), str(pdb_path), "-O", str(output_path),
+                "-p", "7.4",                       # protonate at pH 7.4
+                "--partialcharge", "gasteiger",
+                "-xr",                             # rigid receptor mode
+            ],
+            check=True, capture_output=True, text=True, timeout=120,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            FileNotFoundError) as e:
+        print(f"  obabel PDBQT conversion failed: {e}")
+        return False
+    return output_path.exists()
+
+
 # AD4 metal atom types + their typical formal charge. AutoDock-GPU and
 # AutoDock-Vina ship grid-map types for these out-of-the-box; pdb2pqr
 # silently drops them (AMBER FF doesn't know how to assign Gasteiger
@@ -272,7 +341,26 @@ def pdb_to_pdbqt(pdb_path: Path, output_path: Path) -> Path:
     parameterise bare metals — without this fallback the metal coordinates
     would be silently lost between PDB and PDBQT and the docking grid
     maps would never see the active-site coordination geometry.
+
+    For receptors containing nucleic acid (RNA/DNA), the pdb2pqr +
+    AMBER path can't parameterize the nucleotide residues — they get
+    silently dropped. We auto-detect nucleic acid by residue name and
+    route through obabel for the entire receptor. obabel handles both
+    protein and nucleotide chemistries plus phosphate backbone charges,
+    giving a self-consistent PDBQT in one shot.
     """
+
+    # Auto-route to obabel for nucleic acid receptors. AMBER FF can't
+    # parameterize nucleotides so the pdb2pqr path silently drops them.
+    if _has_nucleic_acid(pdb_path):
+        print("  Nucleic acid detected in receptor → routing through obabel "
+              "(pdb2pqr's AMBER FF doesn't cover RNA/DNA)")
+        if _pdb_to_pdbqt_obabel(pdb_path, output_path):
+            print(f"  Receptor PDBQT (obabel): {output_path}")
+            return output_path
+        # If obabel failed, fall through to pdb2pqr — last-resort attempt
+        # so a misconfigured obabel doesn't strand the whole pipeline.
+        print("  obabel path failed; trying pdb2pqr (likely to drop nucleic chains)")
 
     # Step 1: pdb2pqr adds hydrogens and assigns charges
     pqr_path = output_path.with_suffix(".pqr")

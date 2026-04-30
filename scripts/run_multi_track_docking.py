@@ -184,7 +184,32 @@ def run_autodock_gpu_on_template(
     grid_dir = output_dir / "grid"
     grid_dir.mkdir(parents=True, exist_ok=True)
 
-    # Generate GPF
+    # Generate GPF — receptor / ligand atom types parsed from the actual
+    # PDBQTs so nucleic acid receptors (P from phosphate), retained
+    # metals, and ligands with halogens/Si etc. all reach the grid maps.
+    def _parse_pdbqt_types(path: str) -> list[str]:
+        types: list[str] = []
+        seen: set[str] = set()
+        try:
+            with open(path) as fh:
+                for line in fh:
+                    if line.startswith(("ATOM", "HETATM")):
+                        tok = line[77:79].strip() if len(line) >= 79 else line.split()[-1].strip()
+                        if tok and tok not in seen:
+                            seen.add(tok)
+                            types.append(tok)
+        except OSError:
+            pass
+        return types
+
+    base_types = ["A", "C", "HD", "N", "NA", "OA", "SA"]
+    rec_actual = _parse_pdbqt_types(receptor_pdbqt)
+    lig_actual = _parse_pdbqt_types(ligand_pdbqt)
+    if not lig_actual:
+        lig_actual = list(base_types)
+    rec_types = list(dict.fromkeys(base_types + rec_actual + lig_actual))
+    lig_types = list(dict.fromkeys(base_types + lig_actual))
+
     npts = [max(1, int(s / 0.375)) for s in size]
     gpf_path = grid_dir / "receptor.gpf"
     fld_path = grid_dir / "receptor.maps.fld"
@@ -192,15 +217,19 @@ def run_autodock_gpu_on_template(
         f"npts {npts[0]} {npts[1]} {npts[2]}",
         f"gridfld {fld_path.name}",
         "spacing 0.375",
-        "receptor_types A C HD N NA OA SA",
-        "ligand_types A C HD N NA OA SA",
+        f"receptor_types {' '.join(rec_types)}",
+        f"ligand_types {' '.join(lig_types)}",
         f"receptor {receptor_pdbqt}",
         f"gridcenter {center[0]} {center[1]} {center[2]}",
         "smooth 0.5",
-        "map receptor.A.map", "map receptor.C.map", "map receptor.HD.map",
-        "map receptor.N.map", "map receptor.NA.map", "map receptor.OA.map",
-        "map receptor.SA.map", "elecmap receptor.e.map",
-        "dsolvmap receptor.d.map", "dielectric -0.1465",
+    ]
+    # One map line per ligand atom type; elecmap + dsolvmap always.
+    for t in lig_types:
+        gpf_lines.append(f"map receptor.{t}.map")
+    gpf_lines += [
+        "elecmap receptor.e.map",
+        "dsolvmap receptor.d.map",
+        "dielectric -0.1465",
     ]
     gpf_path.write_text("\n".join(gpf_lines) + "\n")
 
