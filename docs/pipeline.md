@@ -203,10 +203,21 @@ Cofolding 출력에서 docking 입력을 자동 생성. `scripts/prepare_docking
 
 | Step | Tool | Output | 용도 |
 |---|---|---|---|
-| CIF → PDB | gemmi (ligand/water 제거) | `receptor.pdb` | 기본 |
+| CIF → PDB | gemmi (selective: dockable ligand chain + water 만 제거, **metal/cofactor retain**) | `receptor.pdb` | 기본 |
 | PDB → PQR | pdb2pqr `--ff=AMBER` | (intermediate) | 수소 + 전하 |
 | PQR → protonated PDB | 자체 변환 | `receptor_protonated.pdb` | Protenix-Dock |
-| PQR → PDBQT | AD4 atom mapping | `receptor.pdbqt` | Vina + AutoDock-GPU |
+| PQR → PDBQT | AD4 atom mapping + metal HETATM 재첨부 | `receptor.pdbqt` | Vina + AutoDock-GPU |
+
+**Metal/cofactor retain** (commit `c65797b`+):
+
+이전엔 `gemmi.remove_ligands_and_waters()` 가 receptor 의 모든 non-polymer 를 strip → metalloprotein 의 active-site coordination 좌표 손실. Fix:
+
+- `cif_to_pdb(dockable_ligand_chains={"L", ...})` — input YAML 의 SMILES-bearing ligand chain id 만 추출해 그 chain 의 non-polymer 만 제거. Metal/cofactor 는 receptor 에 retain
+- `pdb_to_pdbqt` 가 pdb2pqr 후에 metal HETATM 을 manual 재첨부 (`+2.000 Mg` 같은 AD4 atom type + formal charge — pdb2pqr/AMBER 가 bare metal parameterize 못함)
+- 지원: Mg²⁺, Zn²⁺, Ca²⁺, Fe³⁺, Mn²⁺, Cu²⁺, Ni²⁺, Co²⁺, Cd²⁺, Hg²⁺, Ba²⁺, Sr²⁺, Al³⁺, K⁺, Na⁺, Cl⁻
+- Verified on 21ii_input (Mg²⁺ pyrophosphatase): `receptor.pdb` HETATM `0 → 1`, PDBQT 에 `+2.000 Mg` 라인
+- Track 2 receptor (RCSB template) 도 동일 logic 적용 (organic ligand ≥6 heavy atoms 만 strip)
+- 한계: AutoDock-GPU runtime GPF 는 ligand atom type 만 보고 grid map 생성. Receptor metal 은 elec/dsolv map 에 contribute (대부분 metal-coordinating docking 의 dominant signal). Ligand 자체에 metal 들어있는 케이스는 unhandled
 
 #### Ligand preparation
 
@@ -299,7 +310,7 @@ PxDock 은 **default 비활성화** (`protenix_dock.enabled=false` since commit 
 
 - 모든 tool 은 `docking_prep_summary.json` 에서 receptor / ligand / box 를 runtime 에 읽음
 - AutoDock-GPU 래퍼는 추가로 **런타임에 ligand pdbqt 를 파싱**해서 `ligand_types` + grid map 동적 구성 — F/Cl/Br/P/I/Si 등 비표준 atom 도 자동 대응
-- PxDock 이 전체 docking 시간의 ~77 % 차지 (병목)
+- PxDock 활성화 시 docking 시간의 ~77 % 차지 → default 비활성화
 - **Config**: `docking_seeds=[42,101,202,303,404]`. variant 자동
 
 #### Track 2 — Template-based box docking (any template, no MCS gate)
@@ -309,14 +320,16 @@ template 리간드 위치를 docking box 로. **Template ligand 가 query 와 �
 
 - **Script**: `scripts/prepare_template_docking.py` + `scripts/run_multi_track_docking.py`
 - **Logic**:
-  1. **Cluster-aware template selection**: `template_pockets.json` + `template_pocket_clusters.json` 이 있으면 (default) 각 cluster 마다 evidence-best representative template 1 개 픽 (`select_cluster_representative_templates`, 최대 `--max-templates 10` cluster). Track 1 의 `vina_template_consensus_*` 와 같은 cluster set 을 dock 하되 receptor 만 *experimental template* 으로 교체. 옛 `sort top-N` 은 fallback (pockets json 없을 때만)
-  2. RCSB CIF → receptor PDB/PDBQT (gemmi + pdb2pqr)
-  3. **USalign 으로 template → cofold frame transform 행렬 계산** → receptor 에 적용 (`receptor_aligned`)
+  1. **Cluster-aware template selection** (default since `b7dd9d5`): `template_pockets.json` + `template_pocket_clusters.json` 의 각 cluster 마다 evidence-best representative template 1 개 픽 (`select_cluster_representative_templates`, `--max-templates 10` 까지). Track 1 `vina_template_consensus_1..10` 과 **같은 cluster set 을 cover** 하되 receptor 만 *experimental template* 으로 교체. 옛 `sort top-N` 은 pockets json 없을 때 fallback. Redundancy 제거 — 옛 sort top-3 은 종종 같은 cluster 의 alternate chain/conformation 만 dock 하던 문제 해결
+  2. RCSB CIF → receptor PDB/PDBQT (gemmi + pdb2pqr, **metal/cofactor retain** — Stage 3 와 동일 logic. Track 2 receptor 도 organic ligand (≥6 heavy atoms) 만 strip)
+  3. **USalign template → cofold frame transform** 계산 → template CIF 의 모든 atom 에 적용 → receptor 와 box 좌표가 cofold receptor 와 같은 좌표계
   4. Template 리간드 bound-pose SDF 추출 (`extract_template_ligand_sdf()`)
   5. Target SMILES → SDF/PDBQT (RDKit + meeko)
-  6. Vina + ADG + PxDock 실행
+  6. Vina + ADG 실행 (PxDock 은 default 비활성화, `protenix_dock.enabled=true` 시에만)
 - **MCS 게이트 없음**: `check_template_hits` 는 `num_ligands > 0` 만 검사
-- **Frame fix (2026-04)**: 이전엔 docked pose 가 **template frame** 에 머물러 cofold receptor 와 정합 안 됨 → BA-Pred 입력 / 최종 MODEL block 이 mis-aligned. USalign template→cofold transform 으로 receptor 와 box 좌표를 cofold frame 으로 옮겨 dock → 결과 pose 가 cofold receptor 와 같은 좌표계
+- **Frame fix (commit `e16cb8c`)**: 이전엔 docked pose 가 template frame 에 머물러 cofold receptor 와 mis-aligned → BA-Pred 입력 / 최종 MODEL block 좌표 깨짐. USalign template→cofold transform 으로 fix. Track 1 의 `vina_template_consensus_*` 와 box 좌표 매칭됨
+
+> **Track 1 vina_template_consensus_N ↔ Track 2 cluster N representative 의 차이**: box 는 동일 (cluster N centroid 근처), receptor 만 다름. Track 1 = cofold (predicted) receptor, Track 2 = experimental template receptor (USalign-transformed to cofold frame). Cofold protein 이 정확하면 Track 1 의 cofold receptor 가 valid, cofold 가 wrong fold 면 Track 2 의 experimental conformation 이 backup. novel2025 batch 에서 Track 2 family 의 native rate 가 낮아 (~2.2 %) ROI 회의적이지만 multi-chain receptor 에서 cluster-aware 가 효과 있을지 측정 대기.
 
 #### Track 3 — lig-align (MCS ≥ 0.5)
 
@@ -346,21 +359,21 @@ flowchart TB
 
 | Track | Receptor | Box source | Method | Entry |
 |---|---|---|---|---|
-| 1 | cofold best (`_aligned`) | ≤19 (≤3 cofold cluster + ≤6 predictor top-K + ≤10 consensus) | Vina + ADG + PxDock | always |
-| 2 | template PDB (RCSB, USalign-aligned to cofold frame) | template ligand centroid | Vina + ADG + PxDock | `num_ligands > 0` |
+| 1 | cofold best (`_aligned`) | ≤19 (≤3 cofold cluster + ≤6 predictor top-K + ≤10 consensus) | Vina + ADG (+ PxDock opt-in) | always |
+| 2 | template PDB (RCSB, USalign→cofold frame, **cluster-aware top-1 per cluster**) | template ligand centroid | Vina + ADG (+ PxDock opt-in) | `num_ligands > 0` |
 | 3 | template PDB (same as Track 2) | MCS anchor alignment | lig-align | per-template `best_mcs_coverage ≥ mcs_threshold` |
 
 ---
 
-### Stage 5 — Ion / metal placement (conditional)
+### Stage 5 — Ion / metal placement (conditional, post-hoc)
 
-Input YAML 에 ion CCD 엔티티 (ZN/MG/CA/FE 등) 가 있으면 자동 실행. Cofolding 은 metal 위치 부정확 →
-template alignment 기반으로 위치 후보 수집.
+Input YAML 에 ion CCD 엔티티 (ZN/MG/CA/FE 등) 가 있으면 자동 실행. **Stage 3 의 metal retain (cofold 가 놓은 metal 좌표를 docking receptor 에 보존) 과는 별개의 post-hoc 분석** — template alignment 기반으로 *대안* 위치 후보 cluster.
 
 - **Script**: `scripts/collect_template_ions.py`
 - **Logic**: target ion 보유 template (rcsb_index.db) → gemmi CA superposition (template → cofold) → rotation/translation 을 ion 좌표에 적용 → distance clustering (default 2.0 Å) → confidence 그룹별 (high `pident≥70%`, medium 50–70 %, low 30–50 %) 리포트
 - **Output**: `outputs/ion_placement/ion_placement_summary.json`
 - **Auto skip**: input 에 ion 없으면 미실행
+- **Receptor 와의 관계**: 이 stage 는 docking 결과에 직접 inject 안 됨. Cofold 가 metal 위치 잘 잡았으면 Stage 3 의 metal retain 으로 docking 이 metal coordinator 인식. Cofold metal 위치가 의심스러울 땐 이 ion placement 결과로 alternate 좌표 검토 가능
 
 ---
 
@@ -589,11 +602,12 @@ gantt
 | Docking prep bridge | <5 s | <5 s | |
 | Vina (5 seeds × N variants) | 254 s | 130 s | |
 | AutoDock-GPU (5 seeds × N variants) | 42 s | 42 s | runtime GPF |
-| Protenix-Dock (single) | 459 s | 513 s | docking 시간의 ~77 % |
+| Protenix-Dock (single, opt-in) | 459 s | 513 s | enable 시 docking 시간의 ~77 %; default 비활성화 (commit `b7dd9d5`+) |
 | Track 2/3, ion placement | skip | skip | (이 타겟들은 미발화) |
 | BA-Pred + RMSD-Pred | ~1–2 min | ~1–2 min | |
 | Score aggregation + LG | <10 s | <10 s | |
-| **Total** | **53:26** | **52:08** | Track 2/3 + ion 모두 활성 시 +8–20 min 추가 |
+| **Total (PxDock 활성)** | **53:26** | **52:08** | Track 2/3 + ion 모두 활성 시 +8–20 min 추가 |
+| **Total (PxDock skip, default)** | ~46 min | ~44 min | PxDock ~7-9 min 절약. Track 2/3 active 시 + 5-15 min |
 
 > Cofolding 합산 36 분 ≈ 전체 ~67 %. Track 1 docking ~13 분 ≈ ~25 %.
 > Source fan-out (최대 19 개) 의 wall-clock 영향은 작음 — Vina 3 s × 19 src × 5 seed ≈ 285 s, ADG 10 s × 19 × 5 ≈ 950 s. 전체 docking 시간은 PxDock 이 결정.
@@ -638,7 +652,7 @@ experiments/runs/<target>/
 │   ├── alphafold3_input.json                       # AF3 JSON (+ MSA from Boltz bridge)
 │   ├── docking/
 │   │   ├── docking_prep_summary.json                 # receptor / ligand / box paths + binding_site_predictions (≤19 sources)
-│   │   ├── receptor.pdb / .pdbqt / receptor_protonated.pdb
+│   │   ├── receptor.pdb / .pdbqt / receptor_protonated.pdb  (metal/cofactor retained)
 │   │   ├── ligand_L.sdf / .pdbqt
 │   │   ├── p2rank/                                   # P2Rank pocket predictions
 │   │   └── swinsite/                                 # SwinSite pocket predictions
