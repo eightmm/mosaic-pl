@@ -98,8 +98,17 @@ def run_template_docking_prep(
     return json.loads(summary_path.read_text())
 
 
-def run_vina_on_template(template: dict, output_dir: Path, seed: int = 42) -> dict | None:
-    """Run AutoDock Vina on a template-prepared structure."""
+def run_vina_on_template(
+    template: dict, output_dir: Path, seed: int = 42,
+    ligand: dict | None = None,
+) -> dict | None:
+    """Run AutoDock Vina on a template-prepared structure for one ligand.
+
+    The ``ligand`` arg is one entry from ``template["ligands"]`` (the
+    multi-ligand list ``prepare_template_docking`` writes). When ``None``
+    falls back to the first ligand for backward compat with single-ligand
+    runs.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     receptor_pdbqt = template.get("receptor_pdbqt")
     ligands = template.get("ligands", [])
@@ -109,7 +118,10 @@ def run_vina_on_template(template: dict, output_dir: Path, seed: int = 42) -> di
     if not receptor_pdbqt or not ligands:
         return None
 
-    ligand_pdbqt = ligands[0].get("pdbqt")
+    if ligand is None:
+        ligand = ligands[0]
+    ligand_pdbqt = ligand.get("pdbqt")
+    lig_id = ligand.get("id", "L")
     if not ligand_pdbqt or not Path(ligand_pdbqt).exists():
         return None
 
@@ -130,6 +142,7 @@ def run_vina_on_template(template: dict, output_dir: Path, seed: int = 42) -> di
 
         return {
             "tool": "vina",
+            "ligand_id": lig_id,
             "output": str(out_path),
             "best_score": best_score,
             "template_pdb_id": template.get("template_pdb_id"),
@@ -140,9 +153,10 @@ def run_vina_on_template(template: dict, output_dir: Path, seed: int = 42) -> di
 
 
 def run_autodock_gpu_on_template(
-    template: dict, output_dir: Path, seed: int = 42
+    template: dict, output_dir: Path, seed: int = 42,
+    ligand: dict | None = None,
 ) -> dict | None:
-    """Run AutoDock-GPU on a template-prepared structure."""
+    """Run AutoDock-GPU on a template-prepared structure for one ligand."""
     output_dir.mkdir(parents=True, exist_ok=True)
     repo_root = Path(__file__).resolve().parent.parent
 
@@ -154,7 +168,10 @@ def run_autodock_gpu_on_template(
     if not receptor_pdbqt or not ligands:
         return None
 
-    ligand_pdbqt = ligands[0].get("pdbqt")
+    if ligand is None:
+        ligand = ligands[0]
+    ligand_pdbqt = ligand.get("pdbqt")
+    lig_id = ligand.get("id", "L")
     if not ligand_pdbqt or not Path(ligand_pdbqt).exists():
         return None
 
@@ -213,6 +230,7 @@ def run_autodock_gpu_on_template(
         print(f"    AutoDock-GPU done: {dlg_file}")
         return {
             "tool": "autodock_gpu",
+            "ligand_id": lig_id,
             "output": str(dlg_file),
             "template_pdb_id": template.get("template_pdb_id"),
         }
@@ -222,9 +240,10 @@ def run_autodock_gpu_on_template(
 
 
 def run_protenix_dock_on_template(
-    template: dict, output_dir: Path, seed: int = 42
+    template: dict, output_dir: Path, seed: int = 42,
+    ligand: dict | None = None,
 ) -> dict | None:
-    """Run Protenix-Dock on a template-prepared structure."""
+    """Run Protenix-Dock on a template-prepared structure for one ligand."""
     output_dir.mkdir(parents=True, exist_ok=True)
     repo_root = Path(__file__).resolve().parent.parent
 
@@ -236,7 +255,10 @@ def run_protenix_dock_on_template(
     if not receptor_pdb or not ligands:
         return None
 
-    ligand_sdf = ligands[0].get("sdf")
+    if ligand is None:
+        ligand = ligands[0]
+    ligand_sdf = ligand.get("sdf")
+    lig_id = ligand.get("id", "L")
     if not ligand_sdf or not Path(ligand_sdf).exists():
         return None
 
@@ -263,6 +285,7 @@ def run_protenix_dock_on_template(
         print(f"    Protenix-Dock done: {output_dir}")
         return {
             "tool": "protenix_dock",
+            "ligand_id": lig_id,
             "output": str(output_dir),
             "template_pdb_id": template.get("template_pdb_id"),
         }
@@ -275,7 +298,8 @@ _MAIN_VENV_PYTHON = Path(__file__).resolve().parent.parent / ".venv" / "bin" / "
 
 
 def run_lig_align_on_template(
-    template: dict, target_smiles: str, output_dir: Path
+    template: dict, target_smiles: str, output_dir: Path,
+    ligand_id: str = "L",
 ) -> dict | None:
     """Run lig-align: MCS-guided pose generation from template ligand.
 
@@ -362,6 +386,7 @@ def run_lig_align_on_template(
           f"best_score={result.get('best_score', 'N/A')}")
     return {
         "tool": "lig_align",
+        "ligand_id": ligand_id,
         "output": result.get("output_file"),
         "num_poses": result.get("num_poses"),
         "best_score": result.get("best_score"),
@@ -544,41 +569,70 @@ def main() -> int:
 
         template_out = run_dir / "outputs" / "template_docking" / pdb_id
 
-        # Track 2: Docking tools on template structure
+        # Multi-ligand expansion: iterate every dockable ligand the template
+        # was prepped with (prepare_template_docking writes one entry per
+        # ligand from the input YAML's smiles-bearing entries; ccd-only
+        # entries like ions are skipped at prep time so they never reach
+        # this loop).
+        template_ligands = template.get("ligands", []) or []
+        if not template_ligands:
+            print("    Template has no dockable ligands, skipping all tracks.")
+            continue
+
+        # Track 2: Docking tools on template structure (per-ligand)
         print("\n  --- Track 2: Template-based docking ---")
+        for tlig in template_ligands:
+            lig_id = tlig.get("id", "L")
+            lig_dir_suffix = f"ligand_{lig_id}"
+            print(f"    [ligand {lig_id}]")
 
-        vina_result = run_vina_on_template(
-            template, template_out / "vina", seed=args.seed,
-        )
-        if vina_result:
-            all_results.append(vina_result)
-
-        adg_result = run_autodock_gpu_on_template(
-            template, template_out / "autodock_gpu", seed=args.seed,
-        )
-        if adg_result:
-            all_results.append(adg_result)
-
-        if args.skip_pxdock:
-            print("    Protenix-Dock: skipped (--skip-pxdock).")
-        else:
-            pxdock_result = run_protenix_dock_on_template(
-                template, template_out / "protenix_dock", seed=args.seed,
+            vina_result = run_vina_on_template(
+                template, template_out / "vina" / lig_dir_suffix,
+                seed=args.seed, ligand=tlig,
             )
-            if pxdock_result:
-                all_results.append(pxdock_result)
+            if vina_result:
+                all_results.append(vina_result)
 
-        # Track 3: lig-MCS-align — gated by MCS threshold because it
-        # performs an actual atom-mapped overlay of the template ligand.
-        # Below threshold the MCS is too small to produce a meaningful
-        # alignment; skip rather than emit a low-quality pose.
+            adg_result = run_autodock_gpu_on_template(
+                template, template_out / "autodock_gpu" / lig_dir_suffix,
+                seed=args.seed, ligand=tlig,
+            )
+            if adg_result:
+                all_results.append(adg_result)
+
+            if args.skip_pxdock:
+                print(f"      Protenix-Dock: skipped (--skip-pxdock).")
+            else:
+                pxdock_result = run_protenix_dock_on_template(
+                    template, template_out / "protenix_dock" / lig_dir_suffix,
+                    seed=args.seed, ligand=tlig,
+                )
+                if pxdock_result:
+                    all_results.append(pxdock_result)
+
+        # Track 3: lig-MCS-align (per-ligand) — gated by MCS threshold
+        # because it performs an actual atom-mapped overlay of the template
+        # ligand. Below threshold the MCS is too small to produce a
+        # meaningful alignment; skip rather than emit a low-quality pose.
+        # Note: MCS is computed from filtered_hits.tsv which currently
+        # tracks the primary target ligand only — per-ligand MCS would
+        # need filtered_hits annotations per (template, target_ligand)
+        # pair. For multi-ligand targets all ligands inherit the same
+        # MCS gate decision until that lands.
         if mcs >= args.mcs_threshold:
             print(f"\n  --- Track 3: lig-MCS-align (MCS={mcs:.2f} >= {args.mcs_threshold}) ---")
-            lig_align_result = run_lig_align_on_template(
-                template, target_smiles, template_out / "lig_align",
-            )
-            if lig_align_result:
-                all_results.append(lig_align_result)
+            for tlig in template_ligands:
+                lig_id = tlig.get("id", "L")
+                lig_smiles = tlig.get("smiles") or target_smiles
+                if not lig_smiles:
+                    continue
+                lig_align_result = run_lig_align_on_template(
+                    template, lig_smiles,
+                    template_out / "lig_align" / f"ligand_{lig_id}",
+                    ligand_id=lig_id,
+                )
+                if lig_align_result:
+                    all_results.append(lig_align_result)
         else:
             print(f"\n  --- Track 3: skipped (MCS={mcs:.2f} < {args.mcs_threshold}) ---")
 

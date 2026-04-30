@@ -587,10 +587,11 @@ def find_ligand_files(run_dir: Path) -> dict[str, Path]:
     cofold_sdfs = _stage_cofolding_poses(run_dir, staged_dir)
     ligands.update(cofold_sdfs)
 
-    # --- Template-based docking poses (Track 2 + Track 3) ---
-    # Multi-track docking runs against the primary ligand only, so all
-    # template poses are attached to ``primary_lig``. Each template_dir is
-    # ``outputs/template_docking/<template_pdb_id>/{vina,autodock_gpu,lig_align}/``.
+    # --- Template-based docking poses (Track 2 + Track 3, multi-ligand) ---
+    # Multi-track docking now runs per-dockable-ligand. Each template_dir is
+    # ``outputs/template_docking/<template_pdb_id>/{vina,autodock_gpu,protenix_dock,lig_align}/ligand_<lig_id>/``.
+    # Legacy single-ligand layout (no ``ligand_<id>/`` sub-dir) is also
+    # accepted as a fallback so old runs on disk keep working.
     # Filename conventions (fixed upstream in prepare_template_docking.py /
     # run_multi_track_docking.py):
     #   vina           → docked.pdbqt
@@ -630,26 +631,59 @@ def find_ligand_files(run_dir: Path) -> dict[str, Path]:
                         print(f"  WARN: transform application failed for {staged.name}")
                 return staged
 
-            vina_pdbqt = template_dir / "vina" / "docked.pdbqt"
-            if vina_pdbqt.exists():
-                tool_key = f"template_{pdb_id}_vina_{primary_lig}"
-                staged = _stage_and_align(vina_pdbqt, tool_key)
-                if staged is not None:
-                    ligands[tool_key] = staged
-            adg_dlg = template_dir / "autodock_gpu" / "docked.dlg"
-            if adg_dlg.exists():
-                tool_key = f"template_{pdb_id}_adg_{primary_lig}"
-                staged = _stage_and_align(adg_dlg, tool_key)
-                if staged is not None:
-                    ligands[tool_key] = staged
-            lig_align_dir = template_dir / "lig_align"
-            if lig_align_dir.exists():
-                mcs_sdf = next(lig_align_dir.glob("*.sdf"), None)
-                if mcs_sdf is not None:
-                    tool_key = f"template_{pdb_id}_lig_align_{primary_lig}"
-                    staged = _stage_and_align(mcs_sdf, tool_key)
+            # Vina: per-ligand sub-dir (new) or single-ligand legacy layout.
+            for vina_dir in (template_dir / "vina").glob("ligand_*"):
+                lig_id = vina_dir.name[len("ligand_"):]
+                vina_pdbqt = vina_dir / "docked.pdbqt"
+                if vina_pdbqt.exists():
+                    tool_key = f"template_{pdb_id}_vina_{lig_id}"
+                    staged = _stage_and_align(vina_pdbqt, tool_key)
                     if staged is not None:
                         ligands[tool_key] = staged
+            legacy_vina = template_dir / "vina" / "docked.pdbqt"
+            if legacy_vina.exists():
+                tool_key = f"template_{pdb_id}_vina_{primary_lig}"
+                if tool_key not in ligands:
+                    staged = _stage_and_align(legacy_vina, tool_key)
+                    if staged is not None:
+                        ligands[tool_key] = staged
+
+            # AutoDock-GPU: same per-ligand pattern.
+            for adg_dir in (template_dir / "autodock_gpu").glob("ligand_*"):
+                lig_id = adg_dir.name[len("ligand_"):]
+                adg_dlg = adg_dir / "docked.dlg"
+                if adg_dlg.exists():
+                    tool_key = f"template_{pdb_id}_adg_{lig_id}"
+                    staged = _stage_and_align(adg_dlg, tool_key)
+                    if staged is not None:
+                        ligands[tool_key] = staged
+            legacy_adg = template_dir / "autodock_gpu" / "docked.dlg"
+            if legacy_adg.exists():
+                tool_key = f"template_{pdb_id}_adg_{primary_lig}"
+                if tool_key not in ligands:
+                    staged = _stage_and_align(legacy_adg, tool_key)
+                    if staged is not None:
+                        ligands[tool_key] = staged
+
+            # lig-align: per-ligand sub-dir or legacy.
+            lig_align_root = template_dir / "lig_align"
+            if lig_align_root.exists():
+                for la_dir in lig_align_root.glob("ligand_*"):
+                    lig_id = la_dir.name[len("ligand_"):]
+                    mcs_sdf = next(la_dir.glob("*.sdf"), None)
+                    if mcs_sdf is not None:
+                        tool_key = f"template_{pdb_id}_lig_align_{lig_id}"
+                        staged = _stage_and_align(mcs_sdf, tool_key)
+                        if staged is not None:
+                            ligands[tool_key] = staged
+                # Legacy: SDFs directly under lig_align/ (single-ligand)
+                legacy_mcs = next(lig_align_root.glob("*.sdf"), None)
+                if legacy_mcs is not None:
+                    tool_key = f"template_{pdb_id}_lig_align_{primary_lig}"
+                    if tool_key not in ligands:
+                        staged = _stage_and_align(legacy_mcs, tool_key)
+                        if staged is not None:
+                            ligands[tool_key] = staged
 
     return ligands
 

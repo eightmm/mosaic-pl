@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from typing import Any
@@ -633,9 +634,20 @@ class TemplateSearchSequenceConfig:
     max_hits: int = 500
     threads: int = 8
     extra_args: list[str] = field(default_factory=list)
-    # Multi-track docking: template ligand filtering + template-guided docking
-    rcsb_dir: str = "~/DB/RCSB/raw/mmCIF_data"
-    rcsb_db_path: str = "~/DB/RCSB/processed/rcsb_index.db"
+    # Multi-track docking: template ligand filtering + template-guided docking.
+    # Defaults can be overridden by env vars CASP17_RCSB_DIR and
+    # CASP17_RCSB_INDEX_DB so a single shared cluster setup doesn't need
+    # every config file to override the path.
+    rcsb_dir: str = field(
+        default_factory=lambda: os.environ.get(
+            "CASP17_RCSB_DIR", "~/DB/RCSB/raw/mmCIF_data"
+        )
+    )
+    rcsb_db_path: str = field(
+        default_factory=lambda: os.environ.get(
+            "CASP17_RCSB_INDEX_DB", "~/DB/RCSB/processed/rcsb_index.db"
+        )
+    )
     mcs_threshold: float = 0.5
     # Time-split benchmarks: drop any hit whose RCSB deposition_date is
     # on or after this ISO date (YYYY-MM-DD). None = no date filter.
@@ -657,8 +669,14 @@ class TemplateSearchSequenceConfig:
             max_hits=int(data.get("max_hits", 500)),
             threads=int(data.get("threads", 8)),
             extra_args=[str(arg) for arg in data.get("extra_args", [])],
-            rcsb_dir=str(data.get("rcsb_dir", "~/DB/RCSB/raw/mmCIF_data")),
-            rcsb_db_path=str(data.get("rcsb_db_path", "~/DB/RCSB/processed/rcsb_index.db")),
+            rcsb_dir=str(data.get(
+                "rcsb_dir",
+                os.environ.get("CASP17_RCSB_DIR", "~/DB/RCSB/raw/mmCIF_data"),
+            )),
+            rcsb_db_path=str(data.get(
+                "rcsb_db_path",
+                os.environ.get("CASP17_RCSB_INDEX_DB", "~/DB/RCSB/processed/rcsb_index.db"),
+            )),
             mcs_threshold=float(data.get("mcs_threshold", 0.5)),
             max_deposition_date=_optional_string(
                 data.get("max_deposition_date"),

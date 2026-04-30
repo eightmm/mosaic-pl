@@ -792,7 +792,15 @@ def _extract_cofolding_ligand_centroid(
 # captures multi-pocket / inter-model disagreement signal that the old
 # "best-model single-centroid" extraction discarded.
 COFOLD_CLUSTER_CUTOFF = 5.0       # Å — same as template-pocket cluster
-COFOLD_CLUSTER_MIN_MEMBERS = 5    # out of ~100 placements
+# MIN_MEMBERS scales with the actual placement count instead of being
+# hardcoded for a 100-placement default (4 models × 5 seeds × 5 samples).
+# Targets that change ``cofolding_seeds`` or ``diffusion_samples`` previously
+# kept the same absolute floor → tiny pools (e.g. 25 placements with single
+# seed) lost legitimate clusters. Now: max(2, n_placements // 20) → ~5 % of
+# the pool, with an absolute minimum of 2 to guarantee multi-placement
+# evidence (singleton placements are still rejected).
+COFOLD_CLUSTER_MIN_FRACTION = 0.05
+COFOLD_CLUSTER_MIN_FLOOR = 2
 COFOLD_CLUSTER_TOP_K = 3
 
 
@@ -840,6 +848,14 @@ def _extract_cofolding_ligand_clusters(
             if c is not None:
                 placements.append((c, model))
 
+    # Dynamic min-members: 5 % of placements (floor 2). This degrades
+    # gracefully when the user bumps cofold seeds × samples up or down.
+    n_placements = len(placements)
+    min_members = max(
+        COFOLD_CLUSTER_MIN_FLOOR,
+        int(round(n_placements * COFOLD_CLUSTER_MIN_FRACTION)),
+    )
+
     if not placements:
         return []
 
@@ -868,7 +884,7 @@ def _extract_cofolding_ligand_clusters(
 
     out = []
     for cl in clusters:
-        if len(cl["points"]) < COFOLD_CLUSTER_MIN_MEMBERS:
+        if len(cl["points"]) < min_members:
             continue
         out.append({
             "centroid": [round(x, 4) for x in cl["centroid"]],
@@ -882,7 +898,55 @@ def _extract_cofolding_ligand_clusters(
 
 TEMPLATE_CONSENSUS_TOP_K = 10
 TEMPLATE_CONSENSUS_MIN_MEMBERS = 2
-TEMPLATE_CONSENSUS_BOX_SIZE = [22.5, 22.5, 22.5]
+TEMPLATE_CONSENSUS_BOX_SIZE = [22.5, 22.5, 22.5]  # legacy default; runtime override via _adaptive_box_size below
+
+
+def _adaptive_box_size(
+    ligands: list[dict],
+    *,
+    base: float = 22.5,
+    padding: float = 8.0,
+    cap: float = 40.0,
+) -> list[float]:
+    """Pick a docking box edge that comfortably wraps every dockable ligand.
+
+    For each ligand SDF we compute the max coordinate extent across XYZ,
+    take the largest across all ligands, and add ``padding`` Å margin.
+    Floored at ``base`` (legacy 22.5 Å so typical druglike behaviour
+    stays unchanged), capped at ``cap`` (40 Å — beyond this Vina/ADG
+    grid resolution starts to hurt search quality).
+
+    Returns a 3-list usable as ``box_size`` everywhere the prep summary
+    is consumed.
+    """
+    try:
+        from rdkit import Chem
+    except Exception:
+        return [base, base, base]
+    max_extent = 0.0
+    for lig in ligands:
+        sdf = lig.get("sdf") if isinstance(lig, dict) else None
+        if not sdf:
+            continue
+        try:
+            supp = Chem.SDMolSupplier(str(sdf), removeHs=True, sanitize=False)
+            mol = next(iter(supp), None)
+            if mol is None or mol.GetNumConformers() == 0:
+                continue
+            conf = mol.GetConformer()
+            xs, ys, zs = [], [], []
+            for i in range(mol.GetNumAtoms()):
+                p = conf.GetAtomPosition(i)
+                xs.append(p.x); ys.append(p.y); zs.append(p.z)
+            if not xs:
+                continue
+            extent = max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs))
+            if extent > max_extent:
+                max_extent = extent
+        except Exception:
+            continue
+    edge = max(base, min(cap, max_extent + padding))
+    return [round(edge, 2)] * 3
 
 
 def _add_template_consensus_sources(
@@ -1108,7 +1172,14 @@ def main() -> int:
     #     pockets the cofold ensemble agrees on. Well-converged targets
     #     collapse into a single cluster (= legacy behaviour); multi-
     #     pocket / inter-model-disagreement targets get 2-3 sources.
-    default_size = [22.5, 22.5, 22.5]
+    # Adaptive box size: max-extent + 8 Å padding, floored at 22.5, capped
+    # at 40. Macrocyclic / peptide ligands (extents > 14.5 Å) get a larger
+    # box; typical druglike (≤600 Da) keep the legacy 22.5 Å.
+    default_size = _adaptive_box_size(
+        [{"sdf": pl[2]} for pl in prepared_ligands if pl[2]]
+    )
+    if default_size[0] != 22.5:
+        print(f"  Adaptive box size: {default_size[0]:.1f} Å edge (ligand-extent + 8 Å padding)")
 
     # Receptor CA atoms (chain-aware) for nearest-chain tagging. Real
     # binding-site post-analysis on multi-chain proteins needs to know
@@ -1141,7 +1212,8 @@ def main() -> int:
               f"chain={nearest_chain})")
     if not cofold_clusters:
         print("  WARNING: no cofolding ligand clusters passed "
-              f"min_members={COFOLD_CLUSTER_MIN_MEMBERS} filter")
+              f"the dynamic min_members floor (5 % of placements, ≥ "
+              f"{COFOLD_CLUSTER_MIN_FLOOR})")
 
     # 4b. SwinSite top-K (ML-based surface pocket predictor, needs GPU
     # unless cache reused). Multi-chain receptors: top-2/3 typically pick
@@ -1150,7 +1222,7 @@ def main() -> int:
     swinsite_pockets = run_swinsite(
         pdb_path, args.output_dir,
         reuse_cache=args.reuse_binding_site_cache,
-    )
+    ) or []
     for pkt in swinsite_pockets:
         rank = pkt["rank"]
         src_name = f"swinsite_{rank}"
@@ -1172,7 +1244,7 @@ def main() -> int:
         p2rank_pockets = run_p2rank(
             pdb_path, args.output_dir,
             reuse_cache=args.reuse_binding_site_cache,
-        )
+        ) or []
         for pkt in p2rank_pockets:
             rank = pkt["rank"]
             src_name = f"p2rank_{rank}"
@@ -1244,20 +1316,45 @@ def main() -> int:
     # 5. Write summary JSON — include only the ligands that actually have
     # usable SDF + PDBQT files. Downstream docking tools iterate this list
     # and skip pipeline stages cleanly when the ligand list is empty.
+    usable_ligands = [
+        {
+            "id": lig_id,
+            "smiles": smiles,
+            "sdf": str(sdf) if sdf is not None else None,
+            "pdbqt": str(pdbqt) if pdbqt is not None else None,
+        }
+        for lig_id, smiles, sdf, pdbqt in prepared_ligands
+        if sdf is not None and pdbqt is not None
+    ]
+    n_dropped_ligands = len(prepared_ligands) - len(usable_ligands)
+
+    # Per-source diagnostic — every potential source is listed even if it
+    # ended up missing, so post-mortem runs can see where the silent skip
+    # happened without reading the prep log.
+    source_status = {
+        "cofolding_clusters_registered": [
+            k for k in binding_site_results if k.startswith("cofolding_")
+        ],
+        "swinsite_pockets_registered": [
+            k for k in binding_site_results if k.startswith("swinsite_")
+        ],
+        "p2rank_pockets_registered": [
+            k for k in binding_site_results if k.startswith("p2rank_")
+        ],
+        "template_consensus_registered": [
+            k for k in binding_site_results if k.startswith("template_consensus_")
+        ],
+        "n_cofold_placements_total": n_placements,
+        "cofold_min_members_floor": min_members,
+        "n_dropped_ligands_at_prep": n_dropped_ligands,
+        "dockable_chains_from_yaml": sorted(dockable_chains) if dockable_chains else [],
+    }
+
     summary = {
         "receptor_pdb": str(args.output_dir / "receptor_protonated.pdb"),
         "receptor_pdb_raw": str(args.output_dir / "receptor.pdb"),
         "receptor_pdbqt": str(args.output_dir / "receptor.pdbqt"),
-        "ligands": [
-            {
-                "id": lig_id,
-                "smiles": smiles,
-                "sdf": str(sdf) if sdf is not None else None,
-                "pdbqt": str(pdbqt) if pdbqt is not None else None,
-            }
-            for lig_id, smiles, sdf, pdbqt in prepared_ligands
-            if sdf is not None and pdbqt is not None
-        ],
+        "ligands": usable_ligands,
         "box_center": center,
         "box_size": size,
         "box_method": box_method,
@@ -1271,12 +1368,20 @@ def main() -> int:
         },
         "cofolding_structure": str(structure),
         "cofolding_model": model,
+        "source_status": source_status,
     }
     summary_path = args.output_dir / "docking_prep_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2) + "\n")
     print(f"  Summary: {summary_path}")
     print(f"  Box center: {center} (method: {box_method})")
     print(f"  Box size: {size}")
+    print(f"  Sources registered: cofold={len(source_status['cofolding_clusters_registered'])} "
+          f"swinsite={len(source_status['swinsite_pockets_registered'])} "
+          f"p2rank={len(source_status['p2rank_pockets_registered'])} "
+          f"template_consensus={len(source_status['template_consensus_registered'])}")
+    if n_dropped_ligands:
+        print(f"  WARNING: {n_dropped_ligands} ligand(s) dropped during prep "
+              "(SDF/PDBQT generation failed) — check log above for SMILES errors")
 
     return 0
 
