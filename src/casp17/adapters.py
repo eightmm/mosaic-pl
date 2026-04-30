@@ -521,6 +521,16 @@ def prepare_alphafold3(
 
     dump_json(payload, input_path)
 
+    # Persist the YAML→AF3 chain id remap so downstream tools that consume
+    # AF3 cifs (notably prepare_docking_inputs.py picking dockable chains)
+    # can translate the original SMILES-bearing ligand ids (``L2`` / ``X2``)
+    # to whatever letter AF3 reassigned them to. Without this the ligand
+    # would survive ``cif_to_pdb``'s receptor strip and end up baked into
+    # the docking receptor.
+    af3_remap_path = run_dir / "inputs" / "alphafold3_chain_remap.json"
+    af3_remap_path.parent.mkdir(parents=True, exist_ok=True)
+    dump_json({"yaml_to_af3": af3_id_remap}, af3_remap_path)
+
     if common.templates:
         notes.append(
             "Boltz templates are not translated to AlphaFold3 templates because AlphaFold3 requires explicit query/template index mappings."

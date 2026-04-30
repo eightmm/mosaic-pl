@@ -35,6 +35,11 @@ def _stage_pose_file(src: Path, staged_dir: Path, stem: str) -> Path | None:
     pose-extraction code (``make_casp_submission.py``) load any selected pose
     by its canonical name without caring about the original format.
 
+    Idempotency: when the upstream ``src`` is newer than a previously staged
+    SDF, the staged SDF is deleted before re-conversion so selective reruns
+    pick up the refreshed pose. Without this, a re-docked seed silently
+    reuses the prior staging and BA/RMSD-Pred score the stale conformer.
+
     Returns the preferred representative for downstream tools: the SDF if the
     conversion succeeded, otherwise the original staged file.
     """
@@ -44,6 +49,9 @@ def _stage_pose_file(src: Path, staged_dir: Path, stem: str) -> Path | None:
     if dst_orig.resolve() != src.resolve():
         shutil.copyfile(src, dst_orig)
     dst_sdf = staged_dir / f"{stem}.sdf"
+    src_mtime = src.stat().st_mtime
+    if dst_sdf.exists() and dst_sdf.stat().st_mtime < src_mtime:
+        dst_sdf.unlink()
     if not dst_sdf.exists():
         _pdbqt_to_sdf(dst_orig, dst_sdf)
     return dst_sdf if dst_sdf.exists() else dst_orig
@@ -723,11 +731,57 @@ def run_prediction(
         return False
 
 
+_BAPRED_MIN_CC_MAJOR = 6  # Pascal+
+_BAPRED_MAX_CC_MAJOR = 8  # Ada/Ampere; sm_90 (Hopper) and sm_100 (Blackwell) are unsupported
+
+
+def _verify_cuda_capability(device: str) -> tuple[bool, str]:
+    """Refuse sm_90+ devices for BA-Pred / RMSD-Pred.
+
+    The bundled CUDA kernels in ``.venvs/pred`` were compiled for sm_60–sm_89.
+    On Hopper (H100) and Blackwell the prediction binaries return exit 0 with
+    empty TSVs — undetectable in downstream pipelines because the missing
+    rows just look like "no qualifying poses". Read the runtime capability
+    explicitly and fail loud instead.
+    """
+    if device == "cpu":
+        return True, "cpu"
+    try:
+        import torch  # type: ignore[import-not-found]
+    except ImportError:
+        # Without torch we can't probe; fall through and let bapred fail naturally.
+        return True, "cuda (torch unavailable for capability probe)"
+    if not torch.cuda.is_available():
+        return False, "no CUDA device visible — submit on a GPU partition"
+    major, minor = torch.cuda.get_device_capability(0)
+    name = torch.cuda.get_device_name(0)
+    if major > _BAPRED_MAX_CC_MAJOR:
+        return False, (
+            f"GPU {name} reports sm_{major}{minor}; BA-Pred / RMSD-Pred "
+            f"kernels in .venvs/pred only support sm_{_BAPRED_MIN_CC_MAJOR}0 "
+            f"through sm_{_BAPRED_MAX_CC_MAJOR}9 (Pascal/Volta/Turing/Ampere/Ada). "
+            "Heavy partition (H100/Blackwell) silently produces empty results. "
+            "Submit post-analysis on the 6000ada partition or rebuild kernels."
+        )
+    if major < _BAPRED_MIN_CC_MAJOR:
+        return False, (
+            f"GPU {name} reports sm_{major}{minor}; BA-Pred kernels need "
+            f"sm_{_BAPRED_MIN_CC_MAJOR}0 or newer."
+        )
+    return True, f"cuda sm_{major}{minor} ({name})"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run BA-Pred and RMSD-Pred on pipeline results.")
     parser.add_argument("--run-dir", type=Path, required=True, help="Pipeline run directory.")
     parser.add_argument("--device", default="cuda", choices=["cpu", "cuda"])
     args = parser.parse_args()
+
+    cap_ok, cap_msg = _verify_cuda_capability(args.device)
+    print(f"Compute capability check: {cap_msg}")
+    if not cap_ok:
+        print(f"ERROR: {cap_msg}")
+        return 2
 
     analysis_dir = args.run_dir / "outputs" / "analysis"
     analysis_dir.mkdir(parents=True, exist_ok=True)

@@ -1228,6 +1228,26 @@ def main() -> int:
         # cofactors. Without this the legacy "any non-polymer" path would fire.
         for lig_id, _smi in extract_smiles_from_json(args.input_json):
             dockable_chains.add(lig_id)
+
+    # AF3 rewrites multi-character chain ids (``L2``, ``X2``) to alphabet
+    # letters (``B``, ``C``) because AF3 only accepts upper-case letter ids.
+    # When the auto-selected best cofolding model is AF3, the cif on disk
+    # uses the *new* ids — so a dockable_chains set sourced from the YAML
+    # would miss the renamed ligand and cif_to_pdb would leave it baked
+    # into the receptor. Union in the AF3 mapping when applicable.
+    if model == "alphafold3" and args.run_dir is not None:
+        af3_remap_path = args.run_dir / "inputs" / "alphafold3_chain_remap.json"
+        if af3_remap_path.exists():
+            try:
+                af3_remap = json.loads(af3_remap_path.read_text()).get("yaml_to_af3") or {}
+                added = {af3_remap[c] for c in list(dockable_chains) if c in af3_remap}
+                added -= dockable_chains
+                if added:
+                    dockable_chains.update(added)
+                    print(f"  AF3 chain remap added dockable ids: {sorted(added)}")
+            except Exception as e:
+                print(f"  WARNING: could not load AF3 chain remap: {e}")
+
     if dockable_chains:
         print(f"  Dockable ligand chains (will be stripped from receptor): "
               f"{sorted(dockable_chains)}")

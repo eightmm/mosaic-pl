@@ -98,7 +98,8 @@ def test_write_example_config_populates_defaults(tmp_path: Path) -> None:
     assert config["template_search_structure"]["query_from_cofolding"] is False
     assert config["template_search_structure"]["query_model_priority"] == [
         "alphafold3",
-        "boltz",
+        "boltz2x",
+        "boltz2",
         "protenix",
     ]
     assert config["boltz"]["max_parallel_samples"] == 5

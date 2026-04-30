@@ -80,6 +80,27 @@ template-search-sequence (mmseqs)
 
 ---
 
+## 1.1 Runtime environments
+
+각 외부 모델은 격리된 venv (또는 micromamba env) 에서 동작한다. SLURM job 이 시작될 때 wrapper 가 자동으로 `module load cuda/12.8` + `LD_LIBRARY_PATH`(CUDA targets + per-venv nvidia + boost) + `.local/bin` PATH 를 세팅한다.
+
+| 도구 | 위치 | Python | 핵심 의존성 | 주요 SLURM 파티션 |
+|---|---|---|---|---|
+| Boltz-2 / Boltz-2x | `.venvs/boltz` | 3.12 | torch 2.11 + CUDA 13.0 + cuequivariance | `6000ada`, `heavy` |
+| Protenix v2 | `.venvs/protenix` | 3.12 | torch 2.7 + CUDA 12.6 + cuequivariance | `6000ada`, `heavy` |
+| AlphaFold3 | `.venvs/alphafold3` | 3.12 | JAX + 자체 CUDA `LD_LIBRARY_PATH` runner (`run_alphafold3.sh`) | `6000ada` (sm_86 ~ sm_89) |
+| Protenix-Dock + Vina | `.venvs/protenix-dock` | 3.11 micromamba | ambertools / tleap (conda-only) + pxdock | `6000ada` |
+| AutoDock-GPU + autogrid4 | `.local/bin/` | — | CUDA 바이너리 + C++ 바이너리 (별도 venv 없음) | `6000ada` |
+| SwinSite + BA-Pred + RMSD-Pred | `.venvs/pred` | 3.12 | torch 2.4 + dgl 2.4 + openbabel | `6000ada` (BA/RMSD-Pred 는 sm_90+ 미지원) |
+| P2Rank | `.local/bin/prank` | JDK 21 | Java wrapper | CPU |
+| MMseqs2 + Foldseek + USalign | `.local/bin/` | — | static binaries | CPU (`cpu_only`, `test`) |
+
+> **하드웨어 호환성**: BA-Pred / RMSD-Pred 의 사전 빌드된 CUDA kernel 은 sm_90 (H100) 이후 카드를 지원하지 않아 `heavy` 파티션 (H100 / Blackwell) 에서 silent 빈 결과를 만든다. 새로 가드 추가 (`run_post_analysis.py`) — sm_90+ 디바이스에서 명시적 거부.
+
+> **Master 노드 제약**: GPU 없음 (147.46.139.205). YAML 파싱 / manifest / validation 만 master 에서, 실제 모델 추론은 SLURM compute 노드에서.
+
+---
+
 ## 2. Stages
 
 ### Stage 1 — Template search
