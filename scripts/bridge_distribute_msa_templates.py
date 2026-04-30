@@ -67,15 +67,60 @@ def _per_chain_msa_paths(
     return msa_pipeline_dir / "shared_msa" / f"{chain_id}_{kind}.a3m"
 
 
+def _materialize_inline_mmcif(
+    text: str, dump_dir: Path, fallback_stem: str
+) -> str | None:
+    """Persist an inline mmCIF blob to disk and return the file path.
+
+    AF3's data pipeline emits ``templates[*].mmcif`` as a full mmCIF
+    document inline (not a path). Boltz's templates schema wants a
+    ``cif: PATH`` and Protenix's ``templatesPath`` similarly expects a
+    file backing — so we dump the blob to a deterministic location
+    derived from the cif's ``data_<id>`` block when present, else from
+    a fallback stem.
+    """
+    if not text:
+        return None
+    pdb_id = fallback_stem
+    for line in text.splitlines():
+        if line.startswith("data_"):
+            pdb_id = line[len("data_"):].strip() or fallback_stem
+            break
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    dst = dump_dir / f"{pdb_id}.cif"
+    if not dst.exists():
+        dst.write_text(text)
+    return str(dst)
+
+
 def _collect_template_cifs(
-    af3_chain: dict[str, Any], max_templates: int
+    af3_chain: dict[str, Any],
+    max_templates: int,
+    dump_dir: Path,
+    chain_id: str,
 ) -> list[str]:
+    """Return on-disk mmCIF paths for the chain's templates.
+
+    AF3 ships templates two ways: either ``mmcifPath`` (a string path,
+    used when the data pipeline already wrote the mmCIF to disk and only
+    references it) or ``mmcif`` (the entire mmCIF document inline as a
+    string). The latter is the default in current AF3 builds. Both are
+    handled — inline blobs are materialised under ``dump_dir`` so the
+    downstream Boltz / Protenix patches can hand off a real file path.
+    """
     templates = af3_chain.get("templates") or []
     cif_paths: list[str] = []
-    for t in templates[:max_templates]:
-        p = t.get("mmcifPath")
-        if p:
-            cif_paths.append(p)
+    for idx, t in enumerate(templates[:max_templates]):
+        path = t.get("mmcifPath")
+        if path:
+            cif_paths.append(str(path))
+            continue
+        inline = t.get("mmcif")
+        if isinstance(inline, str) and inline.strip():
+            fallback_stem = f"{chain_id}_template_{idx}"
+            dumped = _materialize_inline_mmcif(inline, dump_dir, fallback_stem)
+            if dumped:
+                cif_paths.append(dumped)
     return cif_paths
 
 
@@ -148,11 +193,16 @@ def patch_boltz_yaml(
             # needed. This is a pragmatic limitation of the Boltz YAML
             # surface, not a quality loss for monomeric targets.
 
-    # Top-level templates: collect unique mmcif paths across chains
+    # Top-level templates: collect unique mmcif paths across chains.
+    # AF3's data pipeline embeds mmCIF inline; materialise blobs to a
+    # shared cif dump so Boltz can address them by path.
+    template_dump = msa_pipeline_dir / "shared_msa" / "templates"
     template_cifs: list[str] = []
     seen_paths: set[str] = set()
-    for chain in af3_chains.values():
-        for cif in _collect_template_cifs(chain, max_templates):
+    for chain_id, chain in af3_chains.items():
+        for cif in _collect_template_cifs(
+            chain, max_templates, template_dump, chain_id
+        ):
             if cif not in seen_paths:
                 seen_paths.add(cif)
                 template_cifs.append(cif)
@@ -234,7 +284,12 @@ def patch_protenix_json(
             # Protenix parses header lines to extract pdb_id; a minimal
             # form is one ">pdb_chain" header per template plus a single
             # placeholder sequence line referencing the query length.
-            cifs = _collect_template_cifs(af3_chain, max_templates)
+            cifs = _collect_template_cifs(
+                af3_chain,
+                max_templates,
+                msa_pipeline_dir / "shared_msa" / "templates",
+                af3_id,
+            )
             if cifs:
                 hmmsearch_path = msa_pipeline_dir / "shared_msa" / f"{af3_id}_hmmsearch.a3m"
                 hmmsearch_path.parent.mkdir(parents=True, exist_ok=True)
