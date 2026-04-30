@@ -212,7 +212,7 @@ def extract_template_ligand_sdf(cif_path: Path, ligand_ccd: str, output_sdf: Pat
 
 
 def cif_to_receptor_pdb(cif_path: Path, output_pdb: Path) -> Path:
-    """Extract protein chains from CIF to PDB.
+    """Extract protein chains from CIF to PDB, retaining metals/cofactors.
 
     RCSB CIFs often use multi-character chain labels (e.g. ``AAA`` for a
     polymer-entity asym_id) which gemmi rejects at PDB serialization with
@@ -220,11 +220,45 @@ def cif_to_receptor_pdb(cif_path: Path, output_pdb: Path) -> Path:
     docking pipeline only needs receptor coordinates (not the original
     chain identity), rename each retained chain to a fresh single letter
     A..Z (then AA..ZZ is impossible in PDB anyway) before writing.
+
+    Like ``prepare_docking_inputs.cif_to_pdb``, this used to wipe every
+    non-polymer entity (waters + ligand + metals + cofactors). Metals on
+    template active sites are critical for metalloprotein docking, so
+    keep the same retain-non-water-non-target rule here. The Track 2
+    box centre is taken from the *original* template ligand coordinates
+    via ``extract_ligand_center`` later in this script — we don't need
+    the ligand atoms in the receptor PDB to compute the box.
     """
     import gemmi
     import string
     structure = gemmi.read_structure(str(cif_path))
-    structure.remove_ligands_and_waters()
+    # Drop waters always; drop other non-polymers only when they're the
+    # target ligand (single small molecule with the candidate CCD code).
+    # Practical heuristic: drop the residue if its name looks like a
+    # bound small molecule (≥ 6 heavy atoms) and isn't a metal-/ion-name.
+    # Metals (MG/ZN/CA/FE/MN/...) and small cofactors stay as part of the
+    # receptor so docking grids see the coordination geometry. Real-world
+    # cofactors > 6 atoms (NAD, HEM, FAD) are uncommon enough on RCSB
+    # active sites that this conservatively keeps them too.
+    metal_or_ion = {"MG", "ZN", "CA", "FE", "MN", "NA", "CL", "K", "CU",
+                    "NI", "CO", "CD", "HG", "PB", "BA", "SR", "AL"}
+    # gemmi.Chain only exposes index-based delete; iterate in reverse so
+    # earlier indices stay stable as we strip residues.
+    for model in structure:
+        for chain in model:
+            for i in range(len(chain) - 1, -1, -1):
+                res = chain[i]
+                is_water = (res.entity_type == gemmi.EntityType.Water
+                            or res.name == "HOH")
+                is_nonpoly = res.entity_type == gemmi.EntityType.NonPolymer
+                if is_water:
+                    del chain[i]
+                elif is_nonpoly and res.name not in metal_or_ion:
+                    n_heavy = sum(1 for a in res if a.element.atomic_number > 1)
+                    if n_heavy >= 6:
+                        # Looks like an organic ligand (≥6 heavy atoms,
+                        # not a known metal/ion) — strip it
+                        del chain[i]
     # Collect already-valid single-letter chain names so we allocate from the
     # unused remainder without clobbering them.
     used = {chain.name for model in structure for chain in model if len(chain.name) == 1}

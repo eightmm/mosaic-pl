@@ -110,14 +110,83 @@ def sdf_to_pdbqt(sdf_path: Path | None, output_path: Path) -> Path | None:
     return output_path
 
 
-def cif_to_pdb(cif_path: Path, output_path: Path) -> Path:
-    """Convert mmCIF to PDB using gemmi."""
+def cif_to_pdb(
+    cif_path: Path,
+    output_path: Path,
+    dockable_ligand_chains: set[str] | None = None,
+) -> Path:
+    """Convert mmCIF to PDB, retaining metals/ions as receptor cofactors.
+
+    The legacy implementation called ``structure.remove_ligands_and_waters()``
+    which strips *every* non-polymer entity — including metals (MG/ZN/CA/FE/
+    MN/NA/CL etc.) and small cofactors. Metalloproteins (kinases binding
+    Mg²⁺, zinc proteases, ferredoxin, …) docked against a metal-stripped
+    receptor produce poses that ignore the coordination geometry, so the
+    result is wrong even when the predictor finds the correct pocket.
+
+    The right behaviour is selective removal: drop **only the dockable
+    ligand chains** (those listed in the input YAML, the molecules we're
+    about to dock) plus waters. Metals and other cofactors stay in the
+    receptor PDB. Downstream pdbqt conversion / pdb2pqr handle the metal
+    atom types via existing code paths (AD4 has Mg/Zn/Ca/Fe/Mn types;
+    AMBER ignores HETATMs it can't parameterize, leaving the metal as a
+    rigid coordinate the docking grid maps still see).
+
+    Args:
+        cif_path: input mmCIF.
+        output_path: where to write the PDB.
+        dockable_ligand_chains: chain ids of the ligands we'll dock — these
+            get stripped. ``None`` falls back to legacy
+            ``remove_ligands_and_waters`` behaviour for backward compat.
+    """
     import gemmi
 
     structure = gemmi.read_structure(str(cif_path))
-    structure.remove_ligands_and_waters()
+
+    if dockable_ligand_chains is None:
+        # Backward-compat: caller didn't supply the dockable list, fall
+        # back to the old whole-non-polymer wipe. Logged so reruns spot
+        # the regression.
+        structure.remove_ligands_and_waters()
+        print("  WARNING: cif_to_pdb called without dockable_ligand_chains; "
+              "every non-polymer (incl. metals) is being stripped from receptor")
+        structure.write_pdb(str(output_path))
+        print(f"  Receptor PDB: {output_path}")
+        return output_path
+
+    # Selective: walk every non-polymer residue, remove only those whose
+    # chain id is in the dockable set, plus waters. Everything else (metals,
+    # cofactors, glycans on protein chains) stays.
+    n_dropped_lig = 0
+    n_dropped_water = 0
+    n_kept_metal_or_cofactor = 0
+    metal_elements = {"MG", "ZN", "CA", "FE", "MN", "NA", "CL", "K", "CU", "NI",
+                      "CO", "CD", "HG", "PB", "BA", "SR", "AL"}
+    # gemmi.Chain doesn't expose a remove-residue helper; we delete by
+    # index in reverse order so earlier indices stay stable.
+    for model in structure:
+        for chain in model:
+            is_dockable = chain.name in dockable_ligand_chains
+            for i in range(len(chain) - 1, -1, -1):
+                res = chain[i]
+                is_water = (res.entity_type == gemmi.EntityType.Water
+                            or res.name == "HOH")
+                is_nonpoly = res.entity_type == gemmi.EntityType.NonPolymer
+                if is_water:
+                    del chain[i]
+                    n_dropped_water += 1
+                elif is_dockable and is_nonpoly:
+                    del chain[i]
+                    n_dropped_lig += 1
+                elif is_nonpoly:
+                    n_kept_metal_or_cofactor += 1
     structure.write_pdb(str(output_path))
     print(f"  Receptor PDB: {output_path}")
+    print(f"    dropped: {n_dropped_lig} dockable-ligand residue(s), "
+          f"{n_dropped_water} water(s)")
+    if n_kept_metal_or_cofactor:
+        print(f"    kept (cofactors/metals): {n_kept_metal_or_cofactor} residue(s) "
+              "(retained for docking grid maps)")
     return output_path
 
 
@@ -155,8 +224,55 @@ def pqr_to_protonated_pdb(pqr_path: Path, output_path: Path) -> Path:
     return output_path
 
 
+# AD4 metal atom types + their typical formal charge. AutoDock-GPU and
+# AutoDock-Vina ship grid-map types for these out-of-the-box; pdb2pqr
+# silently drops them (AMBER FF doesn't know how to assign Gasteiger
+# charges to bare metals), so we re-attach them to the PDBQT after
+# pdb2pqr finishes — keeps the metal coordinates in the receptor so
+# active-site coordination geometry isn't invisible to docking.
+_METAL_TYPE_CHARGE = {
+    "MG": ("Mg", +2.0), "ZN": ("Zn", +2.0), "CA": ("Ca", +2.0),
+    "FE": ("Fe", +3.0), "MN": ("Mn", +2.0), "CU": ("Cu", +2.0),
+    "NI": ("Ni", +2.0), "CO": ("Co", +2.0), "CD": ("Cd", +2.0),
+    "HG": ("Hg", +2.0), "BA": ("Ba", +2.0), "SR": ("Sr", +2.0),
+    "AL": ("Al", +3.0), "K":  ("K",  +1.0), "NA": ("Na", +1.0),
+    "CL": ("Cl", -1.0),
+}
+
+
+def _extract_metal_pdbqt_lines(pdb_path: Path) -> list[str]:
+    """Pull HETATM metal lines from a PDB file → PDBQT-formatted lines.
+
+    pdb2pqr drops any HETATM whose residue name isn't in its CCD parameter
+    file, including bare metals. Without this fallback the metals we
+    retained in cif_to_pdb would silently disappear from receptor.pdbqt.
+
+    Returns one PDBQT line per metal atom, ready to splice into the
+    PQR-derived PDBQT body. Empty list when the input has no metals.
+    """
+    out: list[str] = []
+    for line in pdb_path.read_text().splitlines():
+        if not line.startswith("HETATM"):
+            continue
+        resname = line[17:20].strip().upper()
+        if resname not in _METAL_TYPE_CHARGE:
+            continue
+        ad_type, charge = _METAL_TYPE_CHARGE[resname]
+        # Re-emit in the same fixed-width PDBQT layout.
+        prefix = f"{line[:54]:<54s}"
+        out.append(f"{prefix}  0.00  0.00    {charge:+.3f} {ad_type:<2s}")
+    return out
+
+
 def pdb_to_pdbqt(pdb_path: Path, output_path: Path) -> Path:
-    """Convert PDB to PDBQT for receptor: pdb2pqr (protonation + charges) → PDBQT format."""
+    """Convert PDB to PDBQT for receptor: pdb2pqr (protonation + charges) → PDBQT format.
+
+    Metals retained in the input PDB (see ``cif_to_pdb``) are re-attached
+    to the PDBQT after pdb2pqr because pdb2pqr's AMBER force field doesn't
+    parameterise bare metals — without this fallback the metal coordinates
+    would be silently lost between PDB and PDBQT and the docking grid
+    maps would never see the active-site coordination geometry.
+    """
 
     # Step 1: pdb2pqr adds hydrogens and assigns charges
     pqr_path = output_path.with_suffix(".pqr")
@@ -191,6 +307,18 @@ def pdb_to_pdbqt(pdb_path: Path, output_path: Path) -> Path:
         # Build PDBQT line: first 54 chars from PQR + reformatted tail
         pdb_prefix = f"{line[:54]:<54s}"
         pdbqt_lines.append(f"{pdb_prefix}  0.00  0.00    {charge:+.3f} {ad_type:<2s}")
+
+    # Step 3: re-attach metal HETATMs that pdb2pqr dropped (see helper for
+    # rationale). Insert before the trailing END so they live in the same
+    # ATOM block downstream tools iterate.
+    metal_lines = _extract_metal_pdbqt_lines(pdb_path)
+    if metal_lines:
+        # Splice before END if present, else just append.
+        end_idx = next((i for i, line in enumerate(pdbqt_lines)
+                        if line.strip().startswith("END")), len(pdbqt_lines))
+        pdbqt_lines = pdbqt_lines[:end_idx] + metal_lines + pdbqt_lines[end_idx:]
+        print(f"  Re-attached {len(metal_lines)} metal HETATM(s) to receptor PDBQT "
+              f"(pdb2pqr drops bare metals)")
 
     output_path.write_text("\n".join(pdbqt_lines) + "\n")
     print(f"  Receptor PDBQT: {output_path} (protonated, Gasteiger charges)")
@@ -901,8 +1029,30 @@ def main() -> int:
         return 0
 
     print(f"  Using cofolding structure: {structure}")
+    # Dockable ligand chain ids = whatever the input YAML calls out as
+    # ligand entries. We strip these from the cofold cif; metals / other
+    # cofactors stay so docking sees the active-site coordination.
+    dockable_chains: set[str] = set()
+    if args.input_yaml and args.input_yaml.exists():
+        try:
+            import yaml as _yaml
+            data = _yaml.safe_load(args.input_yaml.read_text()) or {}
+            for entry in data.get("sequences", []) or []:
+                if isinstance(entry, dict) and "ligand" in entry:
+                    lig = entry["ligand"] or {}
+                    # Dockable ligand = entry has SMILES (vs ccd-only entries
+                    # like metals which we want to keep on the receptor).
+                    if lig.get("smiles") and lig.get("id"):
+                        dockable_chains.add(str(lig["id"]))
+        except Exception as e:
+            print(f"  WARNING: could not parse dockable chain ids from YAML: {e}")
+    if dockable_chains:
+        print(f"  Dockable ligand chains (will be stripped from receptor): "
+              f"{sorted(dockable_chains)}")
+
     if structure.suffix in (".cif", ".mmcif"):
-        pdb_path = cif_to_pdb(structure, args.output_dir / "receptor.pdb")
+        pdb_path = cif_to_pdb(structure, args.output_dir / "receptor.pdb",
+                              dockable_ligand_chains=dockable_chains or None)
     else:
         pdb_path = structure
 
