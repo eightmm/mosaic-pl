@@ -3,7 +3,7 @@
 #SBATCH --output=/home/jaemin/project/CASP17/experiments/logs/rerun_t2d_cpu-%A_%a.out
 #SBATCH --error=/home/jaemin/project/CASP17/experiments/logs/rerun_t2d_cpu-%A_%a.err
 #SBATCH --mem=32G
-#SBATCH --time=03:00:00
+#SBATCH --time=06:00:00
 #SBATCH --partition=cpu_only
 #
 # CPU-only array dispatcher for the template→docking rerun. Pairs with
