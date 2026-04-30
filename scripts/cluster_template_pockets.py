@@ -148,8 +148,18 @@ def _summarize(clusters: list[dict]) -> list[dict]:
                 for m in members
             ],
         })
-    out.sort(key=lambda c: -c["evidence_score"])
-    return out
+    # Pair summaries with their raw cluster index *before* sorting so
+    # callers (cluster_member_to_index in main) can map raw_clusters[ci]
+    # → final-rank index after evidence_score sort.
+    indexed = list(enumerate(out))
+    indexed.sort(key=lambda pair: -pair[1]["evidence_score"])
+    sorted_out = [item for _, item in indexed]
+    # Stash raw→sorted index mapping on the first cluster's metadata so
+    # main() can splice cluster_index without recomputing the sort.
+    if sorted_out:
+        raw_to_sorted = {raw_idx: new_idx for new_idx, (raw_idx, _) in enumerate(indexed)}
+        sorted_out[0]["_raw_to_sorted"] = raw_to_sorted
+    return sorted_out
 
 
 def main() -> int:
@@ -190,14 +200,18 @@ def main() -> int:
         raw_clusters = _cluster_pockets(pockets, cutoff=args.cutoff)
         clusters = _summarize(raw_clusters)
 
-    # Tag each pocket record with its cluster index (rank in the sorted
-    # cluster list). Lets downstream consumers like
-    # ``prepare_template_docking::select_cluster_representative_templates``
-    # group pockets by cluster without re-running the spatial join.
+    # Tag each pocket record with its cluster index — but the index has
+    # to match the *sorted* cluster list because that's what
+    # ``select_cluster_representative_templates`` indexes into. The raw
+    # build order (input pocket order) is meaningless to the consumer.
+    raw_to_sorted: dict[int, int] = {}
+    if clusters and "_raw_to_sorted" in clusters[0]:
+        raw_to_sorted = clusters[0].pop("_raw_to_sorted")
     cluster_member_to_index: dict[int, int] = {}
-    for ci, cl in enumerate(raw_clusters):
+    for raw_ci, cl in enumerate(raw_clusters):
+        sorted_ci = raw_to_sorted.get(raw_ci, raw_ci)
         for member in cl.get("_members", []):
-            cluster_member_to_index[id(member)] = ci
+            cluster_member_to_index[id(member)] = sorted_ci
     for p in pockets:
         idx = cluster_member_to_index.get(id(p))
         if idx is not None:

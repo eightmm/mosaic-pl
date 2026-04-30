@@ -725,20 +725,44 @@ def extract_smiles_from_json(input_json: Path) -> list[tuple[str, str]]:
     return results
 
 
-def _extract_cofolding_ligand_centroid(cif_path: Path) -> list[float] | None:
-    """Extract the centroid of ligand (non-polymer) heavy atoms from a cofolding CIF.
+def _extract_cofolding_ligand_centroid(
+    cif_path: Path,
+    dockable_chains: set[str] | None = None,
+) -> list[float] | None:
+    """Extract the heavy-atom centroid of the **dockable ligand** in a cofolding CIF.
 
-    Boltz/Protenix/AF3 cofolding outputs contain both protein and ligand atoms.
-    Non-polymer entities (ligand) are identified by ``entity_type == NonPolymer``
-    or residue names starting with ``LIG``. Returns ``[x, y, z]`` or ``None``
-    if no ligand atoms are found.
+    Cofold outputs may contain non-polymer entities besides the dockable
+    target (metals, ions, cofactors that we kept on the receptor). Averaging
+    all non-polymers gives a wrong centroid on metal-bearing or multi-ligand
+    targets — the cluster centre then biases docking boxes toward the
+    geometric midpoint of "ligand + Mg²⁺ + cofactor" instead of the real
+    binding pose. Restricting the average to the YAML's dockable ligand
+    chain ids fixes that.
+
+    Args:
+        cif_path: cofold CIF.
+        dockable_chains: chain ids declared as ligands (with SMILES) in the
+            input YAML. Atoms outside these chains are ignored. ``None``
+            falls back to the legacy "any non-polymer" behaviour with a
+            warning so reruns notice the regression.
+
+    Returns ``[x, y, z]`` or ``None`` when no qualifying atoms are found.
     """
     try:
         import gemmi
         st = gemmi.read_structure(str(cif_path))
         coords: list[tuple[float, float, float]] = []
+        legacy = dockable_chains is None
+        if legacy:
+            print(f"  WARNING: cofold centroid for {cif_path.name} called without "
+                  "dockable_chains; legacy 'any non-polymer' average used")
         for model in st:
             for chain in model:
+                # Restrict to dockable chains when caller provided them.
+                # LIG-prefixed residues stay as a backstop for cofold
+                # outputs that don't pin a chain id (rare).
+                if not legacy and chain.name not in dockable_chains:
+                    continue
                 for res in chain:
                     is_ligand = (
                         res.entity_type == gemmi.EntityType.NonPolymer
@@ -750,6 +774,7 @@ def _extract_cofolding_ligand_centroid(cif_path: Path) -> list[float] | None:
                         if atom.element.is_hydrogen:
                             continue
                         coords.append((atom.pos.x, atom.pos.y, atom.pos.z))
+            break  # first model only
         if not coords:
             return None
         cx = sum(c[0] for c in coords) / len(coords)
@@ -771,14 +796,19 @@ COFOLD_CLUSTER_MIN_MEMBERS = 5    # out of ~100 placements
 COFOLD_CLUSTER_TOP_K = 3
 
 
-def _extract_cofolding_ligand_clusters(run_dir: Path) -> list[dict]:
+def _extract_cofolding_ligand_clusters(
+    run_dir: Path,
+    dockable_chains: set[str] | None = None,
+) -> list[dict]:
     """Cluster ligand centroids across every aligned cofolding CIF.
 
     Iterates ``outputs/{boltz2,boltz2x,protenix,alphafold3}/**/*_aligned.cif``
     (typically 4 models × 25 seeds = 100 placements, all in the same
     coordinate frame after ``align_cofolding_outputs.py``), pulls the
-    heavy-atom ligand centroid from each, and runs greedy single-link
-    clustering with a ``COFOLD_CLUSTER_CUTOFF`` Å cutoff.
+    heavy-atom ligand centroid from each (restricted to the YAML's dockable
+    ligand chains via ``dockable_chains`` so metals/cofactors don't bias
+    the average), and runs greedy first-match centroid clustering with a
+    ``COFOLD_CLUSTER_CUTOFF`` Å cutoff.
 
     Returns the top-``COFOLD_CLUSTER_TOP_K`` clusters with at least
     ``COFOLD_CLUSTER_MIN_MEMBERS`` placements, sorted by ``n_members``
@@ -806,7 +836,7 @@ def _extract_cofolding_ligand_clusters(run_dir: Path) -> list[dict]:
         if not model_dir.exists():
             continue
         for cif in sorted(model_dir.rglob("*_aligned.cif")):
-            c = _extract_cofolding_ligand_centroid(cif)
+            c = _extract_cofolding_ligand_centroid(cif, dockable_chains=dockable_chains)
             if c is not None:
                 placements.append((c, model))
 
@@ -1088,7 +1118,9 @@ def main() -> int:
     print(f"  Receptor CA atoms: {len(ca_atoms)} (chains: "
           f"{sorted({c for c, _ in ca_atoms})})")
 
-    cofold_clusters = _extract_cofolding_ligand_clusters(args.run_dir)
+    cofold_clusters = _extract_cofolding_ligand_clusters(
+        args.run_dir, dockable_chains=dockable_chains or None,
+    )
     for rank, cl in enumerate(cofold_clusters, start=1):
         src_name = f"cofolding_{rank}"
         nearest_chain, nearest_d = _nearest_chain(cl["centroid"], ca_atoms)

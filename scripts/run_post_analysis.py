@@ -574,7 +574,11 @@ def find_ligand_files(run_dir: Path) -> dict[str, Path]:
                 continue
             out_json = next((p for p in source_dir.glob("*_out.json")), None)
             if out_json is not None:
-                sdf_path = source_dir / "poses.sdf"
+                # Write to ``protenix_dock/poses_<lig_id>.sdf`` so it matches
+                # the layout compute_submission_scores expects (see
+                # _resolve_pose_file there). The legacy ``poses.sdf`` path
+                # left poses unfindable for the multi-ligand path.
+                sdf_path = pxdock_dir / f"poses_{lig_id}.sdf"
                 converted = _pxdock_json_to_sdf(out_json, sdf_path)
                 if converted is not None:
                     ligands[f"protenix_dock_{lig_id}"] = converted

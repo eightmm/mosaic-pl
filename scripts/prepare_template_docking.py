@@ -211,37 +211,36 @@ def extract_template_ligand_sdf(cif_path: Path, ligand_ccd: str, output_sdf: Pat
     return None
 
 
-def cif_to_receptor_pdb(cif_path: Path, output_pdb: Path) -> Path:
-    """Extract protein chains from CIF to PDB, retaining metals/cofactors.
+def cif_to_receptor_pdb(
+    cif_path: Path,
+    output_pdb: Path,
+    target_ccds: set[str] | None = None,
+) -> Path:
+    """Extract protein chains from CIF to PDB, retaining metals + cofactors.
 
     RCSB CIFs often use multi-character chain labels (e.g. ``AAA`` for a
     polymer-entity asym_id) which gemmi rejects at PDB serialization with
     ``RuntimeError: chain name too long for the PDB format``. Since the
     docking pipeline only needs receptor coordinates (not the original
     chain identity), rename each retained chain to a fresh single letter
-    A..Z (then AA..ZZ is impossible in PDB anyway) before writing.
+    A..Z before writing.
 
-    Like ``prepare_docking_inputs.cif_to_pdb``, this used to wipe every
-    non-polymer entity (waters + ligand + metals + cofactors). Metals on
-    template active sites are critical for metalloprotein docking, so
-    keep the same retain-non-water-non-target rule here. The Track 2
-    box centre is taken from the *original* template ligand coordinates
-    via ``extract_ligand_center`` later in this script — we don't need
-    the ligand atoms in the receptor PDB to compute the box.
+    Selective stripping rules (matched to ``prepare_docking_inputs.cif_to_pdb``):
+        - Waters always dropped.
+        - When ``target_ccds`` is provided (the candidate ligand codes
+          we're about to dock), residues with those CCD names are dropped.
+        - Everything else (metals, cofactors like HEM/NAD/FAD, glycans)
+          stays so docking grids see the active-site chemistry.
+
+    The previous heuristic (drop any non-polymer with ≥6 heavy atoms
+    that isn't a metal) wiped HEM/NAD/FAD too, contradicting the
+    "retain cofactor" goal. Switching to a CCD-based rule makes the
+    stripping match the metal-retain comment.
     """
     import gemmi
     import string
     structure = gemmi.read_structure(str(cif_path))
-    # Drop waters always; drop other non-polymers only when they're the
-    # target ligand (single small molecule with the candidate CCD code).
-    # Practical heuristic: drop the residue if its name looks like a
-    # bound small molecule (≥ 6 heavy atoms) and isn't a metal-/ion-name.
-    # Metals (MG/ZN/CA/FE/MN/...) and small cofactors stay as part of the
-    # receptor so docking grids see the coordination geometry. Real-world
-    # cofactors > 6 atoms (NAD, HEM, FAD) are uncommon enough on RCSB
-    # active sites that this conservatively keeps them too.
-    metal_or_ion = {"MG", "ZN", "CA", "FE", "MN", "NA", "CL", "K", "CU",
-                    "NI", "CO", "CD", "HG", "PB", "BA", "SR", "AL"}
+    targets = {c.upper() for c in (target_ccds or set())}
     # gemmi.Chain only exposes index-based delete; iterate in reverse so
     # earlier indices stay stable as we strip residues.
     for model in structure:
@@ -250,15 +249,12 @@ def cif_to_receptor_pdb(cif_path: Path, output_pdb: Path) -> Path:
                 res = chain[i]
                 is_water = (res.entity_type == gemmi.EntityType.Water
                             or res.name == "HOH")
-                is_nonpoly = res.entity_type == gemmi.EntityType.NonPolymer
                 if is_water:
                     del chain[i]
-                elif is_nonpoly and res.name not in metal_or_ion:
-                    n_heavy = sum(1 for a in res if a.element.atomic_number > 1)
-                    if n_heavy >= 6:
-                        # Looks like an organic ligand (≥6 heavy atoms,
-                        # not a known metal/ion) — strip it
-                        del chain[i]
+                elif res.name.upper() in targets:
+                    # Identified target ligand — strip; we'll dock against
+                    # this site, ligand atoms shouldn't sit inside the receptor.
+                    del chain[i]
     # Collect already-valid single-letter chain names so we allocate from the
     # unused remainder without clobbering them.
     used = {chain.name for model in structure for chain in model if len(chain.name) == 1}
@@ -675,8 +671,20 @@ def main() -> int:
         else:
             print(f"  WARNING: Could not extract template ligand SDF for {template_ligand_ccd}")
 
-        # Prepare receptor
-        receptor_pdb = cif_to_receptor_pdb(cif, template_dir / "receptor.pdb")
+        # Prepare receptor — strip the bound target ligand (we dock against
+        # that site so ligand atoms shouldn't be in the receptor PDB) but
+        # keep metals and cofactors. ``ligand_codes`` is the candidate CCD
+        # list for this template hit; ``template_ligand_ccd`` is the one
+        # we picked for the box centre. Both go into ``target_ccds`` so any
+        # alternate copy of the same ligand on a different chain is also
+        # stripped.
+        target_ccds = {c.strip() for c in ligand_codes if c.strip()}
+        if template_ligand_ccd:
+            target_ccds.add(template_ligand_ccd)
+        receptor_pdb = cif_to_receptor_pdb(
+            cif, template_dir / "receptor.pdb",
+            target_ccds=target_ccds,
+        )
         protonated_pdb, receptor_pdbqt = prepare_receptor_pdbqt(receptor_pdb, template_dir)
         print(f"  Receptor PDB: {receptor_pdb.name}")
         print(f"  Receptor PDBQT: {receptor_pdbqt.name}")
