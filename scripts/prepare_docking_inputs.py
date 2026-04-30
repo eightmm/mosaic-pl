@@ -23,6 +23,14 @@ import json
 import sys
 from pathlib import Path
 
+# This script runs inside ``.venvs/protenix-dock`` (selected by the wrapper
+# because it has rdkit/meeko + ambertools), which is NOT the hub venv that
+# pip-installs the ``casp17`` package. Make ``src/`` importable so the
+# shared ccd_sets / template-filter modules resolve regardless of caller.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT / "src"))
+
 
 def smiles_to_sdf(smiles: str, output_path: Path, name: str = "ligand") -> Path | None:
     """Convert SMILES to 3D SDF using RDKit.
@@ -225,22 +233,10 @@ def pqr_to_protonated_pdb(pqr_path: Path, output_path: Path) -> Path:
 
 
 # Nucleic acid residue names (DNA + RNA + standard variants). When the
-# receptor PDB contains any of these we route through obabel for
-# protonation + PDBQT instead of pdb2pqr — pdb2pqr's AMBER FF doesn't
-# parameterize nucleotides reliably and either fails outright or strips
-# the entire nucleic chain.
-_NUCLEIC_RESIDUES = {
-    # RNA standard
-    "A", "U", "G", "C",
-    # RNA explicit prefix (rare in cofold cifs but seen in some PDBs)
-    "RA", "RU", "RG", "RC",
-    # DNA standard
-    "DA", "DT", "DG", "DC",
-    # DNA legacy single-letter (T = thymine)
-    "T",
-    # Modified backbones
-    "DI", "I",
-}
+# Nucleic residue set lives in ``casp17.ccd_sets`` so Stage 3 and the
+# Track 2 prep share the same authoritative list (drift between the two
+# previously gave inconsistent obabel-routing behaviour).
+from casp17.ccd_sets import NUCLEIC_RESIDUES as _NUCLEIC_RESIDUES
 
 
 def _has_nucleic_acid(pdb_path: Path) -> bool:

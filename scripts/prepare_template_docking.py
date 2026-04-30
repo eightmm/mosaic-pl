@@ -273,10 +273,7 @@ def cif_to_receptor_pdb(
     return output_pdb
 
 
-_NUCLEIC_RESIDUES_T2 = {
-    "A", "U", "G", "C", "RA", "RU", "RG", "RC",
-    "DA", "DT", "DG", "DC", "T", "DI", "I",
-}
+from casp17.ccd_sets import NUCLEIC_RESIDUES as _NUCLEIC_RESIDUES
 
 
 def _has_nucleic_acid_pdb(pdb_path: Path) -> bool:
@@ -286,7 +283,7 @@ def _has_nucleic_acid_pdb(pdb_path: Path) -> bool:
     for line in pdb_path.read_text().splitlines():
         if line.startswith(("ATOM", "HETATM")):
             res = line[17:20].strip().upper()
-            if res in _NUCLEIC_RESIDUES_T2:
+            if res in _NUCLEIC_RESIDUES:
                 return True
     return False
 

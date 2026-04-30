@@ -23,6 +23,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Runs inside ``.venvs/pred`` (BA-Pred / RMSD-Pred environment), which does
+# not install the ``casp17`` hub package. Add ``src/`` to the import path
+# so the shared usalign wrapper resolves regardless of caller venv.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT / "src"))
+
 
 def _stage_pose_file(src: Path, staged_dir: Path, stem: str) -> Path | None:
     """Copy a docked pose file to ``staged_dir`` with a unique stem and, when
@@ -81,49 +88,26 @@ def _write_list_file(paths: list[Path], list_path: Path) -> Path | None:
     return list_path
 
 
-_USALIGN_BIN = Path(__file__).resolve().parent.parent / ".local" / "bin" / "USalign"
-
-
 def _usalign_transform(src_pdb: Path, ref_pdb: Path) -> tuple[list[list[float]], list[float]] | None:
     """Return (R, t) such that ``X_ref = t + R @ X_src`` for each atom.
 
-    Runs USalign on the two receptor PDBs and parses the rotation matrix.
-    Returns ``None`` if USalign fails or the matrix file is not written
-    (low sequence overlap / disjoint chains). Callers should treat a
-    failure as "skip the transform and leave the pose untouched".
+    Thin wrapper over ``casp17.usalign.run_usalign`` to keep the existing
+    ``_apply_transform_to_sdf`` contract (which expects nested-list R / t)
+    and to discard the TM/RMSD scalars this caller doesn't use. Returns
+    ``None`` on USalign failure or when either PDB is missing.
     """
-    if not _USALIGN_BIN.exists():
-        return None
     if not (src_pdb.exists() and ref_pdb.exists()):
         return None
     try:
-        import tempfile
-        with tempfile.NamedTemporaryFile("r", suffix=".txt", delete=True) as mat_f:
-            mat_path = mat_f.name
-        proc = subprocess.run(
-            [str(_USALIGN_BIN), str(src_pdb), str(ref_pdb), "-m", mat_path],
-            capture_output=True, text=True, timeout=120,
-        )
-        if proc.returncode != 0 or not Path(mat_path).exists():
-            return None
-        R = [[0.0] * 3 for _ in range(3)]
-        t = [0.0, 0.0, 0.0]
-        for line in Path(mat_path).read_text().splitlines():
-            parts = line.split()
-            if len(parts) != 5 or parts[0] not in ("0", "1", "2"):
-                continue
-            i = int(parts[0])
-            t[i] = float(parts[1])
-            R[i][0] = float(parts[2])
-            R[i][1] = float(parts[3])
-            R[i][2] = float(parts[4])
-        Path(mat_path).unlink(missing_ok=True)
-        # Sanity: if every row is zero the parse failed.
-        if all(abs(v) < 1e-12 for row in R for v in row):
-            return None
-        return R, t
-    except Exception:
+        from casp17.usalign import run_usalign
+    except ImportError as e:
+        print(f"  WARN: casp17.usalign unavailable ({e}); skipping transform")
         return None
+    result = run_usalign(src_pdb, ref_pdb)
+    if result is None:
+        return None
+    R_arr, t_arr, _tm, _rmsd = result
+    return [list(map(float, row)) for row in R_arr], [float(v) for v in t_arr]
 
 
 def _apply_transform_to_sdf(sdf_path: Path, R: list[list[float]], t: list[float]) -> bool:
