@@ -208,6 +208,15 @@ Cofolding 출력에서 docking 입력을 자동 생성. `scripts/prepare_docking
 | PQR → protonated PDB | 자체 변환 | `receptor_protonated.pdb` | Protenix-Dock |
 | PQR → PDBQT | AD4 atom mapping + metal HETATM 재첨부 | `receptor.pdbqt` | Vina + AutoDock-GPU |
 
+**RNA/DNA receptor 자동 분기** (commit `efb9255`+):
+
+`pdb_to_pdbqt` 가 receptor PDB 의 nucleotide residue (A/U/G/C, DA/DT/DG/DC, RA/RU/RG/RC, T, DI/I) 감지 → `pdb2pqr` 우회하고 **`obabel -p 7.4 --partialcharge gasteiger -xr`** 단일 단계로 PDBQT 생성. 이유: pdb2pqr 의 AMBER FF 가 nucleotide parameterize 못 함 → 기존 path 면 RNA/DNA chain 통째로 silent drop.
+
+- obabel binary: `.venvs/pred/bin/obabel` (이미 설치)
+- Protein-only receptor 는 default `pdb2pqr` path 그대로 — 회귀 없음
+- Verified atom types on synthetic DNA: `{P, OA, NA, HD, C}` (모두 표준 AD4 type)
+- Protein + RNA/DNA hetero-multimer receptor 도 nucleotide 한 residue 만 감지되면 obabel 분기
+
 **Metal/cofactor retain** (commit `c65797b`+):
 
 이전엔 `gemmi.remove_ligands_and_waters()` 가 receptor 의 모든 non-polymer 를 strip → metalloprotein 의 active-site coordination 좌표 손실. Fix:
@@ -242,7 +251,8 @@ Track 1 docking 의 box center 후보를 **3 카테고리 = 최대 19 개** 로 
 **Stage 2.5 frame alignment 가 100 cif 를 단일 reference frame 으로 align 한 다음**에 클러스터링하므로 좌표 비교가 의미를 가짐 (`align_cofolding_outputs.py::main` 이 `rglob("*.cif")` 으로 4 모델 × per-seed 모든 cif 를 align).
 
 등록 조건 (`prepare_docking_inputs.py::_extract_cofolding_ligand_clusters`):
-- **`n_members ≥ 5`** (= `COFOLD_CLUSTER_MIN_MEMBERS`) — 100 placements 중 최소 5 개가 모인 cluster 만. 1-2 개 stray placement 는 alternate/spurious site
+- **Dockable ligand chain 만 평균** (commit `28bd99f`+) — input YAML 에서 SMILES-bearing ligand chain id 를 추출 (`L`, `L2` 등) 해서 그 chain 의 heavy atom centroid 만 계산. 이전엔 모든 non-polymer 평균이라 metal/cofactor 가 centroid 를 끌어오는 오염 있었음 (21ii Mg²⁺ target 에서 입증)
+- **Dynamic MIN_MEMBERS** (commit `5fb2039`+) — `max(2, n_placements // 20)` (= 5 % of placements). 100 placement default 시 5; cofold seed × sample 변경 시 자동 scale
 - **`cutoff = 5.0 Å`** (= `COFOLD_CLUSTER_CUTOFF`) — template-pocket cluster 와 동일
 - **최대 3 개** (= `COFOLD_CLUSTER_TOP_K`) — `n_members` desc
 - 실제 등록 수:
@@ -282,9 +292,11 @@ Stage 1-5 에서 만든 `template_pocket_clusters.json` 의 top-K cluster centro
 **해당 source 가 missing 이면 `sys.exit(0)` clean skip** (실패가 아니라 정상 종료) — 그래서 자료 부족한 타겟이라도 파이프라인이 멈추지 않음.
 
 **기타**:
-- **Unified box**: 22.5 Å × 22.5 Å × 22.5 Å, grid spacing 0.375 Å (Vina/ADG/PxDock 공통)
+- **Adaptive box size** (commit `5fb2039`+) — `_adaptive_box_size()` 가 ligand SDF 들의 heavy-atom XYZ extent 를 계산해 `max(extent) + 8 Å` padding 적용. Floor 22.5 Å (legacy default — 일반 druglike 에선 변화 없음), cap 40 Å. Macrocyclic / peptide ligand 는 자동으로 더 큰 box, ion-only 처럼 작은 ligand 는 22.5 floor 유지. Grid spacing 0.375 Å 고정 (Vina/ADG/PxDock 공통)
 - **Fallback box pick** — PxDock 처럼 단일-box 만 받는 도구용 priority: `cofolding_1 > cofolding_2 > cofolding_3 > template_consensus_N (n_unique_pdb ≥ 2 인 strong consensus) > swinsite_1/2/3 > p2rank_1/2/3 > weak consensus`
-- **Output**: `inputs/docking/docking_prep_summary.json` 의 `binding_site_predictions` 딕셔너리 (key = source name, value = `{center, size, metadata}`)
+- **Output**: `inputs/docking/docking_prep_summary.json`. 핵심 필드:
+  - `binding_site_predictions` — key = source name, value = `{center, size, metadata}`
+  - **`source_status`** (commit `5fb2039`+) — observability 용 진단 블록. 어느 카테고리의 source 가 등록 0 이었는지 (silent skip 추적), `n_cofold_placements_total`, `cofold_min_members_floor`, `n_dropped_ligands_at_prep`, `dockable_chains_from_yaml` 모두 한 곳. RNA target 처럼 swinsite/p2rank 가 비어 있는 케이스 즉시 파악 가능
 
 > **Design rationale**:
 > 1. **Cofold clusters** — co-fold 25 seeds × 4 models 가 단일 frame 에서 어디에 ligand 를 놓는지가 가장 직접적 신호. 단일 best cifoldcentroid 만 쓰던 옛 design 은 multi-pocket / inter-model 불일치를 잡지 못함. `cluster_template_pockets.py` 와 동일 single-link 알고리즘을 재사용해 0 cost 에 가까운 확장.
@@ -309,7 +321,7 @@ PxDock 은 **default 비활성화** (`protenix_dock.enabled=false` since commit 
 | Protenix-Dock | (single, no fan-out) | CPU force field | ~5–30 min | `outputs/protenix_dock/poses_*.sdf + *_out.json` |
 
 - 모든 tool 은 `docking_prep_summary.json` 에서 receptor / ligand / box 를 runtime 에 읽음
-- AutoDock-GPU 래퍼는 추가로 **런타임에 ligand pdbqt 를 파싱**해서 `ligand_types` + grid map 동적 구성 — F/Cl/Br/P/I/Si 등 비표준 atom 도 자동 대응
+- AutoDock-GPU 래퍼는 추가로 **런타임에 ligand pdbqt + receptor pdbqt 둘 다 파싱**해서 `ligand_types` + `receptor_types` + grid map 동적 구성 (commit `efb9255`+). F/Cl/Br/P/I/Si 등 비표준 ligand atom 자동 대응 + RNA/DNA receptor 의 phosphate (P) + retain 된 metal (Mg/Zn/...) 가 receptor_types 에 자동 포함되어 autogrid4 의 `WARNING: receptor type X not in list` silent drop 방지
 - PxDock 활성화 시 docking 시간의 ~77 % 차지 → default 비활성화
 - **Config**: `docking_seeds=[42,101,202,303,404]`. variant 자동
 
@@ -321,11 +333,11 @@ template 리간드 위치를 docking box 로. **Template ligand 가 query 와 �
 - **Script**: `scripts/prepare_template_docking.py` + `scripts/run_multi_track_docking.py`
 - **Logic**:
   1. **Cluster-aware template selection** (default since `b7dd9d5`): `template_pockets.json` + `template_pocket_clusters.json` 의 각 cluster 마다 evidence-best representative template 1 개 픽 (`select_cluster_representative_templates`, `--max-templates 10` 까지). Track 1 `vina_template_consensus_1..10` 과 **같은 cluster set 을 cover** 하되 receptor 만 *experimental template* 으로 교체. 옛 `sort top-N` 은 pockets json 없을 때 fallback. Redundancy 제거 — 옛 sort top-3 은 종종 같은 cluster 의 alternate chain/conformation 만 dock 하던 문제 해결
-  2. RCSB CIF → receptor PDB/PDBQT (gemmi + pdb2pqr, **metal/cofactor retain** — Stage 3 와 동일 logic. Track 2 receptor 도 organic ligand (≥6 heavy atoms) 만 strip)
+  2. RCSB CIF → receptor PDB/PDBQT (gemmi + pdb2pqr, **metal/cofactor retain** — Stage 3 와 동일 logic. **Strip 규칙은 CCD-based** (commit `28bd99f`+) — `ligand_codes` 의 CCD 만 strip, HEM/NAD/FAD 같은 cofactor 는 정확히 retain. RNA/DNA template 은 obabel 분기)
   3. **USalign template → cofold frame transform** 계산 → template CIF 의 모든 atom 에 적용 → receptor 와 box 좌표가 cofold receptor 와 같은 좌표계
   4. Template 리간드 bound-pose SDF 추출 (`extract_template_ligand_sdf()`)
   5. Target SMILES → SDF/PDBQT (RDKit + meeko)
-  6. Vina + ADG 실행 (PxDock 은 default 비활성화, `protenix_dock.enabled=true` 시에만)
+  6. **Multi-ligand expansion** (commit `5fb2039`+) — 각 dockable target ligand (input YAML 의 SMILES-bearing entry) 별로 dock 실행. ccd-only entry (metal/ion 등) 는 prep 단계에서 skip 되어 dock loop 도달 안 함. Output 명명: `outputs/template_docking/<pdb_id>/<tool>/ligand_<lig_id>/...`. Vina + ADG 실행 (PxDock 은 default 비활성화)
 - **MCS 게이트 없음**: `check_template_hits` 는 `num_ligands > 0` 만 검사
 - **Frame fix (commit `e16cb8c`)**: 이전엔 docked pose 가 template frame 에 머물러 cofold receptor 와 mis-aligned → BA-Pred 입력 / 최종 MODEL block 좌표 깨짐. USalign template→cofold transform 으로 fix. Track 1 의 `vina_template_consensus_*` 와 box 좌표 매칭됨
 
@@ -395,6 +407,16 @@ Input YAML 에 ion CCD 엔티티 (ZN/MG/CA/FE 등) 가 있으면 자동 실행. 
 | `outputs/{boltz2,boltz2x,protenix,af3}/**/*_aligned.cif` | 리간드 (chain `L` 또는 `LIG*/UNK/UNL` residue) 추출 → 입력 docking ligand SDF 를 템플릿으로 `AssignBondOrdersFromTemplate` (CIF 의 결합차수 정보 소실 보강) | `analysis/poses/cofold_{model}.sdf` |
 
 > **입력 ligand SDF (`inputs/docking/ligand_*.sdf`) 는 post-analysis 제외**. RDKit embedding 좌표가 receptor 와 정렬 안 됨 → BA-Pred 의 "8 Å 이내 단백질 원자 추출" 로직이 빈 mol 반환 → `mol_to_graph` 단계에서 `AttributeError`. Docking + cofold aligned 포즈만 대상.
+
+**Track 2/3 multi-ligand pose staging** (commit `5fb2039`+):
+
+Post-analysis 가 두 layout 모두 인식:
+- 새 (multi-ligand): `outputs/template_docking/<pdb_id>/<tool>/ligand_<lig_id>/{docked.pdbqt|docked.dlg|*.sdf}` → `template_<pdb_id>_<tool>_<lig_id>` tool key
+- 옛 (single-ligand legacy): `outputs/template_docking/<pdb_id>/<tool>/{docked.pdbqt|...}` → `template_<pdb_id>_<tool>_<primary_lig>` tool key (fallback)
+
+Per-template USalign(template_receptor → cofold_receptor) transform 을 staged SDF 에 적용해 BA-Pred / RMSD-Pred / 최종 LG MODEL 모두 cofold receptor 좌표계.
+
+**PxDock pose path** (commit `28bd99f`+): `outputs/protenix_dock/poses_<lig_id>.sdf` 로 통일. 이전엔 multi-ligand 의 경우 `protenix_dock/ligand_<id>/poses.sdf` 와 `compute_submission_scores._resolve_pose_file` 의 `poses_<id>.sdf` 가 mismatch → PxDock pose 가 LG diversity check 에서 silent drop 되던 문제 해결.
 
 #### Naming normalization
 
@@ -642,7 +664,20 @@ CCD 개수를 ground truth 로 써서 불일치 시 naive split fallback.
 에 적힘 — `.venvs/pred` 의 dgl 2.4 / torch 2.4 빌드가 sm_90/sm_100 kernel 미포함. `novel2025_config.yaml::slurm.partition`
 및 `run_array.sbatch.sh` 의 `#SBATCH --partition` 은 **`6000ada` 로만 고정**.
 
-### 3-6. Output tree
+### 3-6. Environment variables
+
+새 환경 setup 시 RCSB DB 경로를 config 마다 override 안 해도 되도록 env var 지원
+(commit `5fb2039`+):
+
+| 변수 | Default | 용도 |
+|---|---|---|
+| `CASP17_RCSB_DIR` | `~/DB/RCSB/raw/mmCIF_data` | `template_search_sequence.rcsb_dir` 기본값 |
+| `CASP17_RCSB_INDEX_DB` | `~/DB/RCSB/processed/rcsb_index.db` | `template_search_sequence.rcsb_db_path` 기본값 |
+
+YAML config 에서 `rcsb_dir` / `rcsb_db_path` 를 명시하면 그쪽이 우선. 즉
+**해석 순서**: explicit YAML > env var > hardcoded default.
+
+### 3-7. Output tree
 
 ```
 experiments/runs/<target>/
@@ -651,7 +686,7 @@ experiments/runs/<target>/
 │   ├── protenix_input.json                         # Protenix JSON
 │   ├── alphafold3_input.json                       # AF3 JSON (+ MSA from Boltz bridge)
 │   ├── docking/
-│   │   ├── docking_prep_summary.json                 # receptor / ligand / box paths + binding_site_predictions (≤19 sources)
+│   │   ├── docking_prep_summary.json                 # receptor / ligand / box paths + binding_site_predictions (≤19 sources) + source_status (silent-skip diagnostic)
 │   │   ├── receptor.pdb / .pdbqt / receptor_protonated.pdb  (metal/cofactor retained)
 │   │   ├── ligand_L.sdf / .pdbqt
 │   │   ├── p2rank/                                   # P2Rank pocket predictions
@@ -680,12 +715,12 @@ experiments/runs/<target>/
 │   │   └── seed_42/ ... ligand_L/docked.pdbqt
 │   ├── autodock_gpu_<source>/                      # Stage 4 Track 1: ≤19 variants × 5 seeds
 │   │   └── seed_42/ ... ligand_L/docked.dlg
-│   ├── protenix_dock/                              # Stage 4 Track 1: single, priority-picked
-│   │   ├── poses_<lid>.sdf                           # multi-pose SDF
+│   ├── protenix_dock/                              # Stage 4 Track 1: single, priority-picked (default off)
+│   │   ├── poses_<lid>.sdf                           # multi-pose SDF (per-ligand path, post-fix `28bd99f`)
 │   │   └── *_out.json                                # raw atom-mapped output
 │   ├── template_docking/                           # Stage 4 Track 2+3
 │   │   ├── multi_track_summary.json
-│   │   └── <pdb_id>/{vina,autodock_gpu,protenix_dock,lig_align}/
+│   │   └── <pdb_id>/{vina,autodock_gpu,protenix_dock,lig_align}/ligand_<lig_id>/  (per-ligand sub-dir; legacy single-ligand layout still readable)
 │   ├── ion_placement/                              # Stage 5 (if ion in input)
 │   │   └── ion_placement_summary.json                # clustered positions by confidence
 │   ├── analysis/                                   # Stage 6
