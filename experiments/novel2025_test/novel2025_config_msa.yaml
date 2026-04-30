@@ -86,7 +86,8 @@ autodock_gpu:
   nrun: 100
 
 protenix_dock:
-  enabled: true
+  # Disabled by default — see novel2025_config.yaml for rationale.
+  enabled: false
 
 post_analysis:
   enabled: true

@@ -31,7 +31,7 @@ flowchart TB
 
     subgraph S5["4. Docking (multi-track)"]
         direction LR
-        T1["Track 1\ncofold-based\nVina/ADG × ≤19 × 5 + PxDock"]
+        T1["Track 1\ncofold-based\nVina/ADG × ≤19 × 5\n(PxDock opt-in)"]
         T2["Track 2\ntemplate-box\n(any template)"]
         T3["Track 3\nlig-align\n(MCS ≥ 0.5)"]
     end
@@ -71,7 +71,7 @@ template-search-sequence (mmseqs)
     └── bridge: union filter → pocket extraction → pocket clustering
   → bridge: align cofolding outputs (Kabsch to common frame) → *_aligned.cif
   → bridge: docking prep (≤3 cofold cluster + ≤6 predictor top-K + ≤10 template-consensus = 최대 19 binding-site sources)
-  → docking (Track 1: Vina/ADG × ≤19 sources × 5 seeds, PxDock × 1)
+  → docking (Track 1: Vina/ADG × ≤19 sources × 5 seeds; PxDock opt-in via `protenix_dock.enabled=true`)
   → multi-track docking (Track 2 + Track 3, conditional)
   → ion placement (conditional)
   → post-analysis (BA-Pred + RMSD-Pred, staged poses)
@@ -289,7 +289,7 @@ Stage 1-5 에서 만든 `template_pocket_clusters.json` 의 top-K cluster centro
 
 Cofolding best model 을 receptor, **위에서 등록된 binding-site source (≤3 cofold cluster + ≤6 predictor (3 swinsite + 3 p2rank) + ≤10 consensus = 최대 19) 각각을 독립 box 로** 사용.
 Vina + AutoDock-GPU 가 **최대 19 × 2 = 30 variant** 로 병렬 실행 (실제 수 = 등록된 source 수).
-PxDock 은 cache-map 재생성 비용 때문에 **단일 run** (priority-picked fallback box).
+PxDock 은 **default 비활성화** (`protenix_dock.enabled=false` since commit `d04e2c9`+) — single run 이지만 ~5–30 min/타겟 소요로 docking wall-clock 의 ~77 % 차지함. novel2025 batch 의 native rate 기여도 ~10 % vs cost ~77 % 라 ROI 낮음. 명시적으로 enable 한 target 에서만 실행 (cache-map 재생성 비용 때문에 fan-out 없이 priority-picked single box).
 
 | Tool | Variants | Type | Time/seed | Output |
 |---|---|---|---:|---|
@@ -309,7 +309,7 @@ template 리간드 위치를 docking box 로. **Template ligand 가 query 와 �
 
 - **Script**: `scripts/prepare_template_docking.py` + `scripts/run_multi_track_docking.py`
 - **Logic**:
-  1. `filtered_hits.tsv` 에서 상위 `--max-templates 3` (sort key 가 evidence_breadth × similarity 이라 both-source/높은 qtmscore 우선)
+  1. **Cluster-aware template selection**: `template_pockets.json` + `template_pocket_clusters.json` 이 있으면 (default) 각 cluster 마다 evidence-best representative template 1 개 픽 (`select_cluster_representative_templates`, 최대 `--max-templates 10` cluster). Track 1 의 `vina_template_consensus_*` 와 같은 cluster set 을 dock 하되 receptor 만 *experimental template* 으로 교체. 옛 `sort top-N` 은 fallback (pockets json 없을 때만)
   2. RCSB CIF → receptor PDB/PDBQT (gemmi + pdb2pqr)
   3. **USalign 으로 template → cofold frame transform 행렬 계산** → receptor 에 적용 (`receptor_aligned`)
   4. Template 리간드 bound-pose SDF 추출 (`extract_template_ligand_sdf()`)
@@ -334,7 +334,7 @@ flowchart TB
     F["filtered_hits.tsv\n(union, no MCS gate)"]
     F --> ANY{"any hit\nnum_ligands > 0?"}
     ANY -->|No| SKIP["Track 2+3 skip\n(Track 1 only)"]
-    ANY -->|Yes| T2_PREP["Track 2 prep\n(top --max-templates 3)"]
+    ANY -->|Yes| T2_PREP["Track 2 prep\n(cluster-aware,\n1 representative\nper cluster, ≤10)"]
     T2_PREP --> T2["Track 2: vina/adg/pxdock\n(template box)"]
     T2_PREP --> MCS{"per-template\nbest_mcs_coverage\n>= mcs_threshold?\n(default 0.5)"}
     MCS -->|Yes| T3["Track 3: lig-align"]

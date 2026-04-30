@@ -53,11 +53,20 @@ def run_template_docking_prep(
     input_yaml: Path,
     output_dir: Path,
     rcsb_db: Path | None = None,
-    max_templates: int = 3,
+    max_templates: int = 10,
     cofold_ref_cif: Path | None = None,
     cofold_lig_anchor: list[float] | None = None,
+    pockets_json: Path | None = None,
 ) -> list[dict]:
-    """Run prepare_template_docking.py and return template summaries."""
+    """Run prepare_template_docking.py and return template summaries.
+
+    When ``pockets_json`` is provided (the ``template_pockets.json`` written
+    by ``extract_template_pockets``), prepare_template_docking selects one
+    representative template per pocket cluster instead of the legacy
+    sort-top-N. Default ``max_templates=10`` matches
+    ``TEMPLATE_CONSENSUS_TOP_K`` so Track 2 docks the same K cluster sites
+    Track 1's vina_template_consensus_* sources cover.
+    """
     script = Path(__file__).resolve().parent / "prepare_template_docking.py"
     cmd = [
         sys.executable, str(script),
@@ -67,6 +76,8 @@ def run_template_docking_prep(
         "--output-dir", str(output_dir),
         "--max-templates", str(max_templates),
     ]
+    if pockets_json is not None and pockets_json.exists():
+        cmd += ["--pockets-json", str(pockets_json)]
     if cofold_ref_cif is not None:
         cmd += ["--cofold-ref-cif", str(cofold_ref_cif)]
     if cofold_lig_anchor is not None:
@@ -390,7 +401,11 @@ def main() -> int:
     parser.add_argument("--rcsb-dir", type=Path, default=Path.home() / "DB/RCSB/raw/mmCIF_data")
     parser.add_argument("--rcsb-db", type=Path, default=Path.home() / "DB/RCSB/processed/rcsb_index.db")
     parser.add_argument("--mcs-threshold", type=float, default=0.5)
-    parser.add_argument("--max-templates", type=int, default=3)
+    parser.add_argument("--max-templates", type=int, default=10,
+                        help="Max Track 2 templates. Default 10 matches "
+                             "TEMPLATE_CONSENSUS_TOP_K so Track 2 covers "
+                             "the same cluster set Track 1's "
+                             "vina_template_consensus_* uses.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--skip-pxdock",
@@ -491,6 +506,15 @@ def main() -> int:
         print("  WARNING: no cofold reference found; Track 2 outputs will "
               "stay in template frame (eval will be wrong)")
 
+    # Cluster-aware Track 2: when extract_template_pockets has produced a
+    # pockets json, prepare_template_docking picks one representative
+    # template per pocket cluster (matches Track 1's
+    # vina_template_consensus_* coverage). Without it, falls back to
+    # filtered_hits.tsv sort top-N.
+    pockets_json = run_dir / "outputs" / "template_pockets" / "template_pockets.json"
+    if not pockets_json.exists():
+        pockets_json = None
+
     templates = run_template_docking_prep(
         hits_tsv=hits_tsv,
         rcsb_dir=args.rcsb_dir,
@@ -500,6 +524,7 @@ def main() -> int:
         max_templates=args.max_templates,
         cofold_ref_cif=cofold_ref_cif,
         cofold_lig_anchor=cofold_lig_anchor,
+        pockets_json=pockets_json,
     )
     if not templates:
         print("Template docking prep produced no templates.")

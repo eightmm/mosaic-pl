@@ -359,13 +359,143 @@ def parse_filtered_hits(tsv_path: Path) -> list[dict]:
     return hits
 
 
+def select_cluster_representative_templates(
+    pockets_json: Path,
+    hits_tsv_lookup: dict[str, dict],
+    *,
+    max_clusters: int = 10,
+    require_strong: bool = False,
+) -> list[dict]:
+    """Pick one representative template per pocket cluster.
+
+    Walks ``template_pockets.json`` (per-instance pocket list with each
+    record's evidence_score / TM-score) grouped by cluster index from
+    ``template_pocket_clusters.json``, picks the highest-evidence template
+    per cluster, and returns the corresponding row from
+    ``hits_tsv_lookup`` (keyed by ``pdb_id``).
+
+    The motivation: Track 2 used to take the top-N by filtered_hits.tsv
+    sort, which often picks 3 alternate chains of the *same* PDB or 3
+    near-identical conformations from one cluster. Spreading across
+    clusters gives Track 2 docking the same pocket diversity Track 1's
+    ``vina_template_consensus_*`` already enjoys, but with the
+    experimental receptor conformation rather than the cofold prediction.
+
+    Args:
+        pockets_json: ``outputs/template_pockets/template_pockets.json``
+        hits_tsv_lookup: ``{pdb_id: row}`` from filtered_hits.tsv so the
+            returned dicts are docking-ready (carry ligand_codes etc.)
+        max_clusters: cap on cluster count (matches the docking-prep
+            ``TEMPLATE_CONSENSUS_TOP_K``)
+        require_strong: when True, only clusters with ``n_unique_pdb >= 2``
+            are considered — drops single-template clusters that are more
+            likely alternate/spurious sites.
+
+    Returns the per-cluster list of hit rows in cluster-rank order.
+    Falls back to an empty list if ``template_pockets.json`` is missing
+    so callers can degrade gracefully (e.g. to legacy sort top-N).
+    """
+    if not pockets_json.exists():
+        return []
+    try:
+        data = json.loads(pockets_json.read_text())
+    except Exception as e:
+        print(f"  WARNING: pockets json unreadable ({e}); cluster-aware off")
+        return []
+    pockets = data.get("pockets") or []
+    clusters_path = pockets_json.parent / "template_pocket_clusters.json"
+    if not clusters_path.exists():
+        return []
+    try:
+        cl_data = json.loads(clusters_path.read_text())
+    except Exception as e:
+        print(f"  WARNING: clusters json unreadable ({e}); cluster-aware off")
+        return []
+    clusters = cl_data.get("clusters") or []
+
+    # Group pockets by cluster_index (single-link cluster builder writes
+    # this onto each pocket record). Fallback: euclidean nearest centroid.
+    by_cluster: dict[int, list[dict]] = {}
+    for p in pockets:
+        ci = p.get("cluster_index")
+        if ci is None:
+            # Fall back: assign to nearest cluster centroid by Euclidean.
+            best_i, best_d2 = None, float("inf")
+            for i, cl in enumerate(clusters):
+                cx, cy, cz = cl["centroid"]
+                d2 = ((p["centroid_x"] - cx) ** 2
+                      + (p["centroid_y"] - cy) ** 2
+                      + (p["centroid_z"] - cz) ** 2)
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best_i = i
+            ci = best_i
+        if ci is None:
+            continue
+        by_cluster.setdefault(ci, []).append(p)
+
+    selected: list[dict] = []
+    for rank, cl in enumerate(clusters[:max_clusters]):
+        if require_strong and (cl.get("n_unique_pdb") or 0) < 2:
+            continue
+        members = by_cluster.get(rank, [])
+        if not members:
+            continue
+        # Best member: highest evidence weight (in_mmseqs+in_foldseek
+        # + max(alignment_tmscore, qtmscore, pident/100))
+        def _weight(m: dict) -> float:
+            base = (1 if m.get("in_mmseqs") else 0) + (1 if m.get("in_foldseek") else 0)
+            tm = float(m.get("alignment_tmscore") or 0.0)
+            qtm = float(m.get("qtmscore") or 0.0)
+            pid = float(m.get("pident") or 0.0)
+            return base + max(tm, qtm, pid / 100.0)
+
+        members_sorted = sorted(members, key=_weight, reverse=True)
+        for member in members_sorted:
+            pdb_id = (member.get("template_pdb_id") or "").strip().lower()
+            row = hits_tsv_lookup.get(pdb_id)
+            if row is None:
+                continue
+            # De-dupe: same PDB across clusters is OK (different binding
+            # mode in different cluster), but skip if we already selected
+            # this exact row in this cluster (shouldn't happen but cheap).
+            if any(r.get("pdb_id", "").strip().lower() == pdb_id
+                   and r.get("_cluster_rank") == rank for r in selected):
+                continue
+            row = dict(row)
+            row["_cluster_rank"] = rank
+            row["_cluster_evidence"] = round(_weight(member), 3)
+            row["_cluster_n_unique_pdb"] = cl.get("n_unique_pdb")
+            selected.append(row)
+            break  # one representative per cluster
+    return selected
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Prepare template-based docking inputs.")
     parser.add_argument("--hits-tsv", type=Path, required=True, help="Filtered template hits TSV.")
     parser.add_argument("--rcsb-dir", type=Path, default=Path.home() / "DB/RCSB/raw/mmCIF_data")
     parser.add_argument("--input-yaml", type=Path, help="Unified input YAML (for ligand SMILES).")
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--max-templates", type=int, default=3, help="Max templates to prepare.")
+    parser.add_argument("--max-templates", type=int, default=10,
+                        help="Max templates to prepare. With --pockets-json the "
+                             "selection is cluster-aware (one representative per "
+                             "pocket cluster); without it the legacy sort-by-evidence "
+                             "top-N is used.")
+    parser.add_argument(
+        "--pockets-json", type=Path, default=None,
+        help="Path to ``template_pockets.json`` from extract_template_pockets. "
+             "When supplied, Track 2 picks one representative per pocket cluster "
+             "(see select_cluster_representative_templates) instead of "
+             "filtered_hits.tsv top-N. ``template_pocket_clusters.json`` is read "
+             "automatically from the same directory."
+    )
+    parser.add_argument(
+        "--strong-clusters-only", action="store_true",
+        help="Only emit Track 2 for clusters with n_unique_pdb >= 2 "
+             "(multi-PDB consensus). Useful when the template pool has many "
+             "single-PDB clusters that don't add receptor diversity."
+    )
     parser.add_argument("--box-size", type=float, default=22.5)
     parser.add_argument(
         "--cofold-ref-cif", type=Path, default=None,
@@ -406,10 +536,34 @@ def main() -> int:
         print("No ligand SMILES found in input.")
         return 1
 
-    print(f"Found {len(hits)} template hits with ligands, using top {args.max_templates}")
+    # 3. Choose templates — cluster-aware when pockets json is available,
+    # falls back to sort-by-evidence top-N otherwise. Cluster-aware spreads
+    # Track 2 across distinct binding modes (one representative per cluster)
+    # instead of doing 3 alternate chains/conformations of the same site.
+    selected: list[dict]
+    if args.pockets_json and args.pockets_json.exists():
+        hits_by_pdb = {h["pdb_id"].strip().lower(): h for h in hits}
+        selected = select_cluster_representative_templates(
+            args.pockets_json, hits_by_pdb,
+            max_clusters=args.max_templates,
+            require_strong=args.strong_clusters_only,
+        )
+        if selected:
+            print(f"Cluster-aware Track 2: {len(selected)} representative templates "
+                  f"(one per pocket cluster, max={args.max_templates}, "
+                  f"strong_only={args.strong_clusters_only})")
+        else:
+            print("Cluster-aware selection returned 0 — falling back to sort top-N")
+    else:
+        selected = []
+
+    if not selected:
+        selected = hits[:args.max_templates]
+        print(f"Found {len(hits)} template hits with ligands, "
+              f"using top {len(selected)} by sort order")
 
     all_templates = []
-    for i, hit in enumerate(hits[:args.max_templates]):
+    for i, hit in enumerate(selected):
         pdb_id = hit["pdb_id"]
         ligand_codes = hit.get("ligand_codes", "").split(";")
 

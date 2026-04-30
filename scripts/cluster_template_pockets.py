@@ -182,12 +182,35 @@ def main() -> int:
 
     data = json.loads(args.pockets_json.read_text())
     pockets = data.get("pockets") or []
+    raw_clusters: list[dict] = []
     if not pockets:
         print("[cluster] empty pocket list; emitting empty cluster set.")
         clusters = []
     else:
         raw_clusters = _cluster_pockets(pockets, cutoff=args.cutoff)
         clusters = _summarize(raw_clusters)
+
+    # Tag each pocket record with its cluster index (rank in the sorted
+    # cluster list). Lets downstream consumers like
+    # ``prepare_template_docking::select_cluster_representative_templates``
+    # group pockets by cluster without re-running the spatial join.
+    cluster_member_to_index: dict[int, int] = {}
+    for ci, cl in enumerate(raw_clusters):
+        for member in cl.get("_members", []):
+            cluster_member_to_index[id(member)] = ci
+    for p in pockets:
+        idx = cluster_member_to_index.get(id(p))
+        if idx is not None:
+            p["cluster_index"] = idx
+
+    # Rewrite the pockets json with cluster_index annotations so future
+    # readers don't have to re-derive the mapping.
+    if pockets:
+        try:
+            data["pockets"] = pockets
+            args.pockets_json.write_text(json.dumps(data, indent=2))
+        except Exception as e:
+            print(f"[cluster] WARNING: failed to annotate pockets json: {e}")
 
     output = args.output_json or args.pockets_json.with_name("template_pocket_clusters.json")
     summary = {
