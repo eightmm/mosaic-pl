@@ -781,8 +781,16 @@ _DOCKING_BOX_SOURCES = (
     "cofolding_1",
     "cofolding_2",
     "cofolding_3",
-    "swinsite",
-    "p2rank",
+    # SwinSite top-K — ranked ML pocket predictor. Multi-chain proteins
+    # typically have chain-B/C equivalents of the chain-A active site
+    # showing up as rank 2/3 instead of the legacy single-best source.
+    "swinsite_1",
+    "swinsite_2",
+    "swinsite_3",
+    # P2Rank top-K — same rationale as swinsite.
+    "p2rank_1",
+    "p2rank_2",
+    "p2rank_3",
     # Template-consensus pockets (top-K from spatial cluster of bound-ligand
     # centroids across all mmseqs+foldseek union hits). Each source maps to
     # one cluster centroid; runtime exits cleanly when prep_summary lacks
@@ -812,10 +820,13 @@ def prepare_vina(
 
     Instead of dispatching docking from a single box center (the old
     priority-picked "best" prediction), we create independent variants per
-    source listed in ``_DOCKING_BOX_SOURCES``: ``vina_cofolding_{1..3}``
-    (top-K cofold ligand clusters), ``vina_swinsite``, ``vina_p2rank``,
-    and ``vina_template_consensus_{1..10}`` (top-K template-consensus
-    pockets). Each reads its designated center from
+    source listed in ``_DOCKING_BOX_SOURCES``:
+    ``vina_cofolding_{1..3}`` (top-K cofold ligand clusters across 4
+    models × 25 seeds), ``vina_swinsite_{1..3}`` and
+    ``vina_p2rank_{1..3}`` (top-K ML/geometry pocket predictors —
+    multi-chain proteins typically expose chain-B/C analogues at rank
+    2-3), and ``vina_template_consensus_{1..10}`` (top-K template-
+    consensus pockets). Each reads its designated center from
     ``docking_prep_summary.binding_site_predictions`` at runtime. Variants
     whose predictor yielded no pocket exit cleanly so the pipeline does
     not fail; downstream post-analysis simply sees fewer pose files for

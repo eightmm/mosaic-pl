@@ -294,40 +294,60 @@ def select_best_model(output_root: Path) -> tuple[str, Path]:
     return (best[0], best[1])
 
 
-def _parse_p2rank_predictions(pred_file: Path) -> tuple[list[float], list[float]] | None:
-    """Parse P2Rank predictions CSV → top-pocket (center, size). Returns None on empty."""
+POCKET_PREDICTOR_TOP_K = 3  # how many top-ranked pockets each ML predictor exposes
+
+
+def _parse_p2rank_predictions(pred_file: Path, top_k: int = POCKET_PREDICTOR_TOP_K) -> list[dict]:
+    """Parse P2Rank predictions CSV → top-K pockets sorted by score.
+
+    Returns a list of ``{"center": [x,y,z], "size": [22.5]*3, "score": float, "rank": int}``
+    capped at ``top_k``. Empty list when the CSV has no pockets.
+    """
     import csv
+    out = []
     with open(pred_file) as f:
         reader = csv.DictReader(f, skipinitialspace=True)
-        for row in reader:
+        for i, row in enumerate(reader, start=1):
+            if i > top_k:
+                break
             row = {k.strip(): v.strip() for k, v in row.items()}
             cx = float(row["center_x"])
             cy = float(row["center_y"])
             cz = float(row["center_z"])
-            box_side = 22.5
-            print(f"  P2Rank pocket 1: center=[{cx:.1f}, {cy:.1f}, {cz:.1f}], score={row['score'].strip()}")
-            return ([cx, cy, cz], [box_side, box_side, box_side])
-    return None
+            score = float(row.get("score") or 0.0)
+            out.append({
+                "center": [cx, cy, cz],
+                "size": [22.5, 22.5, 22.5],
+                "score": score,
+                "rank": i,
+            })
+            print(f"  P2Rank pocket {i}: center=[{cx:.1f}, {cy:.1f}, {cz:.1f}], score={score:.3f}")
+    return out
 
 
 def run_p2rank(
     pdb_path: Path,
     output_dir: Path,
     reuse_cache: bool = False,
-) -> tuple[list[float], list[float]] | None:
-    """Run P2Rank binding site prediction and return (center, size) of top pocket.
+) -> list[dict]:
+    """Run P2Rank binding site prediction and return top-K pockets.
+
+    Multi-chain receptors expose distinct binding sites on different chains
+    so we no longer collapse the prediction to a single best pocket — each
+    of the top-K (default 3) becomes a separate ``p2rank_<rank>`` source.
 
     When ``reuse_cache`` is True and a previous predictions CSV exists, the
     binary is skipped and the cached CSV is parsed directly. Safe across
-    reruns because P2Rank is deterministic for a given receptor PDB and the
-    receptor PDB is itself deterministic from the aligned cofold cif.
+    reruns because P2Rank is deterministic for a given receptor PDB.
+
+    Returns an empty list on failure / missing prediction.
     """
     import subprocess
 
     prank_bin = Path(__file__).resolve().parent.parent / ".local" / "bin" / "prank"
     if not prank_bin.exists():
         print("  P2Rank not found, skipping binding site prediction.")
-        return None
+        return []
 
     p2rank_out = output_dir / "p2rank"
     pred_file = p2rank_out / f"{pdb_path.name}_predictions.csv"
@@ -343,29 +363,32 @@ def run_p2rank(
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
         print(f"  P2Rank failed: {e}")
-        return None
+        return []
 
     if not pred_file.exists():
         print("  P2Rank produced no predictions file.")
-        return None
-
-    parsed = _parse_p2rank_predictions(pred_file)
-    if parsed is None:
-        print("  P2Rank found no pockets.")
-    return parsed
+        return []
+    return _parse_p2rank_predictions(pred_file)
 
 
 def run_swinsite(
     pdb_path: Path,
     output_dir: Path,
     reuse_cache: bool = False,
-) -> tuple[list[float], list[float]] | None:
-    """Run SwinSite binding site prediction and return (center, size) of top pocket.
+) -> list[dict]:
+    """Run SwinSite binding site prediction and return top-K pockets.
+
+    Multi-chain receptors expose distinct binding sites; SwinSite's
+    grid*_score_*.pdb output already ranks every pocket it finds, so we
+    expose the top-K (default 3) as ``swinsite_<rank>`` sources instead
+    of collapsing to a single best.
 
     When ``reuse_cache`` is True and the SwinSite results dir from a prior
     run is on disk, the GPU prediction is skipped and the cached pocket
     PDBs are parsed directly. Safe across reruns because SwinSite output
     is deterministic for a given receptor PDB.
+
+    Returns an empty list on failure / missing pockets.
     """
     repo_root = Path(__file__).resolve().parent.parent
     swinsite_dir = repo_root / "external" / "swinsite"
@@ -373,7 +396,7 @@ def run_swinsite(
 
     if not swinsite_dir.exists() or not pred_python.exists():
         print("  SwinSite not found, skipping.")
-        return None
+        return []
 
     swinsite_out = output_dir / "swinsite"
     cached_results = swinsite_out / "results" / "input" / "receptor"
@@ -411,12 +434,15 @@ def run_swinsite(
     results_dir = swinsite_out / "results" / "input" / "receptor"
     if not results_dir.exists():
         print("  SwinSite produced no output.")
-        return None
+        return []
     return _parse_swinsite_results(results_dir)
 
 
-def _parse_swinsite_results(results_dir: Path) -> tuple[list[float], list[float]] | None:
-    """Parse a SwinSite results directory → top-pocket (center, size).
+def _parse_swinsite_results(
+    results_dir: Path,
+    top_k: int = POCKET_PREDICTOR_TOP_K,
+) -> list[dict]:
+    """Parse a SwinSite results directory → top-K pockets ranked by score.
 
     Layout (observed in runs/22mj_input/...):
         results_dir/
@@ -425,11 +451,11 @@ def _parse_swinsite_results(results_dir: Path) -> tuple[list[float], list[float]
             pocket0_score_0.7219.pdb   ← protein residues near the pocket
             pocket1_score_0.3136.pdb
 
-    ``grid*`` files give the cleanest pocket centroid (they're literally the
-    predicted pocket cloud); the filename score suffix sorts highest-confidence
-    pocket first. Falls back to ``pocket*`` files if grids are missing.
+    ``grid*`` files give the cleanest pocket centroid; falls back to
+    ``pocket*`` files if grids are missing. Returns up to ``top_k`` entries
+    sorted by score descending. Each entry::
 
-    Returns ``None`` when no scored pocket files are present.
+        {"center": [x,y,z], "size": [22.5]*3, "score": float, "rank": int}
     """
     import re as _re
     score_re = _re.compile(r"_score_([0-9.]+)\.pdb$")
@@ -447,29 +473,79 @@ def _parse_swinsite_results(results_dir: Path) -> tuple[list[float], list[float]
 
     if not candidates:
         print("  SwinSite found no pockets.")
-        return None
-
-    best = candidates[0]
-    coords = []
-    for line in best.read_text().splitlines():
-        if line.startswith(("ATOM", "HETATM")):
-            try:
-                x = float(line[30:38])
-                y = float(line[38:46])
-                z = float(line[46:54])
-                coords.append((x, y, z))
-            except ValueError:
-                continue
-    if not coords:
-        print(f"  SwinSite top pocket {best.name} had no atoms, skipping.")
-        return None
+        return []
 
     import numpy as _np
-    arr = _np.array(coords)
-    center = arr.mean(axis=0).tolist()
-    box_side = 22.5
-    print(f"  SwinSite top pocket {best.name}: center=[{center[0]:.1f}, {center[1]:.1f}, {center[2]:.1f}], atoms={len(coords)}, score={_score(best):.3f}")
-    return (center, [box_side, box_side, box_side])
+    out: list[dict] = []
+    for rank, pdb_file in enumerate(candidates[:top_k], start=1):
+        coords = []
+        for line in pdb_file.read_text().splitlines():
+            if line.startswith(("ATOM", "HETATM")):
+                try:
+                    x = float(line[30:38])
+                    y = float(line[38:46])
+                    z = float(line[46:54])
+                    coords.append((x, y, z))
+                except ValueError:
+                    continue
+        if not coords:
+            continue
+        arr = _np.array(coords)
+        center = arr.mean(axis=0).tolist()
+        score = _score(pdb_file)
+        out.append({
+            "center": center,
+            "size": [22.5, 22.5, 22.5],
+            "score": float(score),
+            "rank": rank,
+        })
+        print(f"  SwinSite pocket {rank} {pdb_file.name}: center=[{center[0]:.1f}, "
+              f"{center[1]:.1f}, {center[2]:.1f}], atoms={len(coords)}, score={score:.3f}")
+    return out
+
+
+def _load_receptor_chain_atoms(receptor_pdb: Path) -> list[tuple[str, list[float]]]:
+    """Parse receptor PDB → list of (chain_id, [x,y,z]) for every CA atom.
+
+    Used to attach a ``nearest_protein_chain`` tag to each binding-site
+    centroid so multi-chain post-analysis can distinguish a pocket on
+    chain A from a chemically-identical pocket on chain B.
+    """
+    out = []
+    if not receptor_pdb.exists():
+        return out
+    for line in receptor_pdb.read_text().splitlines():
+        if not line.startswith("ATOM"):
+            continue
+        if line[12:16].strip() != "CA":
+            continue
+        chain = line[21:22].strip() or "?"
+        try:
+            x = float(line[30:38])
+            y = float(line[38:46])
+            z = float(line[46:54])
+        except ValueError:
+            continue
+        out.append((chain, [x, y, z]))
+    return out
+
+
+def _nearest_chain(point: list[float], ca_atoms: list[tuple[str, list[float]]]) -> tuple[str | None, float]:
+    """Return (chain_id, distance) of the nearest CA atom to ``point``.
+
+    Returns ``(None, inf)`` when there are no atoms to compare against.
+    """
+    import math
+    best_chain = None
+    best_d2 = math.inf
+    for chain, xyz in ca_atoms:
+        d2 = ((point[0] - xyz[0]) ** 2
+              + (point[1] - xyz[1]) ** 2
+              + (point[2] - xyz[2]) ** 2)
+        if d2 < best_d2:
+            best_d2 = d2
+            best_chain = chain
+    return best_chain, math.sqrt(best_d2) if best_d2 != math.inf else float("inf")
 
 
 def extract_smiles_from_yaml(input_yaml: Path) -> list[tuple[str, str]]:
@@ -853,9 +929,19 @@ def main() -> int:
     #     collapse into a single cluster (= legacy behaviour); multi-
     #     pocket / inter-model-disagreement targets get 2-3 sources.
     default_size = [22.5, 22.5, 22.5]
+
+    # Receptor CA atoms (chain-aware) for nearest-chain tagging. Real
+    # binding-site post-analysis on multi-chain proteins needs to know
+    # whether a pocket sits on chain A vs chain B vs an interface, so
+    # every centroid we register gets the closest CA's chain id.
+    ca_atoms = _load_receptor_chain_atoms(pdb_path)
+    print(f"  Receptor CA atoms: {len(ca_atoms)} (chains: "
+          f"{sorted({c for c, _ in ca_atoms})})")
+
     cofold_clusters = _extract_cofolding_ligand_clusters(args.run_dir)
     for rank, cl in enumerate(cofold_clusters, start=1):
         src_name = f"cofolding_{rank}"
+        nearest_chain, nearest_d = _nearest_chain(cl["centroid"], ca_atoms)
         binding_site_results[src_name] = (
             cl["centroid"],
             list(default_size),
@@ -864,32 +950,61 @@ def main() -> int:
                 "n_unique_models": cl["n_unique_models"],
                 "models": cl["models"],
                 "cluster_rank": rank,
+                "nearest_protein_chain": nearest_chain,
+                "nearest_ca_distance": round(nearest_d, 2),
             },
         )
         print(f"  Cofolding cluster #{rank}: {cl['centroid']} "
-              f"(n_members={cl['n_members']}, models={cl['models']})")
+              f"(n_members={cl['n_members']}, models={cl['models']}, "
+              f"chain={nearest_chain})")
     if not cofold_clusters:
         print("  WARNING: no cofolding ligand clusters passed "
               f"min_members={COFOLD_CLUSTER_MIN_MEMBERS} filter")
 
-    # 4b. SwinSite (ML-based surface pocket predictor, needs GPU unless cache reused)
+    # 4b. SwinSite top-K (ML-based surface pocket predictor, needs GPU
+    # unless cache reused). Multi-chain receptors: top-2/3 typically pick
+    # up the chain-B/-C equivalent of the chain-A active site.
     print("  Running SwinSite binding site prediction...")
-    swinsite_result = run_swinsite(
+    swinsite_pockets = run_swinsite(
         pdb_path, args.output_dir,
         reuse_cache=args.reuse_binding_site_cache,
     )
-    if swinsite_result:
-        binding_site_results["swinsite"] = swinsite_result
+    for pkt in swinsite_pockets:
+        rank = pkt["rank"]
+        src_name = f"swinsite_{rank}"
+        nearest_chain, nearest_d = _nearest_chain(pkt["center"], ca_atoms)
+        binding_site_results[src_name] = (
+            pkt["center"],
+            pkt["size"],
+            {
+                "score": pkt["score"],
+                "rank": rank,
+                "nearest_protein_chain": nearest_chain,
+                "nearest_ca_distance": round(nearest_d, 2),
+            },
+        )
 
-    # 4c. P2Rank (surface geometry-based)
+    # 4c. P2Rank top-K (surface geometry-based)
     if not args.no_p2rank:
         print("  Running P2Rank binding site prediction...")
-        p2rank_result = run_p2rank(
+        p2rank_pockets = run_p2rank(
             pdb_path, args.output_dir,
             reuse_cache=args.reuse_binding_site_cache,
         )
-        if p2rank_result:
-            binding_site_results["p2rank"] = p2rank_result
+        for pkt in p2rank_pockets:
+            rank = pkt["rank"]
+            src_name = f"p2rank_{rank}"
+            nearest_chain, nearest_d = _nearest_chain(pkt["center"], ca_atoms)
+            binding_site_results[src_name] = (
+                pkt["center"],
+                pkt["size"],
+                {
+                    "score": pkt["score"],
+                    "rank": rank,
+                    "nearest_protein_chain": nearest_chain,
+                    "nearest_ca_distance": round(nearest_d, 2),
+                },
+            )
 
     # 4d. Template-consensus pockets (mmseqs+foldseek union → bound-ligand
     #     centroids → spatial cluster). Each top-K cluster centroid becomes
@@ -898,19 +1013,32 @@ def main() -> int:
     consensus_sources = _add_template_consensus_sources(args.run_dir, binding_site_results)
     if consensus_sources:
         print(f"  Template-consensus pockets: {consensus_sources}")
+        # Tag the consensus sources too so post-analysis can attribute them
+        # to the right chain on multi-chain receptors.
+        for src in consensus_sources:
+            entry = binding_site_results.get(src)
+            if not (isinstance(entry, tuple) and len(entry) >= 3 and entry[2] is not None):
+                continue
+            center, size, meta = entry
+            nearest_chain, nearest_d = _nearest_chain(center, ca_atoms)
+            meta["nearest_protein_chain"] = nearest_chain
+            meta["nearest_ca_distance"] = round(nearest_d, 2)
 
     # Pick best for the *fallback* box_center (each source still gets its own
     # docking variant downstream — this picks only the legacy single-box
     # field). Strong template-consensus pockets (n_unique_pdb≥2) win over
     # swinsite/p2rank because multi-template agreement is the highest-quality
     # binding-site signal we have when seq+struct templates align. Within
-    # cofold sources, cofolding_1 (largest cluster) is preferred.
+    # cofold sources, cofolding_1 (largest cluster) is preferred. Ranked
+    # predictor variants (swinsite_1..3, p2rank_1..3) fall in after the
+    # strong-consensus block.
     priority = [f"cofolding_{i}" for i in range(1, COFOLD_CLUSTER_TOP_K + 1)]
     for src in consensus_sources:
         info = binding_site_results.get(src)
         if isinstance(info, tuple) and len(info) >= 3 and info[2].get("n_unique_pdb", 0) >= 2:
             priority.append(src)
-    priority += ["swinsite", "p2rank"]
+    priority += [f"swinsite_{i}" for i in range(1, POCKET_PREDICTOR_TOP_K + 1)]
+    priority += [f"p2rank_{i}" for i in range(1, POCKET_PREDICTOR_TOP_K + 1)]
     for src in consensus_sources:
         if src not in priority:
             priority.append(src)

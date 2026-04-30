@@ -318,8 +318,12 @@ def test_prepare_vina_and_validate_docking_stage(tmp_path: Path) -> None:
         "vina_cofolding_1",
         "vina_cofolding_2",
         "vina_cofolding_3",
-        "vina_swinsite",
-        "vina_p2rank",
+        "vina_swinsite_1",
+        "vina_swinsite_2",
+        "vina_swinsite_3",
+        "vina_p2rank_1",
+        "vina_p2rank_2",
+        "vina_p2rank_3",
         "vina_template_consensus_1",
         "vina_template_consensus_2",
         "vina_template_consensus_3",
@@ -481,17 +485,22 @@ def test_prepare_docking_run_combines_vina_and_protenix_dock(tmp_path: Path) -> 
     # Vina fans out into one variant per binding-site source:
     #   - 3 cofold-cluster sources (top-K of cofolding ligand clusters
     #     across 4 models × 25 seeds, registered as cofolding_{1,2,3})
-    #   - 2 predictor sources (swinsite, p2rank)
+    #   - 3 SwinSite ML predictor pockets (top-3, ranked by score so
+    #     multi-chain receptors expose chain-B/C equivalents at rank 2/3)
+    #   - 3 P2Rank geometry predictor pockets (top-3, same rationale)
     #   - 10 template-consensus pocket centroids (top-K cluster centers
     #     from mmseqs+foldseek union)
     expected_cofold = {f"vina_cofolding_{i}" for i in range(1, 4)}
+    expected_swinsite = {f"vina_swinsite_{i}" for i in range(1, 4)}
+    expected_p2rank = {f"vina_p2rank_{i}" for i in range(1, 4)}
     expected_consensus = {f"vina_template_consensus_{i}" for i in range(1, 11)}
     assert expected_cofold.issubset(set(model_names))
-    assert {"vina_swinsite", "vina_p2rank"}.issubset(set(model_names))
+    assert expected_swinsite.issubset(set(model_names))
+    assert expected_p2rank.issubset(set(model_names))
     assert expected_consensus.issubset(set(model_names))
     assert "protenix-dock" in model_names
-    # 15 vina variants + 1 protenix-dock; autodock_gpu disabled in this fixture.
-    assert len(prepared.model_runs) == 16
+    # 19 vina variants + 1 protenix-dock; autodock_gpu disabled in this fixture.
+    assert len(prepared.model_runs) == 20
 
 
 def test_write_example_config_includes_protenix_dock(tmp_path: Path) -> None:
