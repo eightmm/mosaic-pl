@@ -254,11 +254,19 @@ def build_shell_script(
                     f"timeout 1500 {rendered}"
                     f" || echo '  (protenix-dock timed out or failed, continuing)'"
                 )
+            # Re-create the stage output directory at runtime as well as
+            # prep time. ``adapters.prepare_template_search_*`` already
+            # makes the dir at prep, but if the user wipes ``outputs/`` and
+            # reruns the same wrapper (common during fix-and-retest cycles),
+            # mmseqs/foldseek then fail with "Cannot create temporary
+            # directory" because ``--tmp-dir outputs/.../tmp`` expects the
+            # parent. ``mkdir -p`` is a no-op when the dir already exists.
             lines.extend([
                 'echo ""',
                 'echo "================================================================"',
                 f'echo "  [{idx}/{total}] {name_upper}"',
                 'echo "================================================================"',
+                f"mkdir -p {shlex.quote(str(model_run.output_dir))}",
                 f"_start_{var_name}=$SECONDS",
                 rendered,
                 f'_elapsed_{var_name}=$(( SECONDS - _start_{var_name} ))',

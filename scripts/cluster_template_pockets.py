@@ -47,8 +47,27 @@ def _pocket_weight(p: dict) -> float:
     actual_tm = float(p.get("alignment_tmscore", 0.0) or 0.0)
     fold_tm = float(p.get("qtmscore", 0.0) or 0.0)
     seq_sim = float(p.get("pident", 0.0) or 0.0) / 100.0
-    sim = max(actual_tm, fold_tm, seq_sim)
-    return float(sources + sim)
+    struct_sim = max(actual_tm, fold_tm, seq_sim)
+
+    # Ligand similarity to the query (target SMILES) — boosts clusters where
+    # homologous proteins were crystallised with chemically similar ligands.
+    # That's a strong "same-binding-site" signal: even when two folds share
+    # the global TM-score they may have diverged into different substrates,
+    # and the cluster whose ligands match the query is the one most likely
+    # to mark the actual site we want to dock against.
+    # ``best_tanimoto`` (Morgan FP, [0,1]) captures global chemotype overlap;
+    # ``best_mcs_coverage`` (MCS atoms / min(target, template) heavy atoms)
+    # captures shared scaffold size. We use ``max`` of the two so a small
+    # fragment with high MCS isn't penalised by a low fingerprint Tanimoto
+    # (and a large flexible compound with high Tanimoto isn't penalised by
+    # a tiny MCS).
+    tanimoto = float(p.get("best_tanimoto", 0.0) or 0.0)
+    mcs_cov = float(p.get("best_mcs_coverage", 0.0) or 0.0)
+    lig_sim = max(tanimoto, mcs_cov)
+
+    # Additive — keeps each signal's contribution independently inspectable
+    # in evidence_score. Range ≈ [0, 4]: sources 0-2, struct_sim 0-1, lig 0-1.
+    return float(sources + struct_sim + lig_sim)
 
 
 def _euclid(a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
@@ -56,46 +75,59 @@ def _euclid(a: tuple[float, float, float], b: tuple[float, float, float]) -> flo
 
 
 def _cluster_pockets(pockets: list[dict], cutoff: float) -> list[dict]:
-    """Greedy agglomerative clustering: each new pocket joins the *first*
-    existing cluster whose centroid is within ``cutoff`` Å, otherwise spawns
-    a new cluster. The order of input matters — the extract step already
-    sorts by evidence (both-source > one-source > qtm/pident), so seed
-    clusters favor strong evidence.
+    """Hierarchical agglomerative single-link clustering.
+
+    Greedy first-match (the previous algorithm) drifts the running centroid
+    as members get added, so two pockets seeded into separate clusters can
+    end up with centroids closer than ``cutoff`` (validated 2026-05-02 on
+    7hqq: clusters #1 ↔ #4 ended up 2.95 Å apart with cutoff=5 Å — same
+    binding site, two redundant cluster slots).
+
+    Single-link agglomerative builds the full distance matrix once and
+    merges any two clusters whose closest member-pair is below ``cutoff``,
+    so by construction the final clusters' member-pair distances are all
+    strictly above ``cutoff`` between any two distinct clusters. Final
+    centroid is the evidence-weighted mean of the cluster members.
     """
     if not pockets:
         return []
+    if len(pockets) == 1:
+        p = pockets[0]
+        return [{
+            "_centroid": (p["centroid_x"], p["centroid_y"], p["centroid_z"]),
+            "_members": [p],
+            "_weights": [_pocket_weight(p)],
+        }]
 
-    clusters: list[dict] = []
-    for p in pockets:
-        center = (p["centroid_x"], p["centroid_y"], p["centroid_z"])
-        weight = _pocket_weight(p)
-        joined = False
-        for cl in clusters:
-            if _euclid(center, cl["_centroid"]) <= cutoff:
-                cl["_members"].append(p)
-                cl["_weights"].append(weight)
-                # Re-compute weighted centroid incrementally
-                total_w = sum(cl["_weights"])
-                if total_w == 0:
-                    total_w = len(cl["_weights"])  # fallback to unweighted
-                    cl["_centroid"] = tuple(
-                        sum(m[k] for m in cl["_members"]) / len(cl["_members"])
-                        for k in ("centroid_x", "centroid_y", "centroid_z")
-                    )
-                else:
-                    cl["_centroid"] = tuple(
-                        sum(m[k] * w for m, w in zip(cl["_members"], cl["_weights"])) / total_w
-                        for k in ("centroid_x", "centroid_y", "centroid_z")
-                    )
-                joined = True
-                break
-        if not joined:
-            clusters.append({
-                "_centroid": center,
-                "_members": [p],
-                "_weights": [weight],
-            })
-    return clusters
+    import numpy as np
+    from scipy.cluster.hierarchy import linkage, fcluster
+    from scipy.spatial.distance import pdist
+
+    coords = np.array([(p["centroid_x"], p["centroid_y"], p["centroid_z"]) for p in pockets])
+    Z = linkage(pdist(coords), method="single")
+    labels = fcluster(Z, t=cutoff, criterion="distance")
+
+    label_to_cluster: dict[int, dict] = {}
+    for label, p in zip(labels, pockets):
+        cl = label_to_cluster.setdefault(int(label), {"_members": [], "_weights": []})
+        cl["_members"].append(p)
+        cl["_weights"].append(_pocket_weight(p))
+
+    out: list[dict] = []
+    for cl in label_to_cluster.values():
+        members = cl["_members"]; weights = cl["_weights"]
+        total_w = sum(weights)
+        if total_w == 0:
+            cx = sum(m["centroid_x"] for m in members) / len(members)
+            cy = sum(m["centroid_y"] for m in members) / len(members)
+            cz = sum(m["centroid_z"] for m in members) / len(members)
+        else:
+            cx = sum(m["centroid_x"] * w for m, w in zip(members, weights)) / total_w
+            cy = sum(m["centroid_y"] * w for m, w in zip(members, weights)) / total_w
+            cz = sum(m["centroid_z"] * w for m, w in zip(members, weights)) / total_w
+        cl["_centroid"] = (cx, cy, cz)
+        out.append(cl)
+    return out
 
 
 def _summarize(clusters: list[dict]) -> list[dict]:
@@ -122,6 +154,12 @@ def _summarize(clusters: list[dict]) -> list[dict]:
         best_qtm = max((float(m.get("qtmscore", 0.0) or 0.0) for m in members), default=0.0)
         best_pident = max((float(m.get("pident", 0.0) or 0.0) for m in members), default=0.0)
         best_tanimoto = max((float(m.get("best_tanimoto", 0.0) or 0.0) for m in members), default=0.0)
+        best_mcs = max((float(m.get("best_mcs_coverage", 0.0) or 0.0) for m in members), default=0.0)
+        # Cluster-level ligand similarity ≡ max(member tanimoto, member MCS).
+        # Folded into ``evidence_score`` already (via _pocket_weight) but
+        # exposed here so downstream consumers (docking-prep box selection,
+        # ranker training data) can filter on the lig-sim signal directly.
+        best_lig_sim = max(best_tanimoto, best_mcs)
         out.append({
             "centroid": [round(c[0], 3), round(c[1], 3), round(c[2], 3)],
             "n_members": n,
@@ -136,6 +174,8 @@ def _summarize(clusters: list[dict]) -> list[dict]:
             "best_qtmscore": round(best_qtm, 3),
             "best_pident": round(best_pident, 1),
             "best_tanimoto": round(best_tanimoto, 3),
+            "best_mcs_coverage": round(best_mcs, 3),
+            "best_ligand_similarity": round(best_lig_sim, 3),
             "members": [
                 {
                     "template_pdb_id": m.get("template_pdb_id"),
@@ -184,6 +224,23 @@ def main() -> int:
              "filtering singletons via n_members floor).",
     )
     parser.add_argument("--output-json", type=Path, default=None)
+    parser.add_argument(
+        "--surface-margin",
+        type=float,
+        default=10.0,
+        help="Drop pocket centroids whose nearest-protein-heavy-atom "
+             "distance exceeds this (Å). Shape-following filter — uses "
+             "per-pocket KDTree query against the cofold receptor heavy "
+             "atoms, so it tracks the protein surface (no axis-aligned "
+             "bbox dead corners on elongated folds). Catches multi-chain "
+             "template artifacts where USalign aligns one protomer but "
+             "the ligand belongs to another (centroid lands 50-200 Å "
+             "from any atom). 0 disables. 10 Å covers buried + surface "
+             "+ shallow-cleft pockets while excluding clearly-outlier "
+             "cases (validated on 7hqq: real binding pocket centroids "
+             "land 1.9-2.8 Å from the nearest atom; interface-style "
+             "candidates ~11 Å; chain-mismatch artifacts 20+ Å).",
+    )
     args = parser.parse_args()
 
     if not args.pockets_json.exists():
@@ -192,6 +249,43 @@ def main() -> int:
 
     data = json.loads(args.pockets_json.read_text())
     pockets = data.get("pockets") or []
+
+    if pockets and args.surface_margin > 0:
+        ref_cif = data.get("reference_cif")
+        if ref_cif and Path(ref_cif).exists():
+            try:
+                import gemmi
+                import numpy as np
+                from scipy.spatial import cKDTree
+                s = gemmi.read_structure(ref_cif)
+                pts = []
+                for model in s:
+                    for chain in model:
+                        for residue in chain:
+                            for atom in residue:
+                                if atom.element.atomic_number <= 1: continue
+                                pts.append((atom.pos.x, atom.pos.y, atom.pos.z))
+                    break
+                if pts:
+                    tree = cKDTree(np.asarray(pts))
+                    inside = []
+                    max_dist = 0.0
+                    for p in pockets:
+                        cx, cy, cz = p.get("centroid_x"), p.get("centroid_y"), p.get("centroid_z")
+                        if cx is None: continue
+                        d, _ = tree.query([cx, cy, cz], k=1)
+                        if d > max_dist: max_dist = d
+                        if d <= args.surface_margin:
+                            inside.append(p)
+                    n_dropped = len(pockets) - len(inside)
+                    if n_dropped > 0:
+                        print(f"[cluster] surface filter (margin={args.surface_margin}Å): "
+                              f"dropped {n_dropped}/{len(pockets)} pockets too far from any "
+                              f"protein heavy atom (worst pocket was {max_dist:.1f} Å away)")
+                        pockets = inside
+                        data["pockets"] = pockets
+            except Exception as e:
+                print(f"[cluster] WARNING: surface filter skipped ({e})")
     raw_clusters: list[dict] = []
     if not pockets:
         print("[cluster] empty pocket list; emitting empty cluster set.")

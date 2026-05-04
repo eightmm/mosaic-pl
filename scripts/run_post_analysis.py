@@ -799,20 +799,42 @@ def main() -> int:
     # Run BA-Pred on each docking result
     print("\n=== BA-Pred (Binding Affinity) ===")
     ba_results = {}
+    ba_failed: list[str] = []
     for lig_name, lig_path in ligands.items():
         out = analysis_dir / f"ba_pred_{lig_name}.tsv"
         ok = run_prediction("BA-Pred", bapred_bin, primary_receptor, lig_path, out, args.device)
         if ok and out.exists():
             ba_results[lig_name] = out.read_text().strip()
+        else:
+            ba_failed.append(lig_name)
 
     # Run RMSD-Pred on each docking result
     print("\n=== RMSD-Pred (Pose RMSD) ===")
     rmsd_results = {}
+    rmsd_failed: list[str] = []
     for lig_name, lig_path in ligands.items():
         out = analysis_dir / f"rmsd_pred_{lig_name}.tsv"
         ok = run_prediction("RMSD-Pred", rmsdpred_bin, primary_receptor, lig_path, out, args.device)
         if ok and out.exists():
             rmsd_results[lig_name] = out.read_text().strip()
+        else:
+            rmsd_failed.append(lig_name)
+
+    # Surface ba/rmsd failures so silent skips don't get hidden between
+    # "FAILED" prints during long runs. The classic failure mode is a
+    # docking source whose box centre landed outside the protein (bad
+    # template-consensus cluster centroid → ligand 100+ Å from receptor →
+    # BA-Pred's mol_to_graph returns None → AttributeError). The cluster
+    # bbox filter should have stopped that upstream, but log explicitly
+    # here as a second line of defence.
+    n_total = len(ligands)
+    n_ba_ok = len(ba_results); n_rmsd_ok = len(rmsd_results)
+    print(f"\n=== Post-analysis tally: BA-Pred {n_ba_ok}/{n_total} ok, "
+          f"RMSD-Pred {n_rmsd_ok}/{n_total} ok ===")
+    if ba_failed:
+        print(f"  BA-Pred failed for {len(ba_failed)} sources: {sorted(ba_failed)}")
+    if rmsd_failed:
+        print(f"  RMSD-Pred failed for {len(rmsd_failed)} sources: {sorted(rmsd_failed)}")
 
     # Write summary
     summary = {
@@ -820,6 +842,8 @@ def main() -> int:
         "ligands": {k: str(v) for k, v in ligands.items()},
         "ba_pred": {k: str(analysis_dir / f"ba_pred_{k}.tsv") for k in ba_results},
         "rmsd_pred": {k: str(analysis_dir / f"rmsd_pred_{k}.tsv") for k in rmsd_results},
+        "ba_pred_failed": sorted(ba_failed),
+        "rmsd_pred_failed": sorted(rmsd_failed),
     }
     summary_path = analysis_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2) + "\n")

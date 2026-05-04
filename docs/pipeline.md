@@ -133,27 +133,40 @@ template-search-sequence (mmseqs)
 #### 1-3. Union filter (mmseqs ∪ foldseek)
 
 - **Script**: `scripts/run_template_filter.py`, module `src/casp17/template_filter.py`
-- **Logic**: 두 TSV 를 source 태깅 → `(pdb_id, chain_id)` dedup (한 row 가 양쪽 다 있으면 두 metric 모두 보존, `in_mmseqs=in_foldseek=1`) → `rcsb_index.db` 에서 candidate ligand (`ligand_type ∈ {small_molecule, cofactor, metabolite, nucleotide_like, peptide_like}`) 조회 → Tanimoto (Morgan FP r=2 / 2048 bit) + MCS coverage (`rdFMCS`, 5 s timeout) **저장만** 하고 게이트 안 함
+- **Logic**: 두 TSV 를 source 태깅 → `(pdb_id, chain_id)` dedup (한 row 가 양쪽 다 있으면 두 metric 모두 보존, `in_mmseqs=in_foldseek=1`) → `rcsb_index.db` 에서 candidate ligand (`ligand_type ∈ {small_molecule, cofactor, metabolite, nucleotide_like, peptide_like}`) 조회 → **Tanimoto (Morgan FP r=2 / 2048 bit) 만 metadata 로 저장** — gating 안 함. MCS 는 filter 에서 계산하지 않고 (`best_mcs_coverage = 0.0` placeholder), 실제 사용처인 Track 3 (lig-align) 가 picked template 한정으로 lazy 계산.
 - **Sort key**: `(in_mmseqs+in_foldseek 합 ↓, qtmscore ↓, pident ↓, n_ligands ↓, tanimoto ↓, mcs ↓)`
-- **Output**: `filtered_hits.tsv` — 기존 14 컬럼 + `in_mmseqs / in_foldseek / qtmscore / ttmscore / alntmscore / prob` 6 컬럼 append. 옛 consumer 들도 그대로 동작
+- **Output**: `filtered_hits.tsv` — 14 컬럼 + `in_mmseqs / in_foldseek / qtmscore / ttmscore / alntmscore / prob` 6 컬럼 append
 - **Time-split**: `template_search_sequence.max_deposition_date: "YYYY-MM-DD"` — held-out 벤치 (e.g. novel2025) 에서 leakage 차단
+
+**성능 구조**:
+
+- **RCSB sqlite 커넥션 재사용** — `filter_hits_with_ligands` 가 한 filter run 동안 단 한 번 `sqlite3.connect()` 하고 끝. `lookup_ligands` / `lookup_deposition_date` 둘 다 connection-or-path 오버로드라 호출 측이 커넥션을 넘김. 같은 `pdb_id` 가 여러 chain hit 으로 반복되는 경우를 위해 `ligand_cache` / `dep_cache` dict 도 함수 안에 둠 — pdb 당 sqlite query 1 회.
+- **Pre-baked Morgan FP cache** — `data/processed/ligand_fp_cache.db` (~12 MB sqlite, 49k CCDs). `casp17.ligand_fp_cache.LigandFPCache.get_fp(ccd_code)` 가 in-process dict → sqlite → SMILES on-demand 순으로 lookup. Miss 일 때 SMILES 로 계산해 `INSERT OR REPLACE` 하므로 새 CCD 가 들어와도 자동 흡수. Target 쪽 FP 는 `_compute_target_fp(target_smiles)` 가 filter run 시작 시점에 한 번 계산하고 모든 hit 비교에 재사용. RDKit FP 직렬화는 `ExplicitBitVect.ToBinary()` ↔ `ExplicitBitVect(bytes)` 라운드트립 — `CreateFromBinaryText` 는 다른 포맷이라 nBits 가 silent 192 로 깨지므로 사용 금지.
+- **FP cache 빌드 스크립트**: `.venv/bin/python scripts/build_ligand_fp_cache.py [--rcsb-db PATH] [--cache-db PATH]`. RCSB `ccd_components` 의 SMILES 모두 순회해 Morgan FP (radius=2, nBits=2048) 한 줄씩 적재 (~18 s). Idempotent — 동일 (ccd_code, fp_radius, fp_nbits) 키는 skip, 새/변경된 SMILES 만 갱신.
 
 #### 1-4. Template pocket extraction
 
 - **Script**: `scripts/extract_template_pockets.py`
 - **Alignment 도구**: `casp17.usalign.run_usalign` (`.local/bin/USalign`). 구조 기반 (TM-align) 이라 foldseek 이 hit 을 찾은 view 와 동일. distant homolog 도 정확히 align — gemmi 는 sequence-anchored 라 같은 fold 라도 sequence 멀면 matched residue <50 으로 떨어져 RMSD 가 폭발 → ligand centroid 가 엉뚱한 위치로 transform 됨
-- **Output**: `outputs/template_pockets/template_pockets.json` (flat list — 한 row = 한 ligand-instance pocket point. homotetramer 는 4 record). 필드: `template_pdb_id, template_chain, ligand_ccd, ligand_chain, ligand_n_heavy, centroid_(x|y|z)` (cofold frame) `, alignment_tmscore, alignment_rmsd, in_mmseqs, in_foldseek, pident, qtmscore, best_tanimoto, best_mcs_coverage`
+- **Chain-specific alignment** (`_extract_chain_pdb`): foldseek/mmseqs hit 은 `(pdb_id, chain_id)` 쌍으로 오고 `chain_id` 가 query fold 에 매칭된 protomer. multi-chain template 의 chain-mapping ambiguity 를 없애기 위해 host chain 의 polymer 원자만 단일-chain PDB 로 추출해 USalign reference 로 사용. PDB 포맷이 1-char chain id 만 허용하므로 추출 시 `"A"` 로 rename (`8qrt_CCC` 같은 multi-char asym id 도 동일하게 처리됨). 반환되는 R/t 는 그 protomer frame 으로 보장. Chain 이 CIF 에 없으면 (synthetic asym id, missing chain 등) whole-CIF alignment 로 fallback.
+- **Host-chain ligand 만 보존**: 정렬 후 ligand centroid 도 `lig.chain == host_chain` 인 것만 남김. 다른 protomer 의 ligand 는 다른 R/t 가 필요하므로 별도 hit row 로 들어옴. Host filter 가 모두 비우는 케이스 (single-chain CIF + synthetic asym id) 만 fallback 으로 ligand 전체 통과 — downstream cluster 단계의 surface-margin filter 가 잘못 transform 된 것을 정리.
+- **Output**: `outputs/template_pockets/template_pockets.json` (flat list — 한 row = 한 ligand-instance pocket point. homotetramer 는 4 record). 필드: `template_pdb_id, template_chain, ligand_ccd, ligand_chain, ligand_n_heavy, centroid_(x|y|z)` (cofold frame) `, alignment_tmscore, alignment_rmsd, in_mmseqs, in_foldseek, pident, qtmscore, best_tanimoto, best_mcs_coverage` + 최상단에 `reference_cif` (cluster 단계의 surface-margin filter 입력)
 - **Quality gate**: `--min-tmscore 0.4` (default). canonical 0.5 보다 약간 낮춰서 foldseek `qtmscore_min=0.5` 통과 hit 을 이중 penalise 하지 않음
 - **Default `--max-templates 2000`** — USalign 실측 ~0.5 s/template (300 aa 기준) × 2000 ≈ 17 min/타겟. foldseek `max_hits=2000` 와 매칭. 보통 단백질에서 TM ≥ 0.5 통과 template 50–300 개라 대부분은 게이트에서 reject — pool 확대해도 cluster 결과 안정적
 
 #### 1-5. Pocket clustering (top-K consensus)
 
 - **Script**: `scripts/cluster_template_pockets.py`
-- **Algorithm**: greedy first-match (each new pocket joins the *first* existing cluster whose running weighted centroid is within `--cutoff`; otherwise spawns new). Default cutoff **5.0 Å** (druglike pocket 직경 ~10–15 Å). 입력 순서가 결과에 영향 — extract 단계가 evidence-sorted 이라서 강한 hit 이 cluster seed 가 됨. *Lance-Williams 진짜 single-link 은 아니다*
-- **Per-pocket weight**: `(in_mmseqs + in_foldseek) + max(alignment_tmscore, qtmscore, pident/100)` — 범위 ≈ [0, 3]. mmseqs-only hit 은 foldseek qtm=0 이어도 USalign actual TM 으로 평가 받음
-- **Cluster centroid**: weighted mean (가중치 합 0 fallback 시 unweighted)
+- **Surface-margin pre-filter** (`--surface-margin`, default **10 Å**): cluster 직전에 cofold receptor 의 모든 heavy-atom 을 `scipy.spatial.cKDTree` 에 적재하고, 각 pocket centroid 의 nearest-protein-atom 거리를 query. `> margin` 이면 drop. 이는 multi-chain template 에서 USalign 이 한 protomer 만 align 했을 때 다른 protomer 의 ligand centroid 가 50–200 Å 떠 있는 케이스를 잡아냄. KDTree query 라 단순 axis-aligned bbox 가 못 보는 elongated fold 의 dead corner 에서도 작동. `0` 이면 비활성화. Reference CIF 는 `template_pockets.json` 의 최상단 `reference_cif` 필드에서 읽음.
+- **Algorithm**: hierarchical agglomerative single-link (`scipy.cluster.hierarchy.linkage(method="single")` + `fcluster(t=cutoff, criterion="distance")`). Pairwise pocket distance matrix 한 번 만들고, 멤버 페어 최단거리가 `cutoff` 미만인 두 cluster 를 모두 merge. **결과 cluster 들 사이의 멤버 페어 거리는 보장된 `> cutoff`** — 같은 binding site 가 cluster 간 redundancy 로 갈리지 않음.
+- **Cutoff**: `--cutoff` default **5.0 Å** (druglike pocket 직경 ~10–15 Å)
+- **Per-pocket weight** (`_pocket_weight`): `sources + struct_sim + lig_sim` — 범위 ≈ [0, 4].
+  - `sources = in_mmseqs + in_foldseek` (0 ~ 2)
+  - `struct_sim = max(alignment_tmscore, qtmscore, pident/100)` (0 ~ 1) — mmseqs-only hit 도 USalign actual TM 으로 평가됨
+  - `lig_sim = max(best_tanimoto, best_mcs_coverage)` (0 ~ 1) — query SMILES 와 chemical similarity. Tanimoto 는 fingerprint global 유사도, MCS coverage (filter 가 0 으로 두므로 cluster 단계에선 사실상 Tanimoto 만) 는 scaffold 공유 — `max` 로 작은 fragment-MCS 와 큰 분자 Tanimoto 둘 다 펜로 당겨짐. Lig-sim 부스트의 의미: 동일 fold 라도 ligand 가 query 와 chemically 닮은 cluster 가 진짜 active site 일 가능성이 큼.
+- **Cluster centroid**: weighted mean (`Σ w·xyz / Σ w`, w=0 fallback 시 unweighted)
 - **Cluster `evidence_score`**: `Σ weight`. 정렬 후 top-K (`--top-k 5` default) 보존
-- **Per-cluster metadata**: `n_members, n_unique_pdb, evidence_score, spread_angstrom, in_both_sources, in_mmseqs_only, in_foldseek_only, best_alignment_tmscore, best_qtmscore, best_pident, best_tanimoto`
+- **Per-cluster metadata**: `n_members, n_unique_pdb, evidence_score, spread_angstrom, in_both_sources, in_mmseqs_only, in_foldseek_only, best_alignment_tmscore, best_qtmscore, best_pident, best_tanimoto, best_mcs_coverage, best_ligand_similarity`
 - **Output**: `outputs/template_pockets/template_pocket_clusters.json` — 다음 단계 (`prepare_docking_inputs.py`) 가 읽어 `template_consensus_{1..10}` binding-site source 를 등록
 
 ---
@@ -177,6 +190,7 @@ template-search-sequence (mmseqs)
 - 리간드가 있으면 `properties.affinity` 자동 추가 (Boltz 전용)
 - Boltz: `prepare_boltz()` → `[boltz2 (use_potentials=false), boltz2x (use_potentials=true)]` 리스트 반환 → orchestrator 가 `*` 로 unpack
 - **AF3 chain id remap**: AF3 schema 가 `^[A-Z]+$` 만 허용. `L2`/`X2` 같은 숫자 포함 id 는 단일 letter 우선 → 미사용 letter (A..Z → AA..ZZ 순) 로 배정. `bondedAtomPairs` 의 chain 참조도 동일 remap. Boltz/Protenix 는 YAML id 그대로
+- **AF3 `templates` 필드 처리 (msa_pipeline 인지)**: `msa_pipeline.enabled=true` (default) 이면 wrapper 가 AF3 data pipeline (`run_alphafold.py --run_data_pipeline=true`) 을 먼저 돌려 hmmsearch 까지 실행 → 그 결과가 input JSON 의 `templates` 에 들어와야 함. 따라서 adapter 는 protein block 에 `templates` 키를 **세팅하지 않고 비워둠** (AF3 파서가 missing 키를 `None` 으로 읽음 → `pipeline.py` 에서 `run_template_search=not has_templates` 가 `True` 가 되어 hmmsearch 가 실제로 돈다). Legacy mode (`msa_pipeline.enabled=false`) 에서는 hmmsearch 가 안 도므로 adapter 가 `templates=[]` 로 명시적 빈 리스트를 박아 AF3 가 자체 fetch 시도하지 않게 함
 
 #### MSA 재사용 (cross-seed + cross-model)
 
@@ -229,6 +243,17 @@ Cofolding 출력에서 docking 입력을 자동 생성. `scripts/prepare_docking
 | PQR → protonated PDB | 자체 변환 | `receptor_protonated.pdb` | Protenix-Dock |
 | PQR → PDBQT | AD4 atom mapping + metal HETATM 재첨부 | `receptor.pdbqt` | Vina + AutoDock-GPU |
 
+**Per-ligand "ligand-aware" receptors (multi-ligand 타겟)**:
+
+Multi-ligand 타겟 (`len(dockable_chains) > 1`) 에서는 위 apo receptor 외에 ligand 별로 **다른 dockable ligand 의 cofold pose 를 정적 원자로 박은 receptor** 를 추가 생성:
+
+- 각 dockable ligand chain `<id>` 에 대해 `cif_to_pdb(structure, dockable_ligand_chains={id})` — 자기 chain 만 strip 하고 나머지 ligand chain 은 cofold 좌표 그대로 retain → `receptor_excl_<id>.pdb` + `.pdbqt`
+- `usable_ligands[i]` 의 `receptor_pdbqt` / `receptor_pdb` 필드에 그 ligand 전용 경로가 들어감
+- Vina/ADG 런타임 스크립트가 `lig.get('receptor_pdbqt') or receptor_pdbqt` 로 per-ligand receptor 를 우선 참조 — single-ligand 타겟은 `None` 이라 자동으로 top-level apo receptor 로 fallback
+- ADG 측은 추가로 `_parse_rec_types(lig_receptor)` 로 receptor atom type 도 ligand 별로 재파싱 (다른 ligand 가 박힌 receptor 라 새 AD4 type 이 추가될 수 있음)
+- 효과: ligand i 를 docking 할 때 ligand j 의 cofold pose 가 binding site 의 일부로 보여서 두 ligand 가 같은 pocket 으로 몰려가는 site competition error 가 자연 제거됨
+- Per-ligand receptor 빌드 실패 시 (gemmi/pdb2pqr edge case) 해당 ligand 만 apo receptor 로 fallback, 다른 ligand 는 그대로 진행
+
 **RNA/DNA receptor 자동 분기** (commit `efb9255`+):
 
 `pdb_to_pdbqt` 가 receptor PDB 의 nucleotide residue (A/U/G/C, DA/DT/DG/DC, RA/RU/RG/RC, T, DI/I) 감지 → `pdb2pqr` 우회하고 **`obabel -p 7.4 --partialcharge gasteiger -xr`** 단일 단계로 PDBQT 생성. 이유: pdb2pqr 의 AMBER FF 가 nucleotide parameterize 못 함 → 기존 path 면 RNA/DNA chain 통째로 silent drop.
@@ -272,8 +297,8 @@ Track 1 docking 의 box center 후보를 **3 카테고리 = 최대 19 개** 로 
 **Stage 2.5 frame alignment 가 100 cif 를 단일 reference frame 으로 align 한 다음**에 클러스터링하므로 좌표 비교가 의미를 가짐 (`align_cofolding_outputs.py::main` 이 `rglob("*.cif")` 으로 4 모델 × per-seed 모든 cif 를 align).
 
 등록 조건 (`prepare_docking_inputs.py::_extract_cofolding_ligand_clusters`):
-- **Dockable ligand chain 만 평균** (commit `28bd99f`+) — input YAML 에서 SMILES-bearing ligand chain id 를 추출 (`L`, `L2` 등) 해서 그 chain 의 heavy atom centroid 만 계산. 이전엔 모든 non-polymer 평균이라 metal/cofactor 가 centroid 를 끌어오는 오염 있었음 (21ii Mg²⁺ target 에서 입증)
-- **Dynamic MIN_MEMBERS** (commit `5fb2039`+) — `max(2, n_placements // 20)` (= 5 % of placements). 100 placement default 시 5; cofold seed × sample 변경 시 자동 scale
+- **Dockable ligand chain 만 평균** — input YAML 에서 SMILES-bearing ligand chain id (`L`, `L2` 등) 만 추려 그 chain 의 heavy atom centroid 로 placement 계산. metal/cofactor 같은 ccd-only entry 는 centroid 오염원이라 제외
+- **Dynamic min_members**: `max(2, n_placements // 20)` (= 5 % of placements). default 100 placement 면 5 ; seed × sample 변경 시 자동 scale. 함수가 `(clusters, diagnostics={"n_placements", "min_members"})` 를 반환해 `source_status` 에 기록됨
 - **`cutoff = 5.0 Å`** (= `COFOLD_CLUSTER_CUTOFF`) — template-pocket cluster 와 동일
 - **최대 3 개** (= `COFOLD_CLUSTER_TOP_K`) — `n_members` desc
 - 실제 등록 수:
@@ -342,7 +367,9 @@ PxDock 은 **default 비활성화** (`protenix_dock.enabled=false` since commit 
 | Protenix-Dock | (single, no fan-out) | CPU force field | ~5–30 min | `outputs/protenix_dock/poses_*.sdf + *_out.json` |
 
 - 모든 tool 은 `docking_prep_summary.json` 에서 receptor / ligand / box 를 runtime 에 읽음
-- AutoDock-GPU 래퍼는 추가로 **런타임에 ligand pdbqt + receptor pdbqt 둘 다 파싱**해서 `ligand_types` + `receptor_types` + grid map 동적 구성 (commit `efb9255`+). F/Cl/Br/P/I/Si 등 비표준 ligand atom 자동 대응 + RNA/DNA receptor 의 phosphate (P) + retain 된 metal (Mg/Zn/...) 가 receptor_types 에 자동 포함되어 autogrid4 의 `WARNING: receptor type X not in list` silent drop 방지
+- AutoDock-GPU 래퍼는 추가로 **런타임에 ligand pdbqt + receptor pdbqt 둘 다 파싱**해서 `ligand_types` + `receptor_types` + grid map 동적 구성. F/Cl/Br/P/I/Si 등 비표준 ligand atom 자동 대응 + RNA/DNA receptor 의 phosphate (P) + retain 된 metal (Mg/Zn/...) 가 receptor_types 에 자동 포함되어 autogrid4 의 `WARNING: receptor type X not in list` silent drop 방지
+- AutoDock-GPU 하드 캡: `nrun=100`, **`nev=1500000`**, **`--ngen=27000`** (max LGA generations), `--heuristics=1`, `--autostop=1`. autostop 이 막혀도 nev/ngen 이 worst-case wall-time 를 한정. config 키: `autodock_gpu.nev`, `autodock_gpu.ngen`
+- 멀티-리간드: 위 wrapper 는 `usable_ligands` 를 순회하며 `lig.get('receptor_pdbqt') or receptor_pdbqt` 로 per-ligand "ligand-aware" receptor 를 우선 사용 (Stage 3 참조)
 - PxDock 활성화 시 docking 시간의 ~77 % 차지 → default 비활성화
 - **Config**: `docking_seeds=[42,101,202,303,404]`. variant 자동
 
@@ -353,14 +380,16 @@ template 리간드 위치를 docking box 로. **Template ligand 가 query 와 �
 
 - **Script**: `scripts/prepare_template_docking.py` + `scripts/run_multi_track_docking.py`
 - **Logic**:
-  1. **Cluster-aware template selection** (default since `b7dd9d5`): `template_pockets.json` + `template_pocket_clusters.json` 의 각 cluster 마다 evidence-best representative template 1 개 픽 (`select_cluster_representative_templates`, `--max-templates 10` 까지). Track 1 `vina_template_consensus_1..10` 과 **같은 cluster set 을 cover** 하되 receptor 만 *experimental template* 으로 교체. 옛 `sort top-N` 은 pockets json 없을 때 fallback. Redundancy 제거 — 옛 sort top-3 은 종종 같은 cluster 의 alternate chain/conformation 만 dock 하던 문제 해결
-  2. RCSB CIF → receptor PDB/PDBQT (gemmi + pdb2pqr, **metal/cofactor retain** — Stage 3 와 동일 logic. **Strip 규칙은 CCD-based** (commit `28bd99f`+) — `ligand_codes` 의 CCD 만 strip, HEM/NAD/FAD 같은 cofactor 는 정확히 retain. RNA/DNA template 은 obabel 분기)
-  3. **USalign template → cofold frame transform** 계산 → template CIF 의 모든 atom 에 적용 → receptor 와 box 좌표가 cofold receptor 와 같은 좌표계
-  4. Template 리간드 bound-pose SDF 추출 (`extract_template_ligand_sdf()`)
-  5. Target SMILES → SDF/PDBQT (RDKit + meeko)
-  6. **Multi-ligand expansion** (commit `5fb2039`+) — 각 dockable target ligand (input YAML 의 SMILES-bearing entry) 별로 dock 실행. ccd-only entry (metal/ion 등) 는 prep 단계에서 skip 되어 dock loop 도달 안 함. Output 명명: `outputs/template_docking/<pdb_id>/<tool>/ligand_<lig_id>/...`. Vina + ADG 실행 (PxDock 은 default 비활성화)
+  1. **Cluster-aware template selection**: `template_pockets.json` + `template_pocket_clusters.json` 의 각 cluster 마다 evidence-best representative template 1 개 픽 (`select_cluster_representative_templates`, `--max-templates 10` 까지). Track 1 `vina_template_consensus_1..10` 과 **같은 cluster set 을 cover** 하되 receptor 만 *experimental template* 으로 교체. pockets json 없을 때만 sort top-N fallback.
+  2. **PDB-id dedup** (`run_multi_track_docking.py`): cluster representative 가 같은 PDB 를 두 cluster 에서 동시에 가리키는 경우 (인접 pocket 이 같은 구조로 cover 되는 케이스) 두 번째부터는 skip. `multi_track_summary.json` 에 중복 row 가 박히는 것을 방지. dedup 후 남은 unique template 만 Track 2/3 진행
+  3. RCSB CIF → receptor PDB/PDBQT (gemmi + pdb2pqr, **metal/cofactor retain** — Stage 3 와 동일 logic. Strip 규칙은 CCD-based — `ligand_codes` 의 CCD 만 strip, HEM/NAD/FAD 같은 cofactor 는 retain. RNA/DNA template 은 obabel 분기)
+  4. **pdb2pqr 실패 시 obabel fallback**: pdb2pqr 가 nonstandard residue / missing atom / unusual altloc 으로 죽는 template (4v8w, 6gjc 류) 에서 `obabel -p 7.4 --partialcharge gasteiger -xr` 로 PDBQT 직접 생성. obabel 까지 실패하면 `RuntimeError` raise → caller (`prepare_template_docking.main`) 가 그 template 만 skip (`Skipping Track 2 docking for template <pdb>`). 거대 biological assembly (예: 5BP4 의 ~260 k 원자) 처럼 어떤 도구도 못 처리하는 케이스에 silent broken PDBQT 가 만들어지지 않도록 명시적으로 raise 하는 구조
+  5. **USalign template → cofold frame transform** 계산 → template CIF 의 모든 atom 에 적용 → receptor 와 box 좌표가 cofold receptor 와 같은 좌표계
+  6. Template 리간드 bound-pose SDF 추출 (`extract_template_ligand_sdf()`)
+  7. Target SMILES → SDF/PDBQT (RDKit + meeko)
+  8. **Multi-ligand expansion** — 각 dockable target ligand (input YAML 의 SMILES-bearing entry) 별로 dock 실행. ccd-only entry (metal/ion 등) 는 prep 단계에서 skip. Output 명명: `outputs/template_docking/<pdb_id>/<tool>/ligand_<lig_id>/...`. Vina + ADG 실행 (PxDock 은 default 비활성화)
 - **MCS 게이트 없음**: `check_template_hits` 는 `num_ligands > 0` 만 검사
-- **Frame fix (commit `e16cb8c`)**: 이전엔 docked pose 가 template frame 에 머물러 cofold receptor 와 mis-aligned → BA-Pred 입력 / 최종 MODEL block 좌표 깨짐. USalign template→cofold transform 으로 fix. Track 1 의 `vina_template_consensus_*` 와 box 좌표 매칭됨
+- **Frame**: docked pose 는 USalign template→cofold transform 으로 cofold receptor 좌표계에 들어옴 → BA-Pred 입력 / 최종 MODEL block 모두 동일 frame. Track 1 의 `vina_template_consensus_*` 와 box 좌표 매칭
 
 > **Track 1 vina_template_consensus_N ↔ Track 2 cluster N representative 의 차이**: box 는 동일 (cluster N centroid 근처), receptor 만 다름. Track 1 = cofold (predicted) receptor, Track 2 = experimental template receptor (USalign-transformed to cofold frame). Cofold protein 이 정확하면 Track 1 의 cofold receptor 가 valid, cofold 가 wrong fold 면 Track 2 의 experimental conformation 이 backup. novel2025 batch 에서 Track 2 family 의 native rate 가 낮아 (~2.2 %) ROI 회의적이지만 multi-chain receptor 에서 cluster-aware 가 효과 있을지 측정 대기.
 
@@ -404,6 +433,7 @@ Input YAML 에 ion CCD 엔티티 (ZN/MG/CA/FE 등) 가 있으면 자동 실행. 
 
 - **Script**: `scripts/collect_template_ions.py`
 - **Logic**: target ion 보유 template (rcsb_index.db) → gemmi CA superposition (template → cofold) → rotation/translation 을 ion 좌표에 적용 → distance clustering (default 2.0 Å) → confidence 그룹별 (high `pident≥70%`, medium 50–70 %, low 30–50 %) 리포트
+- **Reference cofold CIF**: `find_best_cofolding_structure` 가 우선 `*_aligned.cif` (Stage 2.5 출력) 을 픽 → 모든 ion 좌표가 docking pose / 최종 MODEL 과 동일 frame 으로 들어감. Aligned CIF 없을 때만 unaligned cofold 출력으로 fallback (안전망)
 - **Output**: `outputs/ion_placement/ion_placement_summary.json`
 - **Auto skip**: input 에 ion 없으면 미실행
 - **Receptor 와의 관계**: 이 stage 는 docking 결과에 직접 inject 안 됨. Cofold 가 metal 위치 잘 잡았으면 Stage 3 의 metal retain 으로 docking 이 metal coordinator 인식. Cofold metal 위치가 의심스러울 땐 이 ion placement 결과로 alternate 좌표 검토 가능
@@ -450,7 +480,9 @@ BA-Pred 와 RMSD-Pred 는 SDF `_Name` 처리 규칙이 다름 (BA 는 raw, RMSD 
 - `outputs/analysis/{vina,autodock_gpu}_poses.txt` — per-tool 입력 리스트
 - `outputs/analysis/ba_pred_<tool>.tsv` — per-pose pKd
 - `outputs/analysis/rmsd_pred_<tool>.tsv` — per-pose pRMSD, P(>2 Å)
-- `outputs/analysis/summary.json`
+- `outputs/analysis/summary.json` — `ba_pred` / `rmsd_pred` 성공 source map + **`ba_pred_failed` / `rmsd_pred_failed` 명시적 source 리스트** (long run 에서 silent skip 안 잃기 위한 second line of defense)
+
+`run_post_analysis.py` 가 BA-Pred / RMSD-Pred 마무리 직후 `=== Post-analysis tally: BA-Pred N/M ok, RMSD-Pred N/M ok ===` 라인을 찍고, 실패 source 가 있으면 sorted 리스트 출력. 전형적 실패 모드: docking source 의 box centroid 가 protein 바깥에 떨어져 ligand 가 100 Å 이상 떠 → BA-Pred 의 `mol_to_graph` 가 `None` 반환 → `AttributeError`. Cluster surface-margin filter 가 1 차로 막지만 두 번째 방어선으로 여기에서 명시적으로 로깅.
 
 ---
 
@@ -563,9 +595,9 @@ echo "----------------------"
 | Boltz MSA cross-seed *(legacy)* | Boltz seed 1 → 이후 seed + Boltz-2x | `script_builder.py` (인라인) | msa_pipeline OFF 일 때만; seed 1 의 `msa/` 디렉토리 재사용 |
 | Boltz MSA → Protenix *(legacy)* | Boltz → Protenix | `script_builder.py` (heredoc) | msa_pipeline OFF fallback — Boltz `uniref.a3m` → Protenix `unpairedMsaPath` |
 | Boltz MSA → AF3 *(legacy)* | Boltz → AF3 | `bridge_boltz_msa_to_af3.py` | msa_pipeline OFF fallback — CSV → A3M + JSON 패치 (`pairedMsa=""`, `templates=[]`) |
-| **Template filter (union)** | mmseqs + foldseek 끝난 후 | **`run_template_filter.py`** | mmseqs ∪ foldseek by `(pdb_id, chain_id)` |
-| **Template pocket extraction** | filter 직후 | **`extract_template_pockets.py`** | USalign per hit → bound-ligand centroid → cofold frame |
-| **Template pocket clustering** | extraction 직후 | **`cluster_template_pockets.py`** | greedy first-match (running weighted centroid), 5 Å, top-K → `template_consensus_*` source |
+| **Template filter (union)** | mmseqs + foldseek 끝난 후 | **`run_template_filter.py`** | mmseqs ∪ foldseek by `(pdb_id, chain_id)`, FP-cache backed Tanimoto |
+| **Template pocket extraction** | filter 직후 | **`extract_template_pockets.py`** | chain-only USalign per hit → host-chain bound-ligand centroid → cofold frame |
+| **Template pocket clustering** | extraction 직후 | **`cluster_template_pockets.py`** | surface-margin (KDTree) pre-filter → scipy single-link agglomerative (5 Å) → top-K → `template_consensus_*` source |
 | **Frame alignment** | cofolding 끝, docking 직전 | **`align_cofolding_outputs.py`** | Kabsch CA → `*_aligned.cif` |
 | Docking prep | alignment → docking | `prepare_docking_inputs.py` | 모델 자동 선택 + 최대 19 binding-site source (≤3 cofold cluster + ≤6 predictor top-K + ≤10 consensus) 등록 + 파일 변환 |
 | Multi-track docking | docking 직후 (조건부) | `run_multi_track_docking.py` | Track 2 (any template) + Track 3 (MCS ≥ 0.5). Multi-char chain id 단일 letter 정규화 |
@@ -666,7 +698,15 @@ gantt
 | `src/casp17/geometry.py` | `parse_ca`, `kabsch`, `transform_mol`, `reassign_bonds`, `mol_from_mdl_body`, `pose_rmsd` (symmetry-aware RDKit `CalcRMS`) | 포즈 align / RMSD |
 | `src/casp17/lg_format.py` | `parse_lg` (multi-MODEL LG 파서 — ATOM/HETATM/TER + MDL body + `LSCORE`/`AFFNTY`/`LIGAND` 분리) | LG 파일 read 측 |
 | `src/casp17/template_filter.py` | `parse_mmseqs_hits`, `parse_foldseek_hits`, `filter_hits_with_ligands` | template union filter |
+| `src/casp17/ligand_fp_cache.py` | `LigandFPCache(db_path, radius=2, nbits=2048).get_fp(ccd_code, smiles=None)` + `tanimoto(fp_a, fp_b)` | sqlite 백업 Morgan FP 캐시 (template_filter 의 hot path 단축) |
 | `src/casp17/usalign.py` | `run_usalign` (`.local/bin/USalign` 래퍼) | template / receptor align |
+
+**Standalone analysis tools** (manual, 파이프라인이 자동으로 호출하지 않음):
+
+| Script | 용도 |
+|---|---|
+| `scripts/analyze_batch_rmsd.py` | 배치 단위 pose-pool RMSD 분석. 각 타겟의 `outputs/analysis/poses/` 모든 staged SDF vs 결정구조 native ligand 의 symmetric RMSD (`rdMolAlign.CalcRMS` + `AssignBondOrdersFromTemplate` — atom permutation 자동 처리). USalign 으로 crystal chain A → cofold reference 정렬, gemmi 로 native ligand instance 를 PDB 직렬화 후 RDKit 에 다시 로드 (hand-rolled PDB writer 의 RDKit-parser breakage 회피). zone 별 generation success rate (oracle <2 Å, <1 Å) 와 ranker gap 계산용 |
+| `scripts/build_ligand_fp_cache.py` | RCSB `ccd_components` 의 SMILES 49k 개 → Morgan FP cache sqlite 빌드 (~18 s). RCSB DB 갱신 시 재실행 |
 
 ### 3-5. Held-out benchmarks
 
@@ -710,8 +750,9 @@ experiments/runs/<target>/
 │   ├── alphafold3_input.json                       # AF3 JSON (+ MSA from Boltz bridge)
 │   ├── docking/
 │   │   ├── docking_prep_summary.json                 # receptor / ligand / box paths + binding_site_predictions (≤19 sources) + source_status (silent-skip diagnostic)
-│   │   ├── receptor.pdb / .pdbqt / receptor_protonated.pdb  (metal/cofactor retained)
-│   │   ├── ligand_L.sdf / .pdbqt
+│   │   ├── receptor.pdb / .pdbqt / receptor_protonated.pdb  (metal/cofactor retained, apo)
+│   │   ├── receptor_excl_<chain>.pdb / .pdbqt        # per-ligand "ligand-aware" receptor (multi-ligand only — others' cofold poses retained as static atoms)
+│   │   ├── ligand_<chain>.sdf / .pdbqt
 │   │   ├── p2rank/                                   # P2Rank pocket predictions
 │   │   └── swinsite/                                 # SwinSite pocket predictions
 │   └── template_docking/                           # Track 2 inputs (any template, no MCS gate)

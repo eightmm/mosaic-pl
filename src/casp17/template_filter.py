@@ -52,45 +52,23 @@ class TemplateHit:
     prob: float = 0.0          # foldseek HMM probability
 
 
-def _compute_ligand_similarity(
-    target_smiles: str, template_smiles: str
-) -> tuple[float, float]:
-    """Compute Tanimoto similarity and MCS coverage between two SMILES.
+def _compute_target_fp(target_smiles: str | None):
+    """Compute the query (target) Morgan FP once per filter run.
 
-    Returns:
-        (tanimoto, mcs_coverage) where both are in [0, 1].
-        mcs_coverage = MCS_atoms / min(target_atoms, template_atoms).
+    Returns ``None`` if the SMILES doesn't parse — callers treat that as
+    "no ligand-similarity signal available" and skip the per-hit lookup.
     """
+    if not target_smiles:
+        return None
     try:
-        from rdkit import Chem, DataStructs
-        from rdkit.Chem import AllChem, rdFMCS
-
-        mol_t = Chem.MolFromSmiles(target_smiles)
-        mol_q = Chem.MolFromSmiles(template_smiles)
-        if mol_t is None or mol_q is None:
-            return 0.0, 0.0
-
-        # Tanimoto (Morgan fingerprint, radius=2)
-        fp_t = AllChem.GetMorganFingerprintAsBitVect(mol_t, 2, nBits=2048)
-        fp_q = AllChem.GetMorganFingerprintAsBitVect(mol_q, 2, nBits=2048)
-        tanimoto = DataStructs.TanimotoSimilarity(fp_t, fp_q)
-
-        # MCS coverage
-        mcs = rdFMCS.FindMCS(
-            [mol_t, mol_q],
-            timeout=5,
-            atomCompare=rdFMCS.AtomCompare.CompareElements,
-            bondCompare=rdFMCS.BondCompare.CompareOrder,
-        )
-        if mcs.numAtoms > 0:
-            min_atoms = min(mol_t.GetNumHeavyAtoms(), mol_q.GetNumHeavyAtoms())
-            mcs_coverage = mcs.numAtoms / max(min_atoms, 1)
-        else:
-            mcs_coverage = 0.0
-
-        return round(tanimoto, 4), round(min(mcs_coverage, 1.0), 4)
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+        mol = Chem.MolFromSmiles(target_smiles)
+        if mol is None:
+            return None
+        return AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=2048)
     except Exception:
-        return 0.0, 0.0
+        return None
 
 
 def parse_mmseqs_hits(tsv_path: Path) -> list[dict[str, str]]:
@@ -157,39 +135,60 @@ def parse_foldseek_hits(tsv_path: Path) -> list[dict[str, str]]:
     return hits
 
 
-def lookup_ligands(db_path: Path, pdb_id: str) -> list[LigandHit]:
-    """Look up ligand instances for a PDB ID from the RCSB index DB."""
-    conn = sqlite3.connect(str(db_path))
-    cur = conn.cursor()
-    cur.execute(
-        """SELECT ccd_code, ligand_type, is_candidate, smiles,
-                  molecular_weight, contact_chain_ids
-           FROM ligand_instances
-           WHERE pdb_id = ? AND is_candidate = 1""",
-        (pdb_id.lower(),),
-    )
-    results = [
-        LigandHit(
-            pdb_id=pdb_id.lower(),
-            ccd_code=row[0],
-            ligand_type=row[1],
-            is_candidate=bool(row[2]),
-            smiles=row[3],
-            molecular_weight=row[4],
-            contact_chain_ids=row[5],
+def lookup_ligands(conn_or_path, pdb_id: str) -> list[LigandHit]:
+    """Look up ligand instances for a PDB ID from the RCSB index DB.
+
+    Accepts either an open ``sqlite3.Connection`` or a path. The connection
+    overload is the hot path: ``filter_hits_with_ligands`` can be called
+    with 1500+ hits, and opening a fresh ``sqlite3.connect`` per hit was
+    burning 5-20 ms × N_hits in pure connection setup overhead — visible
+    as 16× slowdown when 11 jobs ran concurrently. Pass an already-open
+    connection to amortise that to a single setup per filter run.
+    """
+    if isinstance(conn_or_path, sqlite3.Connection):
+        conn = conn_or_path
+        owns_conn = False
+    else:
+        conn = sqlite3.connect(str(conn_or_path))
+        owns_conn = True
+    try:
+        cur = conn.execute(
+            """SELECT ccd_code, ligand_type, is_candidate, smiles,
+                      molecular_weight, contact_chain_ids
+               FROM ligand_instances
+               WHERE pdb_id = ? AND is_candidate = 1""",
+            (pdb_id.lower(),),
         )
-        for row in cur.fetchall()
-    ]
-    conn.close()
+        results = [
+            LigandHit(
+                pdb_id=pdb_id.lower(),
+                ccd_code=row[0],
+                ligand_type=row[1],
+                is_candidate=bool(row[2]),
+                smiles=row[3],
+                molecular_weight=row[4],
+                contact_chain_ids=row[5],
+            )
+            for row in cur.fetchall()
+        ]
+    finally:
+        if owns_conn:
+            conn.close()
     return results
 
 
-def lookup_deposition_date(db_path: Path, pdb_id: str) -> str | None:
+def lookup_deposition_date(conn_or_path, pdb_id: str) -> str | None:
     """Return the ISO ``deposition_date`` for a PDB entry, or ``None`` if not
     indexed. Used by ``filter_hits_with_ligands`` to drop post-cutoff templates
     for time-split experiments (e.g. exclude 2025+ structures when benchmarking
-    on held-out 2025 targets)."""
-    conn = sqlite3.connect(str(db_path))
+    on held-out 2025 targets). Accepts a connection or path — the connection
+    overload reuses an open connection across all hits in the filter loop."""
+    if isinstance(conn_or_path, sqlite3.Connection):
+        conn = conn_or_path
+        owns_conn = False
+    else:
+        conn = sqlite3.connect(str(conn_or_path))
+        owns_conn = True
     try:
         cur = conn.execute(
             "SELECT deposition_date FROM entries WHERE pdb_id = ?",
@@ -197,7 +196,8 @@ def lookup_deposition_date(db_path: Path, pdb_id: str) -> str | None:
         )
         row = cur.fetchone()
     finally:
-        conn.close()
+        if owns_conn:
+            conn.close()
     return row[0] if row and row[0] else None
 
 
@@ -261,6 +261,18 @@ def filter_hits_with_ligands(
         raise ValueError("filter_hits_with_ligands: must provide at least one of hits_tsv or foldseek_tsv")
     if db_path is None:
         raise ValueError("filter_hits_with_ligands: db_path is required")
+
+    # Pre-compute the target FP once + open the CCD-keyed Morgan FP cache.
+    # MCS used to be metadata here too (rdFMCS.FindMCS per hit × candidate)
+    # but that blew up to 30-90 min per target on 20-30 atom drug ligands;
+    # MCS only actually gates Track 3 lig-align downstream, where the
+    # candidates are already filtered to a handful — compute lazily there.
+    # Tanimoto via cache-resident Morgan FPs is O(1) lookup + ~1ms per
+    # comparison, so the whole filter runs in seconds regardless of the
+    # query molecule's size.
+    from casp17.ligand_fp_cache import LigandFPCache, tanimoto as _tanimoto
+    _target_fp = _compute_target_fp(target_smiles)
+    _fp_cache = LigandFPCache()
 
     raw_hits: list[dict[str, str]] = []
     if hits_tsv is not None and Path(hits_tsv).exists():
@@ -327,59 +339,77 @@ def filter_hits_with_ligands(
     results: list[TemplateHit] = []
     date_skipped = 0
 
-    for slot in merged.values():
-        pdb_id = slot["pdb_id"]
-        if max_deposition_date:
-            dep = lookup_deposition_date(db_path, pdb_id)
-            if dep and dep >= max_deposition_date:
-                date_skipped += 1
-                continue
+    # Open one RCSB connection for the whole filter run, plus a tiny
+    # per-PDB cache. lookup_ligands used to ``sqlite3.connect`` per hit
+    # — at 1500 hits × 5-20 ms setup that already added ~15 s on its own,
+    # but with N concurrent jobs the OS-level open/close churn pushed
+    # filter wall-time from 5 min (single) to >1 h (×11 jobs). One conn
+    # + dict cache collapses both axes back to a few seconds.
+    rcsb_conn = sqlite3.connect(str(db_path))
+    ligand_cache: dict[str, list[LigandHit]] = {}
+    dep_cache: dict[str, str | None] = {}
+    try:
+        for slot in merged.values():
+            pdb_id = slot["pdb_id"]
+            if max_deposition_date:
+                if pdb_id not in dep_cache:
+                    dep_cache[pdb_id] = lookup_deposition_date(rcsb_conn, pdb_id)
+                dep = dep_cache[pdb_id]
+                if dep and dep >= max_deposition_date:
+                    date_skipped += 1
+                    continue
 
-        ligands = lookup_ligands(db_path, pdb_id)
-        filtered_ligands = [l for l in ligands if l.ligand_type in ligand_types]
+            if pdb_id not in ligand_cache:
+                ligand_cache[pdb_id] = lookup_ligands(rcsb_conn, pdb_id)
+            ligands = ligand_cache[pdb_id]
+            filtered_ligands = [l for l in ligands if l.ligand_type in ligand_types]
 
-        scored_ligands = []
-        best_tanimoto = 0.0
-        best_mcs = 0.0
-        for lig in filtered_ligands:
-            tanimoto, mcs_cov = 0.0, 0.0
-            if target_smiles and lig.smiles:
-                tanimoto, mcs_cov = _compute_ligand_similarity(target_smiles, lig.smiles)
-            scored = LigandHit(
-                pdb_id=lig.pdb_id,
-                ccd_code=lig.ccd_code,
-                ligand_type=lig.ligand_type,
-                is_candidate=lig.is_candidate,
-                smiles=lig.smiles,
-                molecular_weight=lig.molecular_weight,
-                contact_chain_ids=lig.contact_chain_ids,
-                tanimoto=tanimoto,
-                mcs_coverage=mcs_cov,
+            scored_ligands = []
+            best_tanimoto = 0.0
+            best_mcs = 0.0  # MCS coverage stays at 0 from filter — Track 3
+                            # fills this lazily on its picked templates only.
+            for lig in filtered_ligands:
+                tanimoto = 0.0
+                if _target_fp is not None and lig.ccd_code:
+                    cand_fp = _fp_cache.get_fp(lig.ccd_code, lig.smiles)
+                    tanimoto = round(_tanimoto(_target_fp, cand_fp), 4)
+                scored = LigandHit(
+                    pdb_id=lig.pdb_id,
+                    ccd_code=lig.ccd_code,
+                    ligand_type=lig.ligand_type,
+                    is_candidate=lig.is_candidate,
+                    smiles=lig.smiles,
+                    molecular_weight=lig.molecular_weight,
+                    contact_chain_ids=lig.contact_chain_ids,
+                    tanimoto=tanimoto,
+                    mcs_coverage=0.0,
+                )
+                scored_ligands.append(scored)
+                if tanimoto > best_tanimoto:
+                    best_tanimoto = tanimoto
+
+            template_hit = TemplateHit(
+                query=slot["query"],
+                target=slot["target"],
+                pdb_id=slot["pdb_id"],
+                chain_id=slot["chain_id"],
+                pident=float(slot["pident"]),
+                evalue=float(slot["evalue"]) if slot["evalue"] != float("inf") else 0.0,
+                qlen=int(slot["qlen"]),
+                tlen=int(slot["tlen"]),
+                ligands=scored_ligands,
+                best_tanimoto=best_tanimoto,
+                best_mcs_coverage=best_mcs,
+                in_mmseqs=bool(slot["in_mmseqs"]),
+                in_foldseek=bool(slot["in_foldseek"]),
+                qtmscore=float(slot["qtmscore"]),
+                ttmscore=float(slot["ttmscore"]),
+                alntmscore=float(slot["alntmscore"]),
+                prob=float(slot["prob"]),
             )
-            scored_ligands.append(scored)
-            best_tanimoto = max(best_tanimoto, tanimoto)
-            best_mcs = max(best_mcs, mcs_cov)
-
-        template_hit = TemplateHit(
-            query=slot["query"],
-            target=slot["target"],
-            pdb_id=slot["pdb_id"],
-            chain_id=slot["chain_id"],
-            pident=float(slot["pident"]),
-            evalue=float(slot["evalue"]) if slot["evalue"] != float("inf") else 0.0,
-            qlen=int(slot["qlen"]),
-            tlen=int(slot["tlen"]),
-            ligands=scored_ligands,
-            best_tanimoto=best_tanimoto,
-            best_mcs_coverage=best_mcs,
-            in_mmseqs=bool(slot["in_mmseqs"]),
-            in_foldseek=bool(slot["in_foldseek"]),
-            qtmscore=float(slot["qtmscore"]),
-            ttmscore=float(slot["ttmscore"]),
-            alntmscore=float(slot["alntmscore"]),
-            prob=float(slot["prob"]),
-        )
-        results.append(template_hit)
+            results.append(template_hit)
+    finally:
+        rcsb_conn.close()
 
     if max_deposition_date and date_skipped:
         print(f"  date-filter: dropped {date_skipped} hit(s) with deposition_date >= {max_deposition_date}")

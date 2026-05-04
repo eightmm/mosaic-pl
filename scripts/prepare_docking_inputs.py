@@ -972,7 +972,9 @@ def _extract_cofolding_ligand_clusters(
             "models": sorted(set(cl["models"])),
         })
     out.sort(key=lambda d: -d["n_members"])
-    return out[:COFOLD_CLUSTER_TOP_K]
+    out = out[:COFOLD_CLUSTER_TOP_K]
+    diagnostics = {"n_placements": n_placements, "min_members": min_members}
+    return out, diagnostics
 
 
 TEMPLATE_CONSENSUS_TOP_K = 10
@@ -1263,6 +1265,34 @@ def main() -> int:
     pqr_to_protonated_pdb(pqr_path, args.output_dir / "receptor_protonated.pdb")
     pqr_path.unlink(missing_ok=True)
 
+    # Per-ligand "ligand-aware" receptors for multi-ligand targets.
+    # Each per-ligand receptor strips ONLY that ligand from the cofold cif,
+    # leaving every other dockable ligand's cofold pose embedded as rigid
+    # heavy atoms. Docking ligand i against this receptor sees the other
+    # ligands' cofold poses as part of the binding site → site competition
+    # is captured automatically (e.g. two ligands at adjacent / overlapping
+    # pockets get separated rather than docked into the same spot).
+    # Single-ligand targets skip this; the legacy receptor.pdbqt is reused.
+    per_ligand_receptors: dict[str, dict[str, str]] = {}
+    if structure.suffix in (".cif", ".mmcif") and len(dockable_chains) > 1:
+        print(f"  Multi-ligand target ({len(dockable_chains)} dockable chains) → "
+              f"building per-ligand receptors with other cofold ligands embedded")
+        for chain_id in sorted(dockable_chains):
+            target_pdb = args.output_dir / f"receptor_excl_{chain_id}.pdb"
+            target_pdbqt = args.output_dir / f"receptor_excl_{chain_id}.pdbqt"
+            try:
+                # Strip only this chain — other dockable ligand chains stay
+                # in the receptor as static (cofold-placed) heavy atoms.
+                cif_to_pdb(structure, target_pdb, dockable_ligand_chains={chain_id})
+                pdb_to_pdbqt(target_pdb, target_pdbqt)
+                per_ligand_receptors[chain_id] = {
+                    "receptor_pdb": str(target_pdb),
+                    "receptor_pdbqt": str(target_pdbqt),
+                }
+            except Exception as e:
+                print(f"  WARNING: per-ligand receptor for {chain_id} failed ({e}); "
+                      f"falling back to apo receptor for that ligand")
+
     # 4. Determine docking box
     # Priority: cofolding ligand > SwinSite > P2Rank > input ligand coords
     center, size = None, None
@@ -1293,9 +1323,11 @@ def main() -> int:
     print(f"  Receptor CA atoms: {len(ca_atoms)} (chains: "
           f"{sorted({c for c, _ in ca_atoms})})")
 
-    cofold_clusters = _extract_cofolding_ligand_clusters(
+    cofold_clusters, cofold_diag = _extract_cofolding_ligand_clusters(
         args.run_dir, dockable_chains=dockable_chains,
     )
+    n_placements = cofold_diag["n_placements"]
+    min_members = cofold_diag["min_members"]
     for rank, cl in enumerate(cofold_clusters, start=1):
         src_name = f"cofolding_{rank}"
         nearest_chain, nearest_d = _nearest_chain(cl["centroid"], ca_atoms)
@@ -1420,16 +1452,24 @@ def main() -> int:
     # 5. Write summary JSON — include only the ligands that actually have
     # usable SDF + PDBQT files. Downstream docking tools iterate this list
     # and skip pipeline stages cleanly when the ligand list is empty.
-    usable_ligands = [
-        {
+    usable_ligands = []
+    for lig_id, smiles, sdf, pdbqt in prepared_ligands:
+        if sdf is None or pdbqt is None:
+            continue
+        entry = {
             "id": lig_id,
             "smiles": smiles,
-            "sdf": str(sdf) if sdf is not None else None,
-            "pdbqt": str(pdbqt) if pdbqt is not None else None,
+            "sdf": str(sdf),
+            "pdbqt": str(pdbqt),
         }
-        for lig_id, smiles, sdf, pdbqt in prepared_ligands
-        if sdf is not None and pdbqt is not None
-    ]
+        # If a per-ligand "ligand-aware" receptor was built (multi-ligand
+        # target), point this entry at it so docking variants pick it up
+        # automatically. Single-ligand targets fall through to the top-level
+        # ``receptor_pdbqt`` (apo receptor — every dockable ligand stripped).
+        if lig_id in per_ligand_receptors:
+            entry["receptor_pdbqt"] = per_ligand_receptors[lig_id]["receptor_pdbqt"]
+            entry["receptor_pdb"] = per_ligand_receptors[lig_id]["receptor_pdb"]
+        usable_ligands.append(entry)
     n_dropped_ligands = len(prepared_ligands) - len(usable_ligands)
 
     # Per-source diagnostic — every potential source is listed even if it

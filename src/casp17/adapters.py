@@ -462,8 +462,17 @@ def prepare_alphafold3(
                     notes.append(
                         f"AlphaFold3 adapter ignores non-A3M protein MSA path for chain(s) {ids}: {msa_value}"
                     )
-            # AF3 requires 'templates' field even when empty
-            protein_block["templates"] = []
+            # AF3 schema accepts 'templates' as missing/null/list. We only
+            # pre-populate ``[]`` in legacy mode (no unified MSA pipeline) so
+            # AF3 inference does not try to fetch templates on its own. When
+            # the unified pipeline is enabled the wrapper bridge runs AF3's
+            # data pipeline first; if we set ``templates=[]`` here AF3 reads
+            # ``has_templates=True`` and skips the template hmmsearch entirely
+            # (alphafold3 src/.../pipeline.py:469 — ``run_template_search=not
+            # has_templates``). Leaving the field absent makes the parser set
+            # it to ``None`` so the data pipeline actually runs hmmsearch.
+            if not config.msa_pipeline.enabled:
+                protein_block["templates"] = []
             sequences.append({"protein": protein_block})
             if entity.get("cyclic"):
                 notes.append("AlphaFold3 adapter currently ignores the Boltz cyclic flag.")
@@ -949,14 +958,18 @@ def _prepare_vina_variant(
         "    if not lig_pdbqt:",
         "        print(f'Vina[{BOX_SOURCE}]: ligand {lig_id} has no pdbqt, skipping.')",
         "        continue",
+        "    # Per-ligand 'ligand-aware' receptor (multi-ligand targets):",
+        "    # falls back to apo top-level receptor for single-ligand or when",
+        "    # per-ligand prep wasn't built.",
+        "    lig_receptor = lig.get('receptor_pdbqt') or receptor_pdbqt",
         "    lig_out_dir = seed_out_dir / f'ligand_{lig_id}'",
         "    lig_out_dir.mkdir(parents=True, exist_ok=True)",
         "    out_path = str(lig_out_dir / 'docked.pdbqt')",
         "    log_path = str(lig_out_dir / 'vina.log')",
-        "    print(f'  -> {lig_id}: {lig_pdbqt}')",
+        "    print(f'  -> {lig_id}: lig={lig_pdbqt} receptor={lig_receptor}')",
         "    try:",
         "        v = Vina(sf_name='vina', seed=seed)",
-        "        v.set_receptor(receptor_pdbqt)",
+        "        v.set_receptor(lig_receptor)",
         "        v.set_ligand_from_file(lig_pdbqt)",
         "        v.compute_vina_maps(center=center, box_size=size)",
         "        v.dock(exhaustiveness=exhaustiveness, n_poses=n_poses)",
@@ -1046,6 +1059,7 @@ def _prepare_autodock_gpu_variant(
         f"binary = {str(repo_root / config.autodock_gpu.binary)!r}",
         f"nrun = {config.autodock_gpu.nrun}",
         f"nev = {config.autodock_gpu.nev}",
+        f"ngen = {config.autodock_gpu.ngen}",
         f"heuristics = {config.autodock_gpu.heuristics}",
         f"autostop = {autostop_flag}",
         f"seed = {seed}",
@@ -1124,6 +1138,9 @@ def _prepare_autodock_gpu_variant(
         "    if not lig_pdbqt:",
         "        print(f'  -> {lig_id}: missing pdbqt, skipping.')",
         "        continue",
+        "    # Per-ligand 'ligand-aware' receptor (multi-ligand targets) —",
+        "    # contains other dockable ligands' cofold poses as static atoms.",
+        "    lig_receptor = lig.get('receptor_pdbqt') or receptor_pdbqt",
         "    lig_out_dir = seed_out_dir / f'ligand_{lig_id}'",
         "    lig_out_dir.mkdir(parents=True, exist_ok=True)",
         "    lig_grid_dir = lig_out_dir / 'grid'",
@@ -1132,11 +1149,11 @@ def _prepare_autodock_gpu_variant(
         "    lig_types = _parse_lig_types(lig_pdbqt)",
         "    if not lig_types:",
         "        lig_types = ['A', 'C', 'HD', 'N', 'NA', 'OA', 'SA']",
-        "    # Receptor atom types parsed from receptor pdbqt so nucleic acid",
-        "    # P (phosphate), retained metals (Mg/Zn/...), and any other",
-        "    # non-default types reach autogrid's grid maps.",
+        "    # Receptor atom types parsed from this ligand's receptor pdbqt",
+        "    # (may differ from apo when per-ligand receptors are in use —",
+        "    # the embedded other-ligand atoms add their own AD4 types).",
         "    _rec_base = ['A', 'C', 'HD', 'N', 'NA', 'OA', 'SA']",
-        "    _rec_actual = _parse_rec_types(receptor_pdbqt)",
+        "    _rec_actual = _parse_rec_types(lig_receptor)",
         "    rec_types = list(dict.fromkeys(_rec_base + _rec_actual + lig_types))",
         "",
         "    npts = [max(1, int(s / 0.375)) for s in size]",
@@ -1146,7 +1163,7 @@ def _prepare_autodock_gpu_variant(
         "        f'spacing 0.375',",
         "        f'receptor_types {chr(32).join(rec_types)}',",
         "        f'ligand_types {chr(32).join(lig_types)}',",
-        "        f'receptor {receptor_pdbqt}',",
+        "        f'receptor {lig_receptor}',",
         "        f'gridcenter {center[0]} {center[1]} {center[2]}',",
         "        f'smooth 0.5',",
         "    ]",
@@ -1168,7 +1185,7 @@ def _prepare_autodock_gpu_variant(
         "        subprocess.run([",
         "            binary, '--ffile', str(lig_grid_dir / 'receptor.maps.fld'),",
         "            '--lfile', lig_pdbqt,",
-        "            '--nrun', str(nrun), '--nev', str(nev),",
+        "            '--nrun', str(nrun), '--nev', str(nev), '--ngen', str(ngen),",
         "            '--heuristics', str(heuristics), '--autostop', str(autostop),",
         "            '--seed', str(seed),",
         "            '--resnam', str(lig_out_dir / 'docking'),",

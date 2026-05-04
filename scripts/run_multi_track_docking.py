@@ -585,6 +585,25 @@ def main() -> int:
         print("Template docking prep produced no templates.")
         return 0
 
+    # Dedup by pdb_id. ``select_cluster_representative_templates`` can pick
+    # the same PDB as the rep for multiple pocket clusters (observed on 7hqq:
+    # 8qrt represented two adjacent clusters), and the prep step then writes
+    # the same {receptor.pdb, ligand.sdf} bundle twice. Re-running Track 2
+    # against duplicates only inflates ``multi_track_summary.json`` results
+    # without adding new poses, so collapse here.
+    seen_pdb: set[str] = set()
+    deduped: list[dict] = []
+    for tmpl in templates:
+        pid = (tmpl.get("template_pdb_id") or "").lower()
+        if pid in seen_pdb:
+            continue
+        seen_pdb.add(pid)
+        deduped.append(tmpl)
+    if len(deduped) < len(templates):
+        print(f"  dedup: {len(templates)} → {len(deduped)} unique templates "
+              f"(skipped {len(templates) - len(deduped)} duplicate pdb_id reps)")
+    templates = deduped
+
     # 5. Run Track 2 + Track 3 for each template
     all_results: list[dict] = []
     for i, template in enumerate(templates):

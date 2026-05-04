@@ -141,6 +141,50 @@ def _ligand_centroids(cif_path: Path, candidate_ccds: set[str]) -> list[dict]:
     return pockets
 
 
+def _extract_chain_pdb(cif_path: Path, chain_id: str, output_pdb: Path) -> Path | None:
+    """Write polymer atoms of a single chain to PDB, for chain-specific USalign.
+
+    USalign on a multi-chain template returns one transform tied to whichever
+    chain it best-fit to the cofold monomer. That transform only places the
+    ligands of *that* host chain correctly; other protomers' ligands fly into
+    deep space (validated 2026-05-02 on 7hqq: 7/10 cluster centroids landed
+    50-200 Å away). Aligning a single-chain extraction to the reference makes
+    the host chain explicit and removes USalign's chain-mapping ambiguity, so
+    the returned R/t is guaranteed to correspond to ``chain_id``.
+
+    Returns ``None`` when the requested chain isn't present (the caller falls
+    back to whole-CIF alignment in that case so single-chain templates with
+    synthetic asym ids still work).
+    """
+    import gemmi
+    structure = gemmi.read_structure(str(cif_path))
+    new_struct = gemmi.Structure(); new_struct.name = structure.name
+    new_model = gemmi.Model("1")
+    matched = False
+    target = chain_id.upper()
+    for model in structure:
+        for chain in model:
+            if chain.name.upper() != target:
+                continue
+            # PDB format only allows single-character chain ids — multi-char
+            # asym ids (foldseek often hits ``8qrt_CCC`` etc.) crash
+            # ``write_pdb`` with "chain name too long for the PDB format".
+            # We're writing a single-chain extraction anyway; rename to "A".
+            new_chain = gemmi.Chain("A")
+            for res in chain:
+                if res.entity_type == gemmi.EntityType.Polymer:
+                    new_chain.add_residue(res)
+            if len(new_chain) > 0:
+                new_model.add_chain(new_chain)
+                matched = True
+        break  # first model only
+    if not matched:
+        return None
+    new_struct.add_model(new_model)
+    new_struct.write_pdb(str(output_pdb))
+    return output_pdb
+
+
 def _safe_float(s, default=0.0):
     try:
         return float(s)
@@ -256,12 +300,22 @@ def main() -> int:
             n_failed_cif += 1
             continue
 
-        # USalign on the template CIF onto the cofolding reference. Returns
-        # ``ref ≈ R @ pred + t`` plus TM-score and aligned-region RMSD.
-        # Structure-based alignment matches how foldseek originally ranked
-        # the hit, so distant homologs that gemmi's sequence-anchored
-        # superposition fails on get a correct transform here.
-        align = run_usalign(cif, reference_cif)
+        # Chain-specific alignment. Foldseek/mmseqs report a (pdb_id, chain_id)
+        # pair as the hit — that chain is the one whose fold matched the query.
+        # Pre-extract that single chain and run USalign on the chain-only PDB
+        # so the returned R/t is guaranteed to correspond to that protomer's
+        # frame, regardless of how many homologous chains the full CIF has.
+        # Falls back to whole-CIF alignment when the chain isn't extractable
+        # (synthetic asym ids, missing chain in the model, etc.) so this
+        # tightening never silently drops a valid hit.
+        host_chain = (chain_id or "").upper()
+        chain_pdb = None
+        if host_chain:
+            chain_pdb = _extract_chain_pdb(
+                cif, host_chain, work_dir / f"{pdb_id}_{host_chain}.pdb"
+            )
+        align_input = chain_pdb if chain_pdb is not None else cif
+        align = run_usalign(align_input, reference_cif)
         if align is None:
             n_failed_align += 1
             continue
@@ -272,7 +326,18 @@ def main() -> int:
         n_aligned += 1
 
         ligand_centroids = _ligand_centroids(cif, candidate_ccds)
-        for lig in ligand_centroids:
+        # Keep only ligands physically attached to the host chain — those are
+        # the ones the chain-only USalign transform places correctly. Other
+        # protomers' ligands need their own (different) transform.
+        kept = [lig for lig in ligand_centroids if lig["chain"].upper() == host_chain]
+        if not kept and ligand_centroids:
+            # Single-chain CIFs sometimes carry synthetic asym ids that don't
+            # match the foldseek-reported ``chain_id``. In that case the host
+            # filter would wipe everything out; fall through to all ligands
+            # and let the surface-margin filter in cluster_template_pockets
+            # reject any whose transformed centroid lands outside the protein.
+            kept = ligand_centroids
+        for lig in kept:
             tx, ty, tz = transform_point(R, t_vec, lig["x"], lig["y"], lig["z"])
             pockets.append(PocketPoint(
                 template_pdb_id=pdb_id,

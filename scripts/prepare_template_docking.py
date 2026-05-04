@@ -330,11 +330,37 @@ def prepare_receptor_pdbqt(pdb_path: Path, output_dir: Path) -> tuple[Path, Path
              "--keep-chain", str(pdb_path), str(pqr_path)],
             check=True, capture_output=True, text=True,
         )
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        # If pdb2pqr not in this venv, just copy PDB as-is
-        shutil.copy2(pdb_path, protonated_pdb)
-        shutil.copy2(pdb_path, pdbqt_path)
-        return protonated_pdb, pdbqt_path
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        # pdb2pqr can choke on a number of legitimate templates (4v8w, 6gjc
+        # observed: nonstandard residues / missing atoms / unusual altlocs).
+        # Try obabel as a second-chance protein path before giving up — it
+        # accepts much messier PDB input than pdb2pqr/AMBER. Only fail loudly
+        # when both tools refuse the receptor.
+        repo_root = Path(__file__).resolve().parent.parent
+        obabel = repo_root / ".venvs" / "pred" / "bin" / "obabel"
+        if obabel.exists():
+            try:
+                subprocess.run(
+                    [str(obabel), str(pdb_path), "-O", str(pdbqt_path),
+                     "-p", "7.4", "--partialcharge", "gasteiger", "-xr"],
+                    check=True, capture_output=True, text=True, timeout=120,
+                )
+                subprocess.run(
+                    [str(obabel), str(pdb_path), "-O", str(protonated_pdb),
+                     "-p", "7.4"],
+                    check=True, capture_output=True, text=True, timeout=120,
+                )
+                print(f"  pdb2pqr failed → obabel fallback succeeded for {pdb_path.name}")
+                return protonated_pdb, pdbqt_path
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+                    FileNotFoundError):
+                pass
+        msg = e.stderr if isinstance(e, subprocess.CalledProcessError) else str(e)
+        raise RuntimeError(
+            f"pdb2pqr (and obabel fallback) failed for {pdb_path.name}; "
+            f"cannot produce a Vina-ready PDBQT. Skip Track 2 for this template. "
+            f"Underlying error:\n{msg}"
+        ) from e
 
     # PQR → protonated PDB
     pdb_lines = []
@@ -730,7 +756,15 @@ def main() -> int:
             cif, template_dir / "receptor.pdb",
             target_ccds=target_ccds,
         )
-        protonated_pdb, receptor_pdbqt = prepare_receptor_pdbqt(receptor_pdb, template_dir)
+        try:
+            protonated_pdb, receptor_pdbqt = prepare_receptor_pdbqt(receptor_pdb, template_dir)
+        except RuntimeError as exc:
+            # Edge case: huge biological assemblies (e.g. 5BP4 expanded to
+            # ~260 k atoms) crash pdb2pqr, and the previous silent fallback
+            # produced an unusable PDBQT. Drop this template cleanly.
+            print(f"  WARNING: receptor PDBQT prep failed for {pdb_id}: {exc}")
+            print(f"  Skipping Track 2 docking for template {pdb_id}.")
+            continue
         print(f"  Receptor PDB: {receptor_pdb.name}")
         print(f"  Receptor PDBQT: {receptor_pdbqt.name}")
 

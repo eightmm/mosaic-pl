@@ -232,10 +232,19 @@ def cluster_positions(
 
 def find_best_cofolding_structure(run_dir: Path) -> Path | None:
     """Find best cofolding CIF structure."""
+    # Prefer ``*_aligned.cif`` (produced by ``align_cofolding_outputs.py``).
+    # The unaligned originals live in the cofold-native frame, while every
+    # downstream ion consumer (docking poses, CASP submission) reads coords
+    # in the common aligned frame. Picking unaligned as the reference would
+    # silently park ion centroids in a different frame than the docked poses.
     for model in ("boltz2", "boltz2x", "protenix", "alphafold3"):
         model_dir = run_dir / "outputs" / model
         if not model_dir.exists():
             continue
+        for cif in sorted(model_dir.rglob("*_aligned.cif")):
+            return cif
+        # Fallback: align bridge hasn't run yet (shouldn't happen at ion
+        # placement time, but keep the legacy behaviour as a safety net).
         if model.startswith("boltz"):
             for cif in sorted(model_dir.rglob("predictions/**/*.cif")):
                 return cif

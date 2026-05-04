@@ -556,7 +556,12 @@ class AutoDockGPUConfig:
     size_y: float | None = None
     size_z: float | None = None
     nrun: int = 100
-    nev: int = 2500000
+    nev: int = 1500000      # Lowered from 2.5M default → ~40% wall-time saving
+                            # without measurable accuracy loss on flexible
+                            # ligands. 9emd hung at 2M+ evals before autostop
+                            # kicked in; 1.5M cap prevents that worst case.
+    ngen: int = 27000       # Max LGA generations per run (ADG default).
+                            # Hard cap so even autostop=0 has a ceiling.
     heuristics: int = 1
     autostop: bool = True
     seed: int | None = None
@@ -578,7 +583,8 @@ class AutoDockGPUConfig:
             size_y=float(data["size_y"]) if data.get("size_y") is not None else None,
             size_z=float(data["size_z"]) if data.get("size_z") is not None else None,
             nrun=int(data.get("nrun", 100)),
-            nev=int(data.get("nev", 2500000)),
+            nev=int(data.get("nev", 1500000)),
+            ngen=int(data.get("ngen", 27000)),
             heuristics=int(data.get("heuristics", 1)),
             autostop=_to_bool(data.get("autostop"), True),
             seed=int(data["seed"]) if data.get("seed") is not None else None,

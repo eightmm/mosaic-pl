@@ -650,10 +650,18 @@ def evaluate_target(pdb_id: str, meta: dict, lg_path: Path, work_dir: Path) -> d
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--submissions-dir", default=str(SUBMISSIONS),
+                        help="Directory holding *_input.lg files (default: experiments/submissions)")
+    parser.add_argument("--output-json", default=str(ROOT / "evaluation.json"),
+                        help="Per-target results JSON output path")
+    args = parser.parse_args()
+    submissions_dir = Path(args.submissions_dir)
     targets = load_targets()
-    lgs = sorted(SUBMISSIONS.glob("*_input.lg"))
+    lgs = sorted(submissions_dir.glob("*_input.lg"))
     novel_lgs = [p for p in lgs if not p.name.startswith("L10")]
-    print(f"Evaluating {len(novel_lgs)} novel2025 LG submissions (USalign-based)...")
+    print(f"Evaluating {len(novel_lgs)} novel2025 LG submissions from {submissions_dir} ...")
     work_dir = ROOT / "_eval_work"
     work_dir.mkdir(exist_ok=True)
     results = []
@@ -681,7 +689,7 @@ def main():
             b5s = f"{best5:>6.2f}" if best5 is not None else "  n/a"
             print(f"  {pdb:<6} [{zone:>7}]  top1={t1s} best5={b5s}  {flag}")
 
-    (ROOT / "evaluation.json").write_text(json.dumps(results, indent=2, default=str))
+    Path(args.output_json).write_text(json.dumps(results, indent=2, default=str))
 
     # Summary
     ok = [r for r in results if "top1_rmsd" in r and r["top1_rmsd"] is not None]
