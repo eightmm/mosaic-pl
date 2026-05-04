@@ -985,6 +985,15 @@ def _extract_cofolding_ligand_clusters(
     return out, diagnostics
 
 
+def summary_pred_iter(binding_site_results):
+    """Yield ``(name, (center, size, [metadata]))`` from the in-memory
+    ``binding_site_results`` dict, normalising the optional metadata slot
+    so the frame-check loop above can read ``payload[0]`` (center)
+    uniformly. Standalone helper so the prep main flow stays readable."""
+    for k, v in binding_site_results.items():
+        yield k, v if isinstance(v, tuple) else (v.get("center"), v.get("size"))
+
+
 TEMPLATE_CONSENSUS_TOP_K = 10
 TEMPLATE_CONSENSUS_MIN_MEMBERS = 2
 TEMPLATE_CONSENSUS_BOX_SIZE = [22.5, 22.5, 22.5]  # legacy default; runtime override via _adaptive_box_size below
@@ -1501,6 +1510,83 @@ def main() -> int:
         "n_dropped_ligands_at_prep": n_dropped_ligands,
         "dockable_chains_from_yaml": sorted(dockable_chains) if dockable_chains else [],
     }
+
+    # Frame-consistency check: every binding-site center should be within
+    # reasonable distance of the receptor's heavy-atom centroid. A source
+    # >50 Å away is a strong signal that we picked the wrong cofold ref or
+    # a frame mismatch slipped through (e.g. template-consensus written in
+    # an unaligned frame). Logging here is the cheapest defence.
+    try:
+        import gemmi as _gemmi
+        _rec_atoms: list[tuple[float, float, float]] = []
+        for _m in _gemmi.read_structure(str(args.output_dir / "receptor.pdb")):
+            for _ch in _m:
+                for _r in _ch:
+                    if not _r.entity_type == _gemmi.EntityType.Polymer:
+                        continue
+                    for _a in _r:
+                        if _a.element.name == "H":
+                            continue
+                        _rec_atoms.append((_a.pos.x, _a.pos.y, _a.pos.z))
+            break
+        if _rec_atoms:
+            import numpy as _np
+            _rec = _np.asarray(_rec_atoms)
+            _rec_centroid = _rec.mean(axis=0)
+            _rec_extent = float(_np.linalg.norm(_rec - _rec_centroid, axis=1).max())
+            # 30 Å past receptor's farthest heavy atom is generously beyond
+            # any pocket. Anything past that is almost certainly a frame
+            # bug, not a real cryptic site.
+            _max_allowed = _rec_extent + 30.0
+            outliers: list[dict] = []
+            for src, payload in summary_pred_iter(binding_site_results):
+                ctr = _np.asarray(payload[0])
+                d = float(_np.linalg.norm(ctr - _rec_centroid))
+                if d > _max_allowed:
+                    outliers.append({
+                        "source": src,
+                        "center": [round(float(x), 3) for x in payload[0]],
+                        "dist_from_receptor_centroid": round(d, 2),
+                    })
+            source_status["frame_check"] = {
+                "receptor_centroid": [round(float(x), 3) for x in _rec_centroid],
+                "receptor_extent_angstrom": round(_rec_extent, 2),
+                "max_allowed_source_distance": round(_max_allowed, 2),
+                "n_sources_checked": len(binding_site_results),
+                "n_outliers": len(outliers),
+                "outliers": outliers,
+            }
+            if outliers:
+                print(f"  WARNING: {len(outliers)} binding-site source(s) > "
+                      f"{_max_allowed:.0f} Å from receptor centroid — possible "
+                      f"frame mismatch:")
+                for o in outliers:
+                    print(f"    {o['source']}: dist={o['dist_from_receptor_centroid']} Å")
+    except Exception as _e:
+        source_status["frame_check"] = {"error": str(_e)}
+
+    # Surface alignment quality so downstream readers see frame health
+    # without opening a separate file. ``align_cofolding_outputs.py`` writes
+    # an ``alignment_summary.json`` with per-cif RMSD-before/after; we lift
+    # the summary stats into source_status. Missing alignment summary is
+    # non-fatal — just means the bridge didn't run (template-only pipelines).
+    try:
+        _align_path = args.run_dir / "outputs" / "alignment_summary.json"
+        if _align_path.exists():
+            _align = json.loads(_align_path.read_text())
+            _details = _align.get("details", [])
+            _rmsds = [d.get("rmsd_after") for d in _details
+                      if d.get("rmsd_after") is not None]
+            source_status["alignment"] = {
+                "reference": _align.get("reference"),
+                "n_aligned": _align.get("n_aligned", 0),
+                "n_skipped": _align.get("n_skipped", 0),
+                "rmsd_after_max": round(max(_rmsds), 3) if _rmsds else None,
+                "rmsd_after_median": round(sorted(_rmsds)[len(_rmsds) // 2], 3)
+                                      if _rmsds else None,
+            }
+    except Exception:
+        pass
 
     summary = {
         "receptor_pdb": str(args.output_dir / "receptor_protonated.pdb"),
