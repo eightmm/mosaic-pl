@@ -248,12 +248,21 @@ def find_receptor_pdbs(run_dir: Path) -> dict[str, Path]:
         receptors["docking_prep"] = prep_pdb
 
     # Per-model CIF → we use the docking prep PDB since it's already converted
-    # But also check for raw cofolding CIFs for model-specific analysis
+    # But also check for raw cofolding CIFs for model-specific analysis. Prefer
+    # ``*_aligned.cif`` (Stage 2.5 output) — every other coordinate consumer
+    # in the run lives in that frame, so a raw-frame fallback here would be a
+    # silent footgun if the docking_prep receptor goes missing.
     for model in ("boltz2", "boltz2x", "protenix", "alphafold3"):
         model_dir = run_dir / "outputs" / model
         if not model_dir.exists():
             continue
+        aligned = next(iter(sorted(model_dir.rglob("*_aligned.cif"))), None)
+        if aligned is not None:
+            receptors[model] = aligned
+            continue
         for cif in sorted(model_dir.rglob("*.cif")):
+            if "_aligned" in cif.name:
+                continue
             if "model" in cif.name or "sample" in cif.name:
                 receptors[model] = cif
                 break

@@ -237,6 +237,27 @@ def main() -> int:
         scores = _read_confidence(run_dir)
         ref_path = _pick_best_cofolding_as_ref(run_dir, scores)
     if ref_path is None:
+        # Last-resort fallback: pick literally the first non-aligned cofold
+        # cif we can find. Frame consistency depends on every downstream
+        # stage reading a ``*_aligned.cif`` — even if pLDDT files are
+        # missing or corrupted, an identity-transform self-alignment is
+        # still better than letting alignment fail and downstream silently
+        # falling back to the unaligned cif (which broke the
+        # ``template_consensus_*`` frame in earlier runs).
+        for model in ("alphafold3", "protenix", "boltz2x", "boltz2"):
+            d = run_dir / "outputs" / model
+            if not d.exists():
+                continue
+            for cif in sorted(d.rglob("*.cif")):
+                if "_aligned" in cif.name:
+                    continue
+                ref_path = cif
+                print(f"  Cofolding reference (last-resort, no pLDDT scores): "
+                      f"{model} → {cif.name}")
+                break
+            if ref_path is not None:
+                break
+    if ref_path is None:
         print("ERROR: no reference structure found (no template, no cofolding outputs)")
         return 1
 

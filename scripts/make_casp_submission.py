@@ -30,7 +30,12 @@ from pathlib import Path
 
 
 def find_best_cofolding_cif(run_dir: Path, preferred: str | None = None) -> tuple[str, Path]:
-    """Find best cofolding CIF, preferring ``_aligned.cif`` and pLDDT ranking."""
+    """Find best cofolding CIF, preferring ``_aligned.cif`` and pLDDT ranking.
+
+    Emits a loud warning when forced to fall back to an unaligned cif —
+    the submission MODEL receptor must be in the same frame as the docked
+    pose MDL blocks, otherwise the rendered LG file mixes coordinate frames.
+    """
 
     def _first_cif(model_dir: Path, model: str) -> Path | None:
         if model.startswith("boltz"):
@@ -43,7 +48,13 @@ def find_best_cofolding_cif(run_dir: Path, preferred: str | None = None) -> tupl
             raw = sorted(c for c in model_dir.rglob("*.cif") if "_aligned" not in c.name)
         for cif in raw:
             aligned = cif.with_name(cif.stem + "_aligned.cif")
-            return aligned if aligned.exists() else cif
+            if aligned.exists():
+                return aligned
+            print(f"  WARNING: submission falling back to UNALIGNED "
+                  f"{model}/{cif.name} — pose coords (aligned frame) and "
+                  f"receptor coords will disagree. Re-run "
+                  f"scripts/align_cofolding_outputs.py first.")
+            return cif
         return None
 
     candidates = []

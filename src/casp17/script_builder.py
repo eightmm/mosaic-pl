@@ -482,14 +482,20 @@ def build_wrapper_shell_script(
         ):
             _emit_msa_pipeline_bridge(script_path.parent.parent)
             msa_bridges_done = True
-        # Pre-docking bridges. Order matters: template artifacts (filter +
-        # pockets + cluster) must come BEFORE docking-prep so the prep step
-        # can register template_consensus_* sources for vina/adg/pxdock.
+        # Pre-docking bridges. Order matters:
+        #   1. Frame alignment FIRST — produces ``*_aligned.cif`` so every
+        #      downstream consumer that prefers aligned reads the same frame.
+        #   2. Template bridges (filter → pocket extract → cluster) — pocket
+        #      extraction's USalign needs the cofold reference cif in the
+        #      common frame, otherwise ``template_consensus_*`` centroids
+        #      end up in a different frame than ``cofolding_*`` /
+        #      ``swinsite_*`` / ``p2rank_*`` (those are written later by
+        #      prepare_docking_inputs in the aligned frame).
+        #   3. Docking prep — registers all binding-site sources, all in
+        #      the aligned frame, so docking + post-analysis + LG
+        #      submission read consistent coordinates.
         if stage_name == "docking":
             run_dir = script_path.parent.parent
-            if has_template_search and not template_bridges_done:
-                _emit_template_bridges(run_dir)
-                template_bridges_done = True
             if cofold_done:
                 lines.extend([
                     'echo ""',
@@ -501,6 +507,10 @@ def build_wrapper_shell_script(
                     f" || echo '  (cofolding alignment failed, continuing)'",
                     "",
                 ])
+            if has_template_search and not template_bridges_done:
+                _emit_template_bridges(run_dir)
+                template_bridges_done = True
+            if cofold_done:
                 lines.extend([
                     'echo ""',
                     'echo "----------------------------------------------------------------"',

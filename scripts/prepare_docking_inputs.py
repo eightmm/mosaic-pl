@@ -412,17 +412,25 @@ def pdb_to_pdbqt(pdb_path: Path, output_path: Path) -> Path:
 def find_best_cofolding_structure(cofolding_dir: Path, model: str) -> Path | None:
     """Find the best-ranked structure from cofolding output.
 
-    Prefers ``_aligned.cif`` (produced by ``align_cofolding_outputs.py``) over
-    the raw CIF so that downstream stages work in the common reference frame.
+    Returns ``*_aligned.cif`` when present (Stage 2.5 alignment output) so
+    receptor coords match every other coordinate consumer in the pipeline
+    (binding-site predictors, template-pocket clusters, post-analysis,
+    submission). Falls back to the raw cif with a loud warning — running
+    with an unaligned receptor while template_consensus_* / docking poses
+    are in the aligned frame produces silent geometric mis-docking.
     """
     def _prefer_aligned(cifs: list[Path]) -> Path | None:
-        # First pass: return the first cif that has a sibling ``_aligned``.
-        # Second pass: fall back to the first raw cif.
         for cif in cifs:
             aligned = cif.with_name(cif.stem + "_aligned.cif")
             if aligned.exists():
                 return aligned
-        return cifs[0] if cifs else None
+        if cifs:
+            print(f"  WARNING: no ``*_aligned.cif`` found for {model} under "
+                  f"{cofolding_dir}; falling back to {cifs[0].name} (UNALIGNED). "
+                  f"Run scripts/align_cofolding_outputs.py first to keep "
+                  f"every downstream stage in a common frame.")
+            return cifs[0]
+        return None
 
     if model.startswith("boltz"):
         return _prefer_aligned(sorted(cofolding_dir.rglob("predictions/**/*.cif")))

@@ -231,29 +231,40 @@ def cluster_positions(
 
 
 def find_best_cofolding_structure(run_dir: Path) -> Path | None:
-    """Find best cofolding CIF structure."""
-    # Prefer ``*_aligned.cif`` (produced by ``align_cofolding_outputs.py``).
-    # The unaligned originals live in the cofold-native frame, while every
-    # downstream ion consumer (docking poses, CASP submission) reads coords
-    # in the common aligned frame. Picking unaligned as the reference would
-    # silently park ion centroids in a different frame than the docked poses.
+    """Find best cofolding CIF structure.
+
+    Two-pass: aligned cifs first (across every model dir), then unaligned
+    fallback with a loud warning. Returning an unaligned cif while every
+    other downstream consumer is in the aligned frame is a silent frame
+    bug — the warning surfaces it early.
+    """
+    # Pass 1: aligned, preferred order.
     for model in ("boltz2", "boltz2x", "protenix", "alphafold3"):
         model_dir = run_dir / "outputs" / model
         if not model_dir.exists():
             continue
         for cif in sorted(model_dir.rglob("*_aligned.cif")):
             return cif
-        # Fallback: align bridge hasn't run yet (shouldn't happen at ion
-        # placement time, but keep the legacy behaviour as a safety net).
+    # Pass 2: unaligned fallback — emit warning so frame mismatches are
+    # not silent. The pipeline normally runs alignment before any
+    # consumer, so reaching here is unusual (alignment errored out, or
+    # consumer ran out of order).
+    for model in ("boltz2", "boltz2x", "protenix", "alphafold3"):
+        model_dir = run_dir / "outputs" / model
+        if not model_dir.exists():
+            continue
         if model.startswith("boltz"):
-            for cif in sorted(model_dir.rglob("predictions/**/*.cif")):
-                return cif
+            picks = sorted(model_dir.rglob("predictions/**/*.cif"))
         elif model == "alphafold3":
-            for cif in sorted(model_dir.rglob("*model*.cif")):
-                return cif
+            picks = sorted(model_dir.rglob("*model*.cif"))
         else:
-            for cif in sorted(model_dir.rglob("*.cif")):
-                return cif
+            picks = sorted(model_dir.rglob("*.cif"))
+        picks = [c for c in picks if "_aligned" not in c.name]
+        if picks:
+            print(f"  WARNING: no ``*_aligned.cif`` available; falling back to "
+                  f"unaligned {model}/{picks[0].name}. Downstream coordinates "
+                  f"may be in a different frame than docking poses.")
+            return picks[0]
     return None
 
 
