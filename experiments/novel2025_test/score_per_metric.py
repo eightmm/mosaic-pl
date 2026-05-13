@@ -286,26 +286,18 @@ def _pose_n(pose_name: str, source: str) -> int | None:
 
 
 def evaluate_run(target: str, meta: dict, work_dir: Path) -> list[PoseRow]:
-    smi = meta["candidate_smiles"][0] if meta["candidate_smiles"] else ""
-    ccd = meta["candidate_ccd_codes"][0] if meta["candidate_ccd_codes"] else ""
-    if not smi or not ccd:
-        return []
-    template = Chem.MolFromSmiles(smi)
-    if template is None:
-        return []
     cif = cif_path_for(target)
     if cif is None:
         return []
-
     crystal_pdb = work_dir / f"{target}_crystal.pdb"
     if not crystal_pdb.exists() and not dump_crystal_protein_pdb(cif, crystal_pdb):
         return []
 
-    ref_lig, eff_template = load_crystal_ligand(cif, ccd, template)
-    if ref_lig is None:
-        return []
-
     run_dir = RUNS / f"{target}_input"
+    # msa_e2e_test layout is nested: <RUNS>/<target>_input/<target>_input/
+    nested = run_dir / f"{target}_input"
+    if nested.exists():
+        run_dir = nested
     if not run_dir.exists():
         return []
     cofold_pdb = run_dir / "inputs" / "docking" / "receptor.pdb"
@@ -316,6 +308,62 @@ def evaluate_run(target: str, meta: dict, work_dir: Path) -> list[PoseRow]:
     if us is None:
         return []
     R, t, _tm, _rmsd_prot = us
+
+    # Per-ligand reference table — match prep['ligands'] (which carry the
+    # lig_id used in pose filenames: L / L2 / L3 …) to a candidate CCD by
+    # canonical SMILES. Multi-cofactor targets (FAD+NAP+ligand-of-interest)
+    # used to feed every pose through the FIRST candidate ref, causing
+    # atom-count mismatch → MCS fallback at 30s/pose, and occasionally
+    # FindMCS hangs past its own timeout in the C-extension. Now each
+    # pose's lig_id picks the correct ref.
+    prep_path = run_dir / "inputs" / "docking" / "docking_prep_summary.json"
+    prep = json.loads(prep_path.read_text()) if prep_path.exists() else {}
+    cand_canon = []
+    for ccd_, smi_ in zip(meta.get("candidate_ccd_codes") or [],
+                          meta.get("candidate_smiles") or []):
+        tmpl_ = Chem.MolFromSmiles(smi_) if smi_ else None
+        if tmpl_ is None:
+            continue
+        try:
+            canon_ = Chem.MolToSmiles(tmpl_)
+        except Exception:
+            canon_ = smi_
+        cand_canon.append((ccd_, tmpl_, canon_))
+    lig_id_to_ref: dict[str, tuple] = {}
+    for lig in (prep.get("ligands") or []):
+        lig_id = str(lig.get("id") or "L")
+        lig_smi = lig.get("smiles")
+        if not lig_smi or not cand_canon:
+            continue
+        lig_mol = Chem.MolFromSmiles(lig_smi)
+        if lig_mol is None:
+            continue
+        try:
+            lig_canon = Chem.MolToSmiles(lig_mol)
+        except Exception:
+            lig_canon = lig_smi
+        match = next((c for c in cand_canon if c[2] == lig_canon), None)
+        if match is None:
+            # Fallback: closest by heavy-atom count.
+            match = min(cand_canon,
+                        key=lambda c: abs(c[1].GetNumAtoms() - lig_mol.GetNumAtoms()))
+        ccd_m, tmpl_m, _ = match
+        ref_lig_, eff_ = load_crystal_ligand(cif, ccd_m, tmpl_m)
+        if ref_lig_ is not None:
+            lig_id_to_ref[lig_id] = (ref_lig_, eff_)
+    if not lig_id_to_ref:
+        # Legacy single-ligand fallback — load the first candidate.
+        smi = (meta.get("candidate_smiles") or [""])[0]
+        ccd = (meta.get("candidate_ccd_codes") or [""])[0]
+        if not smi or not ccd:
+            return []
+        template = Chem.MolFromSmiles(smi)
+        if template is None:
+            return []
+        ref_lig_, eff_ = load_crystal_ligand(cif, ccd, template)
+        if ref_lig_ is None:
+            return []
+        lig_id_to_ref["L"] = (ref_lig_, eff_)
 
     cofold_conf = _build_cofold_confidence_map(run_dir)
     docking_conf = _docking_anchor_confidence(run_dir)
@@ -385,8 +433,22 @@ def evaluate_run(target: str, meta: dict, work_dir: Path) -> list[PoseRow]:
                     docking_conf.get("conf"),
                 )
 
-        # True RMSD against crystal
-        cache_key = (str(sdf), idx)
+        # True RMSD against crystal — pick ref by pose's ligand id so a
+        # multi-cofactor target's NAP pose is scored against NAP ref, not
+        # FAD ref (atom-count mismatch → MCS fallback → 30s/pose hangs).
+        lig_id_match = None
+        for _lid in ("L1", "L2", "L3", "L4", "L5", "L"):
+            if p.source.endswith(f"_{_lid}"):
+                lig_id_match = _lid
+                break
+        if lig_id_match is None:
+            lig_id_match = "L"
+        ref_pair = lig_id_to_ref.get(lig_id_match) or next(iter(lig_id_to_ref.values()), None)
+        if ref_pair is None:
+            continue
+        ref_lig, eff_template = ref_pair
+
+        cache_key = (str(sdf), idx, lig_id_match)
         if cache_key in rmsd_cache:
             rmsd = rmsd_cache[cache_key]
         else:
@@ -494,12 +556,30 @@ def _time_limit(seconds: int):
 
 
 def main():
+    global SUBMISSIONS, RUNS, WORK
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--submissions-dir", type=Path, default=SUBMISSIONS)
+    parser.add_argument("--runs-dir", type=Path, default=RUNS)
+    parser.add_argument("--output-csv", type=Path,
+                        default=ROOT / "per_pose_scores.csv")
+    parser.add_argument("--work-dir", type=Path, default=WORK)
+    args = parser.parse_args()
+    SUBMISSIONS = args.submissions_dir
+    RUNS = args.runs_dir
+    WORK = args.work_dir
+    print(f"submissions: {SUBMISSIONS}")
+    print(f"runs:        {RUNS}")
+    print(f"output csv:  {args.output_csv}")
+    print(f"work dir:    {WORK}")
+
     targets = load_targets()
     lgs = sorted(SUBMISSIONS.glob("*_input.lg"))
     novel_lgs = [p for p in lgs if not p.name.startswith("L10")]
 
-    WORK.mkdir(exist_ok=True)
-    csv_path = ROOT / "per_pose_scores.csv"
+    WORK.mkdir(exist_ok=True, parents=True)
+    args.output_csv.parent.mkdir(exist_ok=True, parents=True)
+    csv_path = args.output_csv
     # Resume support: read already-completed targets from CSV
     done: set[str] = set()
     header_row = ["target", "seq_zone", "source", "pose_name",
@@ -606,7 +686,9 @@ def main():
         out_lines.append("")
     out_text = "\n".join(out_lines)
     print(out_text)
-    (ROOT / "per_metric_summary.txt").write_text(out_text + "\n")
+    summary_path = args.output_csv.with_name("per_metric_summary.txt")
+    summary_path.write_text(out_text + "\n")
+    print(f"summary: {summary_path}")
 
 
 if __name__ == "__main__":

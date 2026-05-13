@@ -56,7 +56,21 @@ crystal frame 으로 옮긴 pose `pred` 와 reference `ref` 사이에서:
 1. **Primary** — `pose_rmsd(pred, ref)` (`src/casp17/geometry.py`)
    - heavy-atom 만, 동일 분자식 (atom count 일치) 가정.
    - `Chem.MolToSmiles` round-trip 으로 atom ordering 정규화 후 RDKit
-     `rdMolAlign.GetBestRMS` (symmetry-corrected, no further rigid alignment).
+     `rdMolAlign.CalcRMS` (symmetry-corrected, no alignment).
+
+> ### ⚠ 규칙: RMSD 는 반드시 `rdMolAlign.CalcRMS` — `GetBestRMS` 금지
+> - **GetBestRMS** 는 내부적으로 Kabsch 정렬을 수행한 뒤 RMSD 를 반환한다.
+>   → ligand 가 pocket 밖으로 떨어졌는데도 "잘 정렬된 작은 RMSD" 가 나와
+>      placement 오류를 가린다. CASP pose evaluation 에는 부적합.
+> - **CalcRMS** 는 정렬 없이 현재 좌표에서 symmetry-aware atom mapping 만으로
+>   RMSD 를 계산한다. 우리는 receptor 단위로만 정렬하고 ligand 좌표는 그대로
+>   보고 싶으므로 이게 맞다.
+> - 추가로, 직접 `GetSubstructMatches(..., uniquify=False)` 로 permutation 을
+>   enumerate 하는 패턴도 금지 — 2026-05-11 batch 에서 symmetric ligand
+>   하나가 `score_per_metric.py` 를 1시간 넘게 hang 시켰음. C-extension 내부라
+>   SIGALRM 180s timeout 가 안 먹혔다. CalcRMS 가 내부적으로 cap 을 둔다.
+> - 신규 평가/분석 코드에서도 동일: `from rdkit.Chem import rdMolAlign;
+>   rdMolAlign.CalcRMS(prb, ref)` 로 통일.
 2. **Fallback** — `_mcs_rmsd(pred, ref)`
    - primary 가 NaN / atom-count mismatch / sanitization 실패 시 호출.
    - `rdFMCS.FindMCS(elementsMatch, anyBondMatch, ringMatchesRingOnly=True,
@@ -91,10 +105,10 @@ crystal frame 으로 옮긴 pose `pred` 와 reference `ref` 사이에서:
   실제로 native pose 를 맞췄나?" 다. 추가로 ligand 만 따로 align 하면 (예:
   Kabsch on ligand atoms) 항상 작은 RMSD 가 나오므로 평가 의미가 사라진다.
   대신 receptor 단위로만 정렬한 뒤 그 위에서 ligand 좌표를 그대로 본다.
-- **symmetric heavy-atom RMSD** — RDKit 의 `GetBestRMS` 는 분자 대칭을
-  enumerate 해 가장 작은 atom-mapping RMSD 를 반환한다. C2 대칭 분자 (예:
-  symmetric biphenyl) 에서 atom-index mismatch 만으로 잘못된 RMSD 가 나오는
-  걸 막는다.
+- **symmetric heavy-atom RMSD** — RDKit 의 `CalcRMS` 는 분자 대칭을
+  내부적으로 처리해 가장 작은 atom-mapping RMSD 를 반환한다 (정렬 X). C2 대칭
+  분자 (예: symmetric biphenyl) 에서 atom-index mismatch 만으로 잘못된 RMSD 가
+  나오는 걸 막는다. `GetBestRMS` 는 절대 쓰지 말 것 — 위 ⚠ 규칙 참조.
 - **MCS fallback** — bond order 재구성 실패는 평가 단계에서도 흔하다 (HEM,
   NAG, 변환된 protonation 상태 등). MCS 매핑은 element 만 보고 최대 공통
   substructure 의 거리 평균을 내므로 partial match 에서도 합리적 거리를 준다.

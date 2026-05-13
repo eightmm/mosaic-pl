@@ -174,35 +174,35 @@ def pose_rmsd(pred: Chem.Mol, ref: Chem.Mol, *, max_matches: int = 1000) -> floa
     """Symmetry-aware heavy-atom RMSD at the current coordinates — **no**
     rigid-body re-alignment of the ligand.
 
-    This is the correct CASP pose metric: align the protein frame first
-    (see :func:`kabsch`), apply the transform to the predicted ligand
-    (see :func:`transform_mol`), then compare ligand coordinates as-is.
-    ``rdkit.Chem.rdMolAlign.GetBestRMS`` would re-align the ligand
-    internally and return a much smaller conformational RMSD, hiding
-    pocket-placement errors entirely.
+    Uses ``rdkit.Chem.rdMolAlign.CalcRMS`` (symmetry-aware, no alignment).
 
-    Enumerates every valid atom mapping (symmetry-aware via
-    ``GetSubstructMatches``) up to ``max_matches`` and returns the
-    smallest RMSD. Returns ``nan`` when no mapping is found.
+    Why CalcRMS and not GetBestRMS:
+      * ``GetBestRMS`` performs an internal Kabsch alignment of the ligand
+        before computing RMSD, returning a conformational distance rather
+        than a pocket-placement error — useless for CASP-style evaluation
+        where the ligand must already be in the correct pocket frame.
+      * The previous hand-rolled enumeration via
+        ``GetSubstructMatches(uniquify=False)`` was correct but combinatorial
+        in symmetric ligands; on the 499-target batch one such target hung
+        score_per_metric.py for >1 h because the SIGALRM 180-s timeout
+        cannot fire inside RDKit's C-extension loop. ``CalcRMS`` caps the
+        permutation search internally.
+
+    NEVER substitute ``rdMolAlign.GetBestRMS`` here. See
+    ``docs/per_pose_rmsd_method.md`` for the rule.
+
+    Returns ``nan`` when atom mapping fails (typically atom-count mismatch
+    or sanitization failure — the caller should fall back to MCS RMSD).
     """
+    from rdkit.Chem import rdMolAlign  # type: ignore
     pred_h = Chem.RemoveHs(pred)
     ref_h = Chem.RemoveHs(ref)
-    matches = ref_h.GetSubstructMatches(pred_h, uniquify=False)
-    if not matches:
-        matches_r = pred_h.GetSubstructMatches(ref_h, uniquify=False)
-        if not matches_r:
+    try:
+        return float(rdMolAlign.CalcRMS(pred_h, ref_h))
+    except Exception:
+        # Try the reverse direction (probe/ref swap) for edge cases where
+        # only one ordering admits a substructure match.
+        try:
+            return float(rdMolAlign.CalcRMS(ref_h, pred_h))
+        except Exception:
             return math.nan
-        matches = [tuple(m) for m in matches_r]
-        pred_h, ref_h = ref_h, pred_h
-
-    pred_conf = pred_h.GetConformer()
-    ref_conf = ref_h.GetConformer()
-    best = math.inf
-    for match in matches[:max_matches]:
-        d2 = 0.0
-        for i, j in enumerate(match):
-            pi = pred_conf.GetAtomPosition(i)
-            rj = ref_conf.GetAtomPosition(j)
-            d2 += (pi.x - rj.x) ** 2 + (pi.y - rj.y) ** 2 + (pi.z - rj.z) ** 2
-        best = min(best, math.sqrt(d2 / len(match)))
-    return best

@@ -15,6 +15,7 @@ MODEL_NAMES = (
     "vina",
     "autodock_gpu",
     "protenix_dock",
+    "surfdock",
     "template_search_sequence",
     "template_search_structure",
 )
@@ -630,6 +631,84 @@ class ProtenixDockConfig:
 
 
 @dataclass(slots=True)
+class SurfDockConfig:
+    """SurfDock — surface-informed diffusion docking (CAODH/SurfDock).
+
+    Wired in as a 4th docking lane (alongside Vina/AutoDock-GPU/Protenix-Dock)
+    purely for pose diversity. Inference is split into three sub-stages —
+    surface mesh prep, ESM-2 3B pocket embedding, then the diffusion model
+    itself — and we drive all three from one wrapper script per binding-site
+    source. Only the cofolding cif (receptor) and the docked ligand SDF
+    cross over from the rest of the pipeline.
+
+    Defaults reflect the SurfDock screen_pipeline.sh reference run (20
+    inference steps, batch=40 poses).
+    """
+
+    enabled: bool = False
+    # SurfDock conda env (mamba/conda created from environment.yaml).
+    python_bin: str = ".venvs/surfdock/bin/python"
+    repo_dir: str = "external/SurfDock"
+    # Diffusion model + scoring head + confidence head (SurfDock ships
+    # three checkpoints under model_weights/{docking,posepredict,screen}).
+    model_dir: str = "external/SurfDock/model_weights/docking"
+    model_ckpt: str | None = None
+    confidence_model_dir: str = "external/SurfDock/model_weights/posepredict"
+    confidence_model_ckpt: str | None = None
+    # ESM-2 3B for pocket embeddings. SurfDock loads weights via fair-esm
+    # which downloads on first call, but we cache to a fixed dir to avoid
+    # re-fetching on every SLURM run.
+    esm_cache_dir: str | None = None
+    # Inference knobs from screen_pipeline.sh.
+    inference_steps: int = 20
+    batch_size: int = 40
+    batch_size_molecule: int = 1
+    samples_per_complex: int = 40
+    # Number of independent inference runs per (binding-site source, seed).
+    # SurfDock is a diffusion model so we get multi-pose diversity for
+    # free; this controls how many *additional* full passes to do.
+    num_inference_runs: int = 1
+    # Pocket cutoff radius (Å) for surface + ESM embedding extraction.
+    pocket_cutoff_a: float = 8.0
+    devices: int = 1
+    extra_args: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "SurfDockConfig":
+        if data is None:
+            return cls()
+        return cls(
+            enabled=_to_bool(data.get("enabled"), False),
+            python_bin=str(data.get("python_bin", ".venvs/surfdock/bin/python")),
+            repo_dir=str(data.get("repo_dir", "external/SurfDock")),
+            model_dir=str(
+                data.get("model_dir", "external/SurfDock/model_weights/docking")
+            ),
+            model_ckpt=_optional_string(data.get("model_ckpt"), "surfdock.model_ckpt"),
+            confidence_model_dir=str(
+                data.get(
+                    "confidence_model_dir",
+                    "external/SurfDock/model_weights/posepredict",
+                )
+            ),
+            confidence_model_ckpt=_optional_string(
+                data.get("confidence_model_ckpt"), "surfdock.confidence_model_ckpt"
+            ),
+            esm_cache_dir=_optional_string(
+                data.get("esm_cache_dir"), "surfdock.esm_cache_dir"
+            ),
+            inference_steps=int(data.get("inference_steps", 20)),
+            batch_size=int(data.get("batch_size", 40)),
+            batch_size_molecule=int(data.get("batch_size_molecule", 1)),
+            samples_per_complex=int(data.get("samples_per_complex", 40)),
+            num_inference_runs=int(data.get("num_inference_runs", 1)),
+            pocket_cutoff_a=float(data.get("pocket_cutoff_a", 8.0)),
+            devices=int(data.get("devices", 1)),
+            extra_args=[str(arg) for arg in data.get("extra_args", [])],
+        )
+
+
+@dataclass(slots=True)
 class TemplateSearchSequenceConfig:
     enabled: bool = False
     binary: str = "mmseqs"
@@ -861,6 +940,7 @@ class RunnerConfig:
     vina: VinaConfig = field(default_factory=VinaConfig)
     autodock_gpu: AutoDockGPUConfig = field(default_factory=AutoDockGPUConfig)
     protenix_dock: ProtenixDockConfig = field(default_factory=ProtenixDockConfig)
+    surfdock: SurfDockConfig = field(default_factory=SurfDockConfig)
     template_search_sequence: TemplateSearchSequenceConfig = field(
         default_factory=TemplateSearchSequenceConfig
     )
@@ -893,6 +973,9 @@ class RunnerConfig:
             ),
             protenix_dock=ProtenixDockConfig.from_dict(
                 _merge_preset_section(preset, "protenix_dock", data.get("protenix_dock"))
+            ),
+            surfdock=SurfDockConfig.from_dict(
+                _merge_preset_section(preset, "surfdock", data.get("surfdock"))
             ),
             template_search_sequence=TemplateSearchSequenceConfig.from_dict(
                 data.get("template_search_sequence")

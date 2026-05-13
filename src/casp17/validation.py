@@ -208,8 +208,16 @@ def validate_run(
             _validate_command_target(
                 errors, repo_root, config.autodock_gpu.binary, "autodock_gpu.binary", enabled=True
             )
-        if not config.vina.enabled and not config.protenix_dock.enabled and not config.autodock_gpu.enabled:
-            errors.append("Docking stage is selected but no docking tool (vina, autodock_gpu, protenix_dock) is enabled.")
+        if (
+            not config.vina.enabled
+            and not config.protenix_dock.enabled
+            and not config.autodock_gpu.enabled
+            and not config.surfdock.enabled
+        ):
+            errors.append(
+                "Docking stage is selected but no docking tool "
+                "(vina, autodock_gpu, protenix_dock, surfdock) is enabled."
+            )
 
     return ValidationReport(errors=errors, warnings=warnings, infos=infos)
 
@@ -252,7 +260,12 @@ def _resolve_stages(
         resolved.append("cofolding")
     if config.template_search_structure.enabled:
         resolved.append("template-search-structure")
-    if config.vina.enabled or config.autodock_gpu.enabled or config.protenix_dock.enabled:
+    if (
+        config.vina.enabled
+        or config.autodock_gpu.enabled
+        or config.protenix_dock.enabled
+        or config.surfdock.enabled
+    ):
         resolved.append("docking")
     if not resolved and not allow_empty:
         raise ValueError("No stage is enabled or requested.")

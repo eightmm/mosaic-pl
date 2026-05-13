@@ -250,9 +250,11 @@ def main() -> int:
         for outer in sorted(args.runs_dir.iterdir()):
             if not outer.is_dir() or not outer.name.endswith("_input"):
                 continue
-            inner = outer / outer.name
-            if inner.exists():
-                runs.append(inner)
+            nested = outer / outer.name
+            if nested.exists():
+                runs.append(nested)
+            elif (outer / "inputs" / "docking").exists() or (outer / "outputs").exists():
+                runs.append(outer)
     else:
         print("error: provide --runs-dir or --target-dir")
         return 2

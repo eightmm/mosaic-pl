@@ -14,6 +14,7 @@ from casp17.adapters import (
     prepare_boltz,
     prepare_protenix,
     prepare_protenix_dock,
+    prepare_surfdock,
     prepare_template_search_sequence,
     prepare_template_search_structure,
     prepare_vina,
@@ -186,6 +187,9 @@ def prepare_docking_run(
     pxd = prepare_protenix_dock(common, config, run_dir)
     if pxd is not None:
         model_runs.append(pxd)
+    surfdock_run = prepare_surfdock(common, config, run_dir)
+    if surfdock_run is not None:
+        model_runs.append(surfdock_run)
     if not model_runs:
         raise ValueError("No docking tool is enabled in the runner config.")
 

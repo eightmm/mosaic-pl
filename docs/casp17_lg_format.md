@@ -1,12 +1,82 @@
 # CASP17 LG (Ligand) Submission Format — Authoritative Reference
 
-Source: https://predictioncenter.org/casp17/index.cgi?page=format
+Source: <https://predictioncenter.org/casp17/index.cgi?page=format>
 Format text is identical to CASP16 LG format
-(https://predictioncenter.org/casp16/index.cgi?page=format#LG).
-Verified: 2026-04-23 (KST)
+(<https://predictioncenter.org/casp16/index.cgi?page=format#LG>).
+Last verified against the live page: 2026-05-06 (KST).
 
-This document is the authoritative reference for our `scripts/make_casp_submission.py`
-implementation.
+> **Read this file before generating or modifying any LG-format
+> submission.** It is the canonical mirror of the CASP17 format page,
+> and it is the contract that every LG builder + linter in this repo
+> respects:
+>
+> - `scripts/make_casp_submission.py` (protein-ligand)
+> - `scripts/build_rna_ligand_lg_submission.py` (RNA-ligand)
+> - `scripts/lint_lg_submission.py` (format validator, also wired to
+>   `make lint-lg` and `tests/test_lg_lint.py`)
+>
+> If the upstream CASP page changes, update this file first and then
+> propagate behaviour into the builders / linter so the mirror stays
+> trusted.
+
+RNA-ligand specifics (chain id `0` convention, OP3 5'-end residue,
+ENDMDL handling vs. TS-style templates) live in
+`docs/casp17_rna_ligand_recipe.md`.
+
+## 0. Server-verified rules (override the spec page when they conflict)
+
+These items were confirmed against the live CASP17 LG validator on
+2026-05-06 by submitting R2314 / R2317 / R2318 and observing what the
+server actually accepts. The format page text and the validator
+disagree on a handful of points; **the validator wins**. Source:
+`memory/casp17_lg_format_spec.md`.
+
+1. **Single MODEL per file.** "Submission files in LG and QA categories
+   should contain only one model." To submit five alternates, upload
+   five separate files (`<TID>_1.lg` … `<TID>_5.lg`). Multi-MODEL files
+   trigger `validation script crashed, get in touch with the
+   Prediction Center`.
+2. **`LIGAND <id>` uses the SMILES file integer ID verbatim — no
+   zero-padding.** The format page's `LIGAND 001 LIG` example is
+   misleading. Fetch the per-target SMILES file
+   (`target.cgi?target=<TID>&view=smiles`) and copy the `ID` column
+   straight in (e.g. `LIGAND 0 TRP`).
+3. **MDL atom block must include hydrogens.** Use
+   `Chem.AddHs(mol, addCoords=True)` before `MolToMolBlock`. Heavy-only
+   blocks fail the server's atom-count comparison against the SMILES
+   reference and crash the validator.
+4. **MDL bond stereo column must be `0` for every bond.** Reset chirality
+   tags + bond directions before emit:
+   `atom.SetChiralTag(CHI_UNSPECIFIED)` and
+   `bond.SetBondDir(BondDir.NONE)`. 3D coordinates already encode
+   stereochemistry; a `1` (wedge up) in the stereo column crashes the
+   validator on chiral atoms.
+5. **`TER` is the bare four-letter line, not the full PDB-style record
+   with serial/resName.** Match `spec example 6.1`.
+6. **No `ENDMDL`.** The LG MODEL terminator is `END` only.
+7. **AUTHOR / METHOD trailing line.** The `casp17_own` group code is
+   `0887-0325-2808`. Append a fixed METHOD continuation line:
+   `METHOD Pipeline configured and executed via Claude Code agentic decision-making`.
+8. **Chain id by polymer type.** Protein chains use alphabetic ids
+   (`A`/`B`/...); RNA and DNA chains use digit ids (`0`/`1`/...). For
+   RNA-only targets the receptor lives on chain `0`; cofolding emits
+   chain `A` natively, so the LG writer rewrites column 22 to `0`
+   before output. Mixed protein-RNA targets (`M*`) need per-chain
+   remapping (still TODO).
+9. **B-factors must vary** across the receptor (CASP rejects flat
+   B-factors). Boltz/Protenix/AF3 all populate per-residue pLDDT, so
+   this falls out naturally for cofolded models.
+
+The repo enforces all of the above via:
+- `scripts/build_rna_ligand_lg_submission.py` — emits one
+  multi-MODEL `<TID>.lg` (review only) **plus** the five
+  single-MODEL `<TID>_<k>.lg` submission files in one invocation.
+- `scripts/lint_lg_submission.py` — auto-detects single-MODEL
+  submission files by filename suffix `_<n>.lg` and rejects
+  multi-MODEL ones in that mode.
+- `scripts/make_casp_submission.py::build_lg_submission` — the
+  shared LG assembler used by both protein-ligand and RNA-ligand
+  pipelines.
 
 ---
 

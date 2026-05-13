@@ -148,6 +148,7 @@ def patch_boltz_yaml(
     # Map chain id → AF3 chain dict (AF3 input uses an array of single-key
     # entity wrappers — same shape as Boltz's ``sequences`` list).
     af3_chains = {}
+    af3_rna_chains: dict[str, dict[str, Any]] = {}
     for entry in af3_data.get("sequences", []) or []:
         if isinstance(entry, dict) and "protein" in entry:
             chain = entry["protein"]
@@ -159,6 +160,34 @@ def patch_boltz_yaml(
                     af3_chains[str(c)] = chain
             elif cid:
                 af3_chains[str(cid)] = chain
+        elif isinstance(entry, dict) and "rna" in entry:
+            chain = entry["rna"]
+            cid = chain.get("id")
+            if isinstance(cid, list):
+                for c in cid:
+                    af3_rna_chains[str(c)] = chain
+            elif cid:
+                af3_rna_chains[str(cid)] = chain
+
+    # Per-RNA-chain MSA injection — AF3's data pipeline runs nhmmer against
+    # rfam + rnacentral + nt_rna and stores the result in
+    # ``rna.unpairedMsa``. We dump it to a shared a3m and point Boltz's
+    # ``rna.msa`` at the file (Boltz schema accepts ``msa: <path>`` for rna
+    # entries the same way as for protein).
+    for entry in spec.get("sequences", []) or []:
+        if not isinstance(entry, dict) or "rna" not in entry:
+            continue
+        rna = entry["rna"]
+        cid = rna.get("id")
+        ids = cid if isinstance(cid, list) else [cid]
+        primary = next((str(c) for c in ids if str(c) in af3_rna_chains), None)
+        if primary is None:
+            continue
+        unpaired = af3_rna_chains[primary].get("unpairedMsa")
+        if unpaired:
+            rna_a3m = msa_pipeline_dir / "shared_msa" / f"{primary}_rna_unpaired.a3m"
+            _write_a3m(unpaired, rna_a3m)
+            rna["msa"] = str(rna_a3m)
 
     # Per-chain MSA injection
     for entry in spec.get("sequences", []) or []:
@@ -213,9 +242,17 @@ def patch_boltz_yaml(
     spec["use_msa_server"] = False
 
     yaml_path.write_text(pyyaml.safe_dump(spec, sort_keys=False))
+    n_protein = sum(
+        1 for s in spec.get("sequences", []) or [] if isinstance(s, dict) and "protein" in s
+    )
+    n_rna = sum(
+        1
+        for s in spec.get("sequences", []) or []
+        if isinstance(s, dict) and "rna" in s and isinstance(s["rna"], dict) and s["rna"].get("msa")
+    )
     print(
         f"[bridge] patched {yaml_path}: "
-        f"{sum(1 for s in spec.get('sequences', []) if isinstance(s, dict) and 'protein' in s)} chains, "
+        f"{n_protein} protein chains, {n_rna} RNA chains, "
         f"{len(template_cifs)} templates"
     )
 
@@ -242,6 +279,7 @@ def patch_protenix_json(
     data = json.loads(json_path.read_text())
 
     af3_chains: dict[str, dict[str, Any]] = {}
+    af3_rna_chains: dict[str, dict[str, Any]] = {}
     for entry in af3_data.get("sequences", []) or []:
         if isinstance(entry, dict) and "protein" in entry:
             chain = entry["protein"]
@@ -251,11 +289,20 @@ def patch_protenix_json(
                     af3_chains[str(c)] = chain
             elif cid:
                 af3_chains[str(cid)] = chain
+        elif isinstance(entry, dict) and "rna" in entry:
+            chain = entry["rna"]
+            cid = chain.get("id")
+            if isinstance(cid, list):
+                for c in cid:
+                    af3_rna_chains[str(c)] = chain
+            elif cid:
+                af3_rna_chains[str(cid)] = chain
 
     # Protenix input is a list[dict] (one per fold target). Iterate every
     # target's sequences[].proteinChain and patch.
     targets = data if isinstance(data, list) else [data]
     n_chains = 0
+    n_rna_chains = 0
     n_templates = 0
 
     for target in targets:
@@ -264,7 +311,19 @@ def patch_protenix_json(
         # id (the chain id is implicit in the input order, expanded by
         # ``count``). Walk in declaration order and pair with AF3 chains.
         af3_iter = iter(af3_chains.items())
+        af3_rna_iter = iter(af3_rna_chains.items())
         for entry in seqs:
+            if isinstance(entry, dict) and "rnaSequence" in entry:
+                rna_chain = entry["rnaSequence"]
+                try:
+                    rna_id, _ = next(af3_rna_iter)
+                except StopIteration:
+                    continue
+                rna_a3m = msa_pipeline_dir / "shared_msa" / f"{rna_id}_rna_unpaired.a3m"
+                if rna_a3m.exists():
+                    rna_chain["unpairedMsaPath"] = str(rna_a3m)
+                    n_rna_chains += 1
+                continue
             if not isinstance(entry, dict) or "proteinChain" not in entry:
                 continue
             chain = entry["proteinChain"]
@@ -308,7 +367,11 @@ def patch_protenix_json(
                 n_templates += len(cifs)
 
     json_path.write_text(json.dumps(data, indent=2))
-    print(f"[bridge] patched {json_path}: {n_chains} chains, {n_templates} template entries")
+    print(
+        f"[bridge] patched {json_path}: "
+        f"{n_chains} protein chains, {n_rna_chains} RNA chains, "
+        f"{n_templates} template entries"
+    )
 
 
 def replace_alphafold3_json(

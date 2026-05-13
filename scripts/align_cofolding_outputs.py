@@ -24,6 +24,56 @@ import sys
 from pathlib import Path
 
 
+def _align_via_usalign(
+    query_path: Path,
+    query_structure,
+    ref_path: Path,
+    output_path: Path,
+) -> dict:
+    """USalign-based whole-structure superposition for non-protein targets.
+
+    USalign computes ``ref ≈ R @ pred + t``; we apply that transform to
+    every atom of the query and write the result to ``output_path``.
+    """
+    import gemmi
+    import math
+    import numpy as np
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+    from casp17.usalign import run_usalign  # type: ignore
+
+    res = run_usalign(query_path, ref_path)
+    if res is None:
+        return {
+            "query": str(query_path),
+            "aligned": None,
+            "n_matched_ca": 0,
+            "rmsd_before": None,
+            "rmsd_after": None,
+            "status": "usalign_failed",
+        }
+    R, t, tm, rmsd_after = res
+    for model in query_structure:
+        for chain in model:
+            for residue in chain:
+                for atom in residue:
+                    p = atom.pos
+                    new = R @ np.array([p.x, p.y, p.z]) + t
+                    atom.pos = gemmi.Position(float(new[0]), float(new[1]), float(new[2]))
+        break
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    query_structure.make_mmcif_document().write_file(str(output_path))
+    return {
+        "query": str(query_path),
+        "aligned": str(output_path),
+        "n_matched_ca": 0,
+        "tm_score": round(float(tm), 3) if tm is not None else None,
+        "rmsd_before": None,
+        "rmsd_after": round(float(rmsd_after), 3) if rmsd_after is not None else None,
+        "status": "aligned_usalign",
+    }
+
+
 def _read_confidence(run_dir: Path) -> dict[str, float]:
     """Read pLDDT scores for each cofolding model (reuse prepare_docking_inputs logic)."""
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -157,8 +207,21 @@ def _sequence_match_cas(ref_cas, query_cas):
     return pairs_ref, pairs_query
 
 
-def align_structure(query_path: Path, ref_structure, ref_cas, output_path: Path) -> dict:
-    """Align a query CIF to the reference structure using CA superposition.
+def align_structure(
+    query_path: Path,
+    ref_structure,
+    ref_cas,
+    output_path: Path,
+    ref_path: Path | None = None,
+) -> dict:
+    """Align a query CIF to the reference structure.
+
+    Default path: CA superposition with sequence-matched residues
+    (protein-targeted, fast, deterministic). When the query/reference do
+    not have ≥ 10 matchable CA atoms (typical for RNA, DNA, or hybrid
+    nucleic-acid targets), fall back to USalign on the full structure —
+    USalign auto-detects polymer type and produces an R/t transform that
+    we apply to every atom of the query.
 
     Writes the aligned structure to ``output_path`` and returns a summary dict.
     """
@@ -171,14 +234,16 @@ def align_structure(query_path: Path, ref_structure, ref_cas, output_path: Path)
     n_matched = len(pairs_ref)
 
     if n_matched < 10:
-        return {
-            "query": str(query_path),
-            "aligned": None,
-            "n_matched_ca": n_matched,
-            "rmsd_before": None,
-            "rmsd_after": None,
-            "status": "skipped_insufficient_matches",
-        }
+        if ref_path is None:
+            return {
+                "query": str(query_path),
+                "aligned": None,
+                "n_matched_ca": n_matched,
+                "rmsd_before": None,
+                "rmsd_after": None,
+                "status": "skipped_insufficient_matches",
+            }
+        return _align_via_usalign(query_path, query_st, ref_path, output_path)
 
     # Compute superposition: finds transform that maps query onto ref
     sup = gemmi.superpose_positions(pairs_ref, pairs_query)
@@ -301,13 +366,17 @@ def main() -> int:
                 continue
 
             aligned_path = cif.with_name(cif.stem + "_aligned.cif")
-            result = align_structure(cif, ref_st, ref_cas, aligned_path)
+            result = align_structure(cif, ref_st, ref_cas, aligned_path, ref_path=ref_path)
             results.append(result)
 
             if result["status"] == "aligned":
                 n_aligned += 1
                 print(f"  {model}/{cif.name}: {result['n_matched_ca']} CA, "
                       f"RMSD {result['rmsd_before']:.1f} → {result['rmsd_after']:.2f} Å")
+            elif result["status"] == "aligned_usalign":
+                n_aligned += 1
+                print(f"  {model}/{cif.name}: USalign TM {result.get('tm_score')}, "
+                      f"RMSD_after {result['rmsd_after']:.2f} Å")
             else:
                 n_skipped += 1
                 print(f"  {model}/{cif.name}: skipped ({result['status']})")

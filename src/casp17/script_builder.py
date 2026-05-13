@@ -507,6 +507,7 @@ def build_wrapper_shell_script(
                     f" || echo '  (cofolding alignment failed, continuing)'",
                     "",
                 ])
+
             if has_template_search and not template_bridges_done:
                 _emit_template_bridges(run_dir)
                 template_bridges_done = True
@@ -534,6 +535,25 @@ def build_wrapper_shell_script(
         )
         if stage_name == "cofolding":
             cofold_done = True
+
+    # If cofolding ran but no docking stage followed (RNA-only / pure
+    # structure prediction runs), the alignment bridge inside the loop never
+    # fired (its trigger is ``stage_name == "docking"``). LG submission and
+    # any downstream consumer that prefers ``*_aligned.cif`` would then
+    # silently fall back to unaligned cifs. Emit alignment here so a single
+    # coordinate frame is guaranteed regardless of pipeline composition.
+    if cofold_done and "docking" not in {n for n, _ in stage_scripts}:
+        run_dir = stage_scripts[0][1].parent.parent
+        lines.extend([
+            'echo ""',
+            'echo "================================================================"',
+            'echo "  BRIDGE: Aligning cofolding outputs to common frame"',
+            'echo "================================================================"',
+            f"{shlex.quote(str(hub_python))} {shlex.quote(str(align_script))} "
+            f"--run-dir {shlex.quote(str(run_dir))}"
+            f" || echo '  (cofolding alignment failed, continuing)'",
+            "",
+        ])
 
     # Template-only pipeline (no docking stage): emit bridges post-loop so
     # multi-track docking + ion placement still find filtered_hits.tsv.

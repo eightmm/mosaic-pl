@@ -29,6 +29,42 @@ import json
 from pathlib import Path
 
 
+def _safe_v2000_molblock(mol, *, kekulize: bool = False) -> str:
+    """Emit a V2000 MDL mol block, scrubbing the stereo metadata that can
+    push RDKit into V3000 output.
+
+    The CASP LG validator accepts V2000 only (verified 2026-05-06; see
+    ``docs/casp17_lg_format.md`` §0). RDKit auto-selects V3000 when
+    ``MolToMolBlock`` cannot encode the molecule's stereo information in
+    the 3-character V2000 columns — even for small ligands. Per-atom
+    chirality and per-bond direction are already encoded in the 3D
+    coordinates, so we strip them before emit. Enhanced stereo groups
+    are dropped likewise.
+
+    Raises ``ValueError`` if the result is still V3000 — at that point
+    the molecule genuinely exceeds the V2000 size limit (atom or bond
+    count > 999) and the LG entry cannot be produced.
+    """
+    from rdkit import Chem
+
+    for atom in mol.GetAtoms():
+        atom.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
+    for bond in mol.GetBonds():
+        bond.SetBondDir(Chem.BondDir.NONE)
+    try:
+        mol.SetStereoGroups([])
+    except (AttributeError, RuntimeError):
+        pass
+    block = Chem.MolToMolBlock(mol, kekulize=kekulize)
+    lines = block.splitlines()
+    if len(lines) >= 4 and "V3000" in lines[3]:
+        raise ValueError(
+            "RDKit produced a V3000 mol block which the CASP LG validator "
+            "rejects; ligand likely exceeds V2000's 999-atom/bond cap"
+        )
+    return block
+
+
 def find_best_cofolding_cif(run_dir: Path, preferred: str | None = None) -> tuple[str, Path]:
     """Find best cofolding CIF, preferring ``_aligned.cif`` and pLDDT ranking.
 
@@ -310,7 +346,7 @@ def extract_cofolded_ligand_mdl(
                 if residue.name in {"HOH", "WAT", "DOD"}:
                     continue
                 tab = gemmi.find_tabulated_residue(residue.name)
-                if tab and tab.is_amino_acid():
+                if tab and (tab.is_amino_acid() or tab.is_nucleic_acid()):
                     continue
                 for atom in residue:
                     atom_idx += 1
@@ -342,7 +378,7 @@ def extract_cofolded_ligand_mdl(
         pass
     if title:
         mol.SetProp("_Name", title)
-    output_mol.write_text(Chem.MolToMolBlock(mol, kekulize=False))
+    output_mol.write_text(_safe_v2000_molblock(mol, kekulize=False))
     return output_mol
 
 
@@ -373,7 +409,7 @@ def _sdf_to_mdl(
         )
     if title:
         mol.SetProp("_Name", title)
-    mol_block = Chem.MolToMolBlock(mol, kekulize=True)
+    mol_block = _safe_v2000_molblock(mol, kekulize=True)
     output_mol.write_text(mol_block)
 
 
@@ -424,6 +460,7 @@ def build_lg_submission(
     method: str,
     models: list[dict],
     parent: str = "N/A",
+    start_model_idx: int = 1,
 ) -> str:
     """Assemble CASP17 LG format submission text per docs/casp17_lg_format.md.
 
@@ -458,15 +495,23 @@ def build_lg_submission(
             "Truncate to top-5 before calling."
         )
 
+    # Each non-empty line of ``method`` becomes its own ``METHOD`` record so
+    # multi-line method descriptions emit valid CASP-style continuations
+    # (matches CASP17_own's accepted submissions).
+    method_records = [
+        f"METHOD {ln.rstrip()}"
+        for ln in method.splitlines()
+        if ln.strip()
+    ] or [f"METHOD {method}"]
     lines = [
         "PFRMAT LG",
         f"TARGET {target_id}",
         f"AUTHOR {author}",
-        f"METHOD {method}",
-        "METHOD -------------",
+        *method_records,
     ]
 
-    for idx, model in enumerate(models, start=1):
+    for offset, model in enumerate(models):
+        idx = start_model_idx + offset
         ligand_entries = model.get("ligands") or []
         if not ligand_entries:
             raise ValueError(f"MODEL {idx} has no ligand entries")
@@ -483,11 +528,15 @@ def build_lg_submission(
             protein_block.append("TER")
         lines.extend(protein_block)
 
-        # One LIGAND block per ligand
+        # One LIGAND block per ligand. ID is the integer from the CASP-issued
+        # SMILES file column, emitted *as-is* (no zero-pad). Verified
+        # against the live LG validator on R2314/R2317/R2318: zero-padded
+        # ids like ``001`` cause server lookup against the SMILES file to
+        # crash. See docs/casp17_lg_format.md §6.
         for lig in ligand_entries:
             ligand_number = int(lig["ligand_number"])
             ligand_name = str(lig["ligand_name"])
-            lines.append(f"LIGAND {ligand_number:03d} {ligand_name}")
+            lines.append(f"LIGAND {ligand_number} {ligand_name}")
             if lig.get("lscore") is not None:
                 lines.append(f"LSCORE {float(lig['lscore']):.3f}")
             mdl_text = (lig.get("ligand_mdl") or "").rstrip()

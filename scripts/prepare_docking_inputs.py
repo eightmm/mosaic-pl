@@ -1150,6 +1150,12 @@ def main() -> int:
                              "deterministic from _aligned.cif.")
     args = parser.parse_args()
 
+    # Force absolute. Every receptor/ligand path the prep summary emits
+    # is derived from args.output_dir, and downstream consumers (notably
+    # the ADG runner, which invokes autogrid with cwd=lig_grid_dir) cannot
+    # resolve relative paths from their own cwd. Past silent-fail across
+    # the 499-target batch on 2026-05-09 traced to this.
+    args.output_dir = args.output_dir.resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Extract SMILES
