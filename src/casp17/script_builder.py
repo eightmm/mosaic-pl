@@ -627,7 +627,9 @@ def build_wrapper_shell_script(
     if has_docking and config.submission.enabled:
         run_dir = stage_scripts[0][1].parent.parent
         sub_cfg = config.submission
-        submission_output = run_dir.parent.parent / "submissions" / f"{job_name}.lg"
+        # CASP submission filename is fixed to ``{target}_LCDD.lg`` — LCDD is
+        # our CASP group name (registration 6095-5696-9732).
+        submission_output = run_dir.parent.parent / "submissions" / f"{job_name}_LCDD.lg"
         # Ligand numbers + names are derived from docking_prep_summary.json
         # inside make_casp_submission.py. The --ligand-name flag overrides the
         # MDL "name" label — default "LIG" matches CASP convention.

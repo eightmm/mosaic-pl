@@ -1197,5 +1197,5 @@ def test_post_analysis_config_defaults() -> None:
 def test_submission_config_defaults() -> None:
     config = RunnerConfig.from_dict({})
     assert config.submission.enabled is False
-    assert config.submission.author == "0000-0000-0000"
+    assert config.submission.author == "6095-5696-9732"
     assert config.submission.include_affinity is True

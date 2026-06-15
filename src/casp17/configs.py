@@ -911,7 +911,7 @@ class PostAnalysisConfig:
 @dataclass(slots=True)
 class SubmissionConfig:
     enabled: bool = False
-    author: str = "0000-0000-0000"
+    author: str = "6095-5696-9732"
     method: str = "CASP17 protein-ligand pipeline ensemble"
     include_affinity: bool = True
     parent: str = "N/A"
@@ -923,7 +923,7 @@ class SubmissionConfig:
             return cls()
         return cls(
             enabled=_to_bool(data.get("enabled"), False),
-            author=str(data.get("author", "0000-0000-0000")),
+            author=str(data.get("author", "6095-5696-9732")),
             method=str(data.get("method", "CASP17 protein-ligand pipeline ensemble")),
             include_affinity=_to_bool(data.get("include_affinity"), True),
             parent=str(data.get("parent", "N/A")),
