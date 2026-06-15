@@ -450,8 +450,21 @@ def prepare_alphafold3(
             ]
             if modifications:
                 protein_block["modifications"] = modifications
+            # When the unified MSA pipeline is enabled the AF3 data pipeline
+            # MUST run jackhmmer itself. Setting ``unpairedMsa`` here (even to
+            # ``""`` from ``msa: empty``) makes AF3 read ``has_msa=True`` and
+            # skip the search → query-only MSA. So in pipeline mode we leave
+            # the MSA fields absent regardless of the input ``msa`` value; the
+            # wrapper bridge overwrites this input with the data-pipeline output
+            # anyway. Only honour explicit ``msa`` in legacy (non-pipeline) mode.
             msa_value = entity.get("msa")
-            if msa_value == "empty":
+            if config.msa_pipeline.enabled:
+                if msa_value not in (None, "empty"):
+                    notes.append(
+                        f"AlphaFold3 adapter ignores input msa for chain(s) {ids} "
+                        f"because msa_pipeline.enabled runs jackhmmer itself: {msa_value}"
+                    )
+            elif msa_value == "empty":
                 protein_block["unpairedMsa"] = ""
                 protein_block["pairedMsa"] = ""
             elif isinstance(msa_value, str) and msa_value:
