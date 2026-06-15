@@ -890,7 +890,7 @@ def test_build_lg_submission_basic() -> None:
     assert "AUTHOR 0123-4567-8901" in result
     assert "MODEL 1" in result
     assert "PARENT 1CGH" in result
-    assert "LIGAND 001 761" in result
+    assert "LIGAND 1 761" in result
     assert "LSCORE 0.820" in result
     assert "M  END" in result
     assert result.strip().endswith("END")
@@ -910,7 +910,7 @@ def test_build_lg_submission_no_lscore() -> None:
             "ligands": [_mk_ligand(2, "380", lscore=None)],
         }],
     )
-    assert "LIGAND 002 380" in result
+    assert "LIGAND 2 380" in result
     assert "LSCORE" not in result
 
 
@@ -991,8 +991,8 @@ def test_build_lg_submission_multi_ligand_per_model() -> None:
         }],
     )
     # Both LIGAND blocks present in same MODEL
-    assert "LIGAND 001 LIG" in result
-    assert "LIGAND 002 LIG" in result
+    assert "LIGAND 1 LIG" in result
+    assert "LIGAND 2 LIG" in result
     # Both LSCOREs present
     assert "LSCORE 0.820" in result
     assert "LSCORE 0.650" in result

@@ -41,10 +41,11 @@ disagree on a handful of points; **the validator wins**. Source:
    misleading. Fetch the per-target SMILES file
    (`target.cgi?target=<TID>&view=smiles`) and copy the `ID` column
    straight in (e.g. `LIGAND 0 TRP`).
-3. **MDL atom block must include hydrogens.** Use
-   `Chem.AddHs(mol, addCoords=True)` before `MolToMolBlock`. Heavy-only
-   blocks fail the server's atom-count comparison against the SMILES
-   reference and crash the validator.
+3. **MDL atom block omits hydrogens for current RNA-ligand targets.**
+   The CASP17 format page says hydrogens are optional, and the live
+   validator rejected explicit-H SAM/TPP blocks as invalid ligand
+   topology. Emit heavy atoms only, with bond orders copied from the
+   CASP SMILES reference.
 4. **MDL bond stereo column must be `0` for every bond.** Reset chirality
    tags + bond directions before emit:
    `atom.SetChiralTag(CHI_UNSPECIFIED)` and
@@ -68,12 +69,10 @@ disagree on a handful of points; **the validator wins**. Source:
    this falls out naturally for cofolded models.
 
 The repo enforces all of the above via:
-- `scripts/build_rna_ligand_lg_submission.py` — emits one
-  multi-MODEL `<TID>.lg` (review only) **plus** the five
-  single-MODEL `<TID>_<k>.lg` submission files in one invocation.
-- `scripts/lint_lg_submission.py` — auto-detects single-MODEL
-  submission files by filename suffix `_<n>.lg` and rejects
-  multi-MODEL ones in that mode.
+- `scripts/build_rna_ligand_lg_submission.py` — emits one target-level
+  multi-MODEL `<TID>.lg` submission file.
+- `scripts/lint_lg_submission.py` — validates target-level multi-MODEL
+  submission files.
 - `scripts/make_casp_submission.py::build_lg_submission` — the
   shared LG assembler used by both protein-ligand and RNA-ligand
   pipelines.
@@ -116,13 +115,13 @@ PARENT <template>                 # required when receptor coords present
 ATOM   ...                        # receptor PDB coords
 ...
 TER
-LIGAND 001 LIG                    # first ligand, ligand_number = 001
+LIGAND 1 LIG                      # first ligand, ID verbatim (no zero-pad)
 LSCORE 0.82                       # optional, per-ligand, in [0, 1]
-<MDL V2000 body for ligand 001>
+<MDL V2000 body for ligand 1>
 M  END
-LIGAND 002 LIG                    # second ligand (multi-ligand target)
+LIGAND 2 LIG                      # second ligand (multi-ligand target)
 LSCORE 0.65
-<MDL V2000 body for ligand 002>
+<MDL V2000 body for ligand 2>
 M  END
 AFFNTY 0.050 aa                   # optional, per MODEL, after last LIGAND
 END
