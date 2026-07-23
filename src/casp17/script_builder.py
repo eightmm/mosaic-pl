@@ -450,13 +450,25 @@ def build_wrapper_shell_script(
         if msa_cfg.max_template_date:
             cmd_parts.append(f"--max_template_date={shlex.quote(msa_cfg.max_template_date)}")
 
+        # Reuse guard: if an AF3 data-pipeline output (``*_data.json``) is
+        # already present under the run's msa_pipeline dir, skip the expensive
+        # jackhmmer/hmmsearch step and go straight to distribution. This makes
+        # the bridge resume-safe AND lets a caller pre-seed a precomputed MSA
+        # (e.g. a fixed receptor screened against a whole ligand library — one
+        # data.json symlinked into every fragment run). Normal targets have an
+        # empty dir, so the glob misses and the pipeline runs as before.
+        reuse_glob = f'{shlex.quote(str(msa_output_dir))}/*/*_data.json'
         lines.extend([
             'echo ""',
             'echo "================================================================"',
             'echo "  BRIDGE: AF3 data pipeline (jackhmmer + hmmsearch + templates)"',
             'echo "================================================================"',
             f'for _nv_lib in {nv_lib_glob}; do export LD_LIBRARY_PATH="$_nv_lib:${{LD_LIBRARY_PATH:-}}"; done',
-            f"{' '.join(cmd_parts)} || echo '  (msa pipeline failed, continuing — Boltz/Protenix/AF3 will use whatever fallback they have)'",
+            f'if ls {reuse_glob} >/dev/null 2>&1; then',
+            "  echo '  (reusing existing AF3 data-pipeline output — skipping jackhmmer/hmmsearch)'",
+            'else',
+            f"  {' '.join(cmd_parts)} || echo '  (msa pipeline failed, continuing — Boltz/Protenix/AF3 will use whatever fallback they have)'",
+            'fi',
             "",
             'echo "----------------------------------------------------------------"',
             'echo "  BRIDGE: Distributing MSA + templates to Boltz / Protenix / AF3"',
@@ -657,6 +669,22 @@ def build_wrapper_shell_script(
     return "\n".join(lines) + "\n"
 
 
+def _fmt_slurm_time(value) -> str:
+    """SLURM ``--time`` as ``[D-]HH:MM:SS``. A bare integer is otherwise read by
+    SLURM as *minutes* (so ``43200`` becomes 720 h, not 12 h) — treat it as
+    seconds and convert. Anything already containing ``:`` or ``-`` is passed
+    through untouched."""
+    s = str(value).strip()
+    if ":" in s or "-" in s:
+        return s
+    secs = int(s)
+    days, rem = divmod(secs, 86400)
+    h, rem = divmod(rem, 3600)
+    m, sec = divmod(rem, 60)
+    hms = f"{h:02d}:{m:02d}:{sec:02d}"
+    return f"{days}-{hms}" if days else hms
+
+
 def build_sbatch_header(job_name: str, config: RunnerConfig) -> list[str]:
     repo_root = Path(__file__).resolve().parents[2]
     logs_dir = repo_root / "experiments" / "logs"
@@ -668,7 +696,7 @@ def build_sbatch_header(job_name: str, config: RunnerConfig) -> list[str]:
         f"#SBATCH --gres=gpu:{slurm.gpus}",
         f"#SBATCH --cpus-per-task={slurm.cpus_per_task}",
         f"#SBATCH --mem={slurm.mem}",
-        f"#SBATCH --time={slurm.time}",
+        f"#SBATCH --time={_fmt_slurm_time(slurm.time)}",
     ]
     if slurm.partition:
         lines.append(f"#SBATCH --partition={slurm.partition}")
