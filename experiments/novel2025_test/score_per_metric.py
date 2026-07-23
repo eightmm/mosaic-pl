@@ -294,7 +294,7 @@ def evaluate_run(target: str, meta: dict, work_dir: Path) -> list[PoseRow]:
         return []
 
     run_dir = RUNS / f"{target}_input"
-    # msa_e2e_test layout is nested: <RUNS>/<target>_input/<target>_input/
+    # novel2025_runs layout is nested: <RUNS>/<target>_input/<target>_input/
     nested = run_dir / f"{target}_input"
     if nested.exists():
         run_dir = nested

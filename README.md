@@ -228,8 +228,8 @@ srun --partition=6000ada --gres=gpu:1 \
 
 ```bash
 # 단일 타깃당 sbatch (개별 GPU 잡)
-for t in $(ls experiments/msa_e2e_test/runs); do
-    sbatch experiments/msa_e2e_test/runs/$t/$t/scripts/run_wrapper.sbatch.sh
+for t in $(ls experiments/novel2025_runs/runs); do
+    sbatch experiments/novel2025_runs/runs/$t/$t/scripts/run_wrapper.sbatch.sh
 done
 
 # 또는 template→docking 만 다시 (cofold 살아 있을 때):
@@ -241,10 +241,10 @@ sbatch --array=0-498%16 experiments/novel2025_test/rerun_template_to_dock.sbatch
 ```bash
 # Per-pose true RMSD 계산 + 모든 scorer top-1/top-5 집계
 .venv/bin/python experiments/novel2025_test/score_per_metric.py \
-    --submissions-dir experiments/msa_e2e_test/submissions \
-    --runs-dir experiments/msa_e2e_test/runs \
-    --output-csv experiments/msa_e2e_test/per_pose_scores.csv \
-    --work-dir experiments/msa_e2e_test/_per_metric_work
+    --submissions-dir experiments/novel2025_runs/submissions \
+    --runs-dir experiments/novel2025_runs/runs \
+    --output-csv experiments/novel2025_runs/per_pose_scores.csv \
+    --work-dir experiments/novel2025_runs/_per_metric_work
 ```
 
 출력:
@@ -265,12 +265,12 @@ sbatch --array=0-498%16 experiments/novel2025_test/rerun_template_to_dock.sbatch
 
 ```bash
 # 1) LG 재생성 (도킹 결과 새로 반영)
-sbatch --array=0-498%16 experiments/msa_e2e_test/regen_lg.sbatch.sh
+sbatch --array=0-498%16 experiments/novel2025_runs/regen_lg.sbatch.sh
 
 # 2) Crystal vs LG MODEL 비교 — top1<2Å / best5<2Å SR (by zone)
 .venv/bin/python experiments/novel2025_test/evaluate.py \
-    --submissions-dir experiments/msa_e2e_test/submissions \
-    --output-json experiments/msa_e2e_test/evaluation.json
+    --submissions-dir experiments/novel2025_runs/submissions \
+    --output-json experiments/novel2025_runs/evaluation.json
 ```
 
 `evaluate.py` 는 각 `*.lg` 의 MODEL 1..5 를 crystal ligand 와 비교 → JSON + stdout summary 출력.
@@ -282,12 +282,12 @@ sbatch --array=0-498%16 experiments/msa_e2e_test/regen_lg.sbatch.sh
 ```bash
 # 전체 batch 한 번에 (수십초)
 .venv/bin/python scripts/check_frame_consistency.py \
-    --runs-dir experiments/msa_e2e_test/runs \
+    --runs-dir experiments/novel2025_runs/runs \
     --output-tsv /tmp/frame_check.tsv
 
 # random 50 sample 으로 자세한 진단 (receptor↔cofold, cofold pair, family centroid)
 .venv/bin/python scripts/audit_frame_50.py \
-    --runs-dir experiments/msa_e2e_test/runs --n 50
+    --runs-dir experiments/novel2025_runs/runs --n 50
 ```
 
 발견되는 issue class:
@@ -301,9 +301,9 @@ sbatch --array=0-498%16 experiments/msa_e2e_test/regen_lg.sbatch.sh
 ```bash
 # Cluster-level + zone-level SR 표 + Markdown 보고서
 .venv/bin/python scripts/generate_novel2025_report.py \
-    --per-pose-csv experiments/msa_e2e_test/per_pose_scores.csv \
+    --per-pose-csv experiments/novel2025_runs/per_pose_scores.csv \
     --cluster-csv experiments/novel2025_test/cluster_targets_100.csv \
-    --output experiments/msa_e2e_test/ANALYSIS.md
+    --output experiments/novel2025_runs/ANALYSIS.md
 ```
 
 ## Pipeline Stages Detail
@@ -507,7 +507,7 @@ python scripts/make_casp_submission.py \
     --author <your-casp-code> \
     --method "Boltz-2x + Multi-track ensemble" \
     --include-affinity \
-    --output experiments/submissions/L2001.lg
+    --output experiments/CASP17/submissions/L2001.lg
 ```
 
 **Ensemble scoring**:
@@ -725,7 +725,7 @@ Full run artifacts + slurm logs are preserved under `experiments/runs/archive/20
 
 ## Known Issues / Recent Fixes (2026-05)
 
-이 batch (`experiments/msa_e2e_test/` 499-target novel2025) 에서 발견·수정한 버그. 다시 회귀하지 않게 박아둠.
+이 batch (`experiments/novel2025_runs/` 499-target novel2025) 에서 발견·수정한 버그. 다시 회귀하지 않게 박아둠.
 
 | 일자 | 위치 | 증상 | 수정 |
 |---|---|---|---|

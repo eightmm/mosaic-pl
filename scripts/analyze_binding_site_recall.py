@@ -176,7 +176,7 @@ def analyze_one(target: str, runs_root: Path) -> dict:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--runs-dir", type=Path,
-                   default=Path("experiments/msa_e2e_test/runs"))
+                   default=Path("experiments/novel2025_runs/runs"))
     p.add_argument("--targets", nargs="*", default=None,
                    help="Optional explicit target list (default: every "
                         "<id>_input subdir under runs-dir)")

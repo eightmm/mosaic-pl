@@ -10,8 +10,8 @@ Prints one diagnostic per problem and exits non-zero if any ERROR-level check
 fails. WARNING-level issues are reported but do not fail the run.
 
 Usage:
-    uv run python scripts/lint_lg_submission.py experiments/submissions/R2314.lg
-    uv run python scripts/lint_lg_submission.py experiments/submissions/*.lg
+    uv run python scripts/lint_lg_submission.py experiments/CASP17/submissions/R2314_LCDD.lg
+    uv run python scripts/lint_lg_submission.py experiments/CASP17/submissions/*.lg
 """
 
 from __future__ import annotations

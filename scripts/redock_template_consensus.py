@@ -218,7 +218,7 @@ def main() -> int:
     p.add_argument("--targets", nargs="*", default=None,
                    help="Explicit target ids (overrides --targets-file).")
     p.add_argument("--runs-dir", type=Path,
-                   default=Path("experiments/msa_e2e_test/runs"))
+                   default=Path("experiments/novel2025_runs/runs"))
     p.add_argument("--partition", default="6000ada")
     p.add_argument("--time-limit", default="06:00:00")
     p.add_argument("--max-jobs-in-queue", type=int, default=400,

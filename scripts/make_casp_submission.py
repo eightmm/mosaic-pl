@@ -11,7 +11,7 @@ Usage:
         --ligand-name 761 \
         --author 0123-4567-8901 \
         --method "Boltz-2x + Vina (Track 1)" \
-        --output experiments/submissions/L2001.lg
+        --output experiments/CASP17/submissions/L2001.lg
 
 Pose source options:
     --pose-source auto           # pick best by BA-Pred if available
@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 
@@ -258,6 +259,39 @@ def find_best_ligand_pose(
     candidates.sort(key=lambda x: x[2], reverse=True)
     best = candidates[0]
     return best[0], best[1]
+
+
+def _strip_h_mdl(mdl_text: str) -> str:
+    """Remove explicit H atoms from a V2000 MDL block (and their bonds),
+    renumbering atom indices. CASP ligand validation matches the heavy-atom
+    graph against the released SMILES; docked poses that keep explicit H give
+    a different atom count than cofold poses (which are heavy-only), and a
+    mixed submission makes the ligand validator crash. Heavy-atom-only is the
+    consistent, spec-aligned form ("hydrogens optional; we omit them")."""
+    lines = mdl_text.split("\n")
+    try:
+        ci = next(i for i, l in enumerate(lines) if l.rstrip().endswith("V2000"))
+    except StopIteration:
+        return mdl_text
+    na, nb = int(lines[ci][:3]), int(lines[ci][3:6])
+    atoms = lines[ci + 1: ci + 1 + na]
+    bonds = lines[ci + 1 + na: ci + 1 + na + nb]
+    keep, omap, new_i = [], {}, 0
+    for idx, a in enumerate(atoms):
+        if a[31:34].strip() == "H":
+            continue
+        new_i += 1
+        omap[idx + 1] = new_i
+        keep.append(a)
+    if len(keep) == na:           # no H present, nothing to do
+        return mdl_text
+    new_bonds = []
+    for b in bonds:
+        a1, a2 = int(b[0:3]), int(b[3:6])
+        if a1 in omap and a2 in omap:
+            new_bonds.append(f"{omap[a1]:>3}{omap[a2]:>3}" + b[6:])
+    counts = f"{len(keep):>3}{len(new_bonds):>3}" + lines[ci][6:]
+    return "\n".join(lines[:ci] + [counts] + keep + new_bonds + ["M  END"])
 
 
 def pose_to_mdl(
@@ -542,6 +576,7 @@ def build_lg_submission(
             mdl_text = (lig.get("ligand_mdl") or "").rstrip()
             if not mdl_text.endswith("M  END"):
                 mdl_text += "\nM  END"
+            mdl_text = _strip_h_mdl(mdl_text)   # heavy-atom only (match SMILES)
             lines.append(mdl_text)
 
         # Per-MODEL AFFNTY before END
@@ -577,8 +612,10 @@ def _load_target_ligands(run_dir: Path) -> list[dict]:
     normalized ligand list the submission needs.
 
     Each entry has ``{"ligand_id": "L"|"L2"|..., "ligand_number": int,
-    "ligand_name": str}``. ``ligand_number`` is derived from position in
-    the summary (1-indexed — matches the SMILES file's convention).
+    "ligand_name": str}``. ``ligand_number`` is the **0-indexed** position
+    matching the CASP-issued SMILES file's ID column (verified against the
+    live validator: T2383 / R2387 ligand ID = 0; a 1-based id is rejected
+    with "LIGAND id does not correspond to the SMILES template").
     ``ligand_name`` defaults to ``"LIG"`` per CASP convention but callers
     can override via CLI.
     """
@@ -592,7 +629,7 @@ def _load_target_ligands(run_dir: Path) -> list[dict]:
         return []
     ligs = data.get("ligands") or []
     out = []
-    for i, lig in enumerate(ligs, start=1):
+    for i, lig in enumerate(ligs):          # 0-indexed: matches SMILES file ID
         out.append({
             "ligand_id": str(lig.get("id") or f"L{i}"),
             "ligand_number": i,
@@ -607,6 +644,7 @@ def _select_poses_for_ligand(
     k: int,
     rmsd_threshold: float,
     primary: bool,
+    anchors: list | None = None,
 ) -> list:
     """Pick up to ``k`` diverse poses for one ligand from the shared pool.
 
@@ -614,8 +652,13 @@ def _select_poses_for_ligand(
     ``ligand_id``. For backwards compatibility (older runs / legacy dirs
     whose poses have ``ligand_id is None``), the primary ligand inherits
     untagged poses.
+
+    When ``anchors`` (research / dominant-consensus pocket centres) are given,
+    uses the anchored ranker so a dominant functional site is guaranteed a MODEL.
     """
-    from compute_submission_scores import select_diverse_top_k  # type: ignore
+    from compute_submission_scores import (  # type: ignore
+        select_diverse_top_k, select_diverse_top_k_anchored,
+    )
 
     filtered = [
         p for p in candidate_pool
@@ -623,9 +666,829 @@ def _select_poses_for_ligand(
     ]
     if not filtered:
         return []
+    if anchors:
+        return select_diverse_top_k_anchored(
+            filtered, anchors, k=k, rmsd_threshold=rmsd_threshold,
+        )
     return select_diverse_top_k(
         filtered, k=k, rmsd_threshold=rmsd_threshold,
     )
+
+
+_REC_HEAVY_CACHE: dict = {}
+
+
+def _receptor_heavy_coords(cif_path: "Path"):
+    """Heavy-atom coords of the (polymer-only) submission receptor, in the same
+    aligned frame the staged poses use. Cached per cif. None on failure."""
+    key = str(cif_path)
+    if key in _REC_HEAVY_CACHE:
+        return _REC_HEAVY_CACHE[key]
+    arr = None
+    try:
+        import gemmi
+        import numpy as np
+        st = gemmi.read_structure(str(cif_path))
+        st.remove_ligands_and_waters()
+        pts = []
+        for model in st:
+            for chain in model:
+                for res in chain:
+                    for a in res:
+                        if (a.element.name or "") != "H":
+                            pts.append([a.pos.x, a.pos.y, a.pos.z])
+            break
+        arr = np.asarray(pts, dtype=float) if pts else None
+    except Exception:
+        arr = None
+    _REC_HEAVY_CACHE[key] = arr
+    return arr
+
+
+def _pose_clashes(mol, rec, cutoff: float = 2.0, min_n: int = 5) -> bool:
+    """True if the ligand interpenetrates the receptor — ``min_n``+ heavy-atom
+    pairs closer than ``cutoff`` Å. A template pose docked against a *different*
+    receptor conformation, once aligned onto the cofold receptor, jams into it
+    (T2414 3zos: 88 contacts < 2 Å). Such poses must never enter a MODEL."""
+    if rec is None or mol is None:
+        return False
+    try:
+        import numpy as np
+        from compute_submission_scores import _pose_coord_array  # type: ignore
+        a = _pose_coord_array(mol)
+        if a is None:
+            return False
+        d = np.linalg.norm(rec[:, None, :] - a[None, :, :], axis=2)
+        return int((d < cutoff).sum()) >= min_n
+    except Exception:
+        return False
+
+
+_TPL_REC_CACHE: dict = {}
+_TRACK2_RE = re.compile(r"^template_([0-9A-Za-z]{4})_(?:vina|adg|autodock|lig_align)")
+
+
+def _track2_template(pose_name: str) -> str | None:
+    """Template PDB id if this is a Track-2 template-receptor-docked pose
+    (``template_<pdb>_vina/adg/lig_align_...``), else None. ``template_consensus``
+    is Track-1 on the cofold receptor — NOT this."""
+    s = pose_name or ""
+    if "consensus" in s:
+        return None
+    m = _TRACK2_RE.match(s)
+    return m.group(1) if m else None
+
+
+def _template_receptor_lines(pdb_id: str, run_dir: "Path", cofold_cif: "Path"):
+    """Receptor ATOM/TER lines for a Track-2 template, in the cofold frame.
+
+    A template-docked pose fits the TEMPLATE receptor's conformation, not the
+    cofold receptor — so its MODEL must carry the template receptor (aligned to
+    the cofold frame via USalign, the same transform the docked pose already
+    went through). Regenerated from the vendored template CIF. Cached. None on
+    failure (caller falls back to the cofold receptor)."""
+    key = (str(run_dir), pdb_id)
+    if key in _TPL_REC_CACHE:
+        return _TPL_REC_CACHE[key]
+    lines = None
+    try:
+        import gemmi
+        import numpy as np
+        from casp17.usalign import run_usalign  # type: ignore
+        tcif = Path(run_dir) / "outputs" / "template_pockets" / "_extract_work" / f"{pdb_id}.cif"
+        if tcif.is_file():
+            r = run_usalign(tcif, Path(cofold_cif))
+            if r:
+                R = np.asarray(r[0], dtype=float)
+                t = np.asarray(r[1], dtype=float)
+                st = gemmi.read_structure(str(tcif))
+                st.remove_alternative_conformations()
+                st.remove_ligands_and_waters()
+                st.remove_empty_chains()
+                model0 = st[0]
+                for chain in model0:
+                    for k, res in enumerate(chain, 1):
+                        # renumber residues to positive sequential per chain — the
+                        # CASP server indexes an array by residue number and CRASHES
+                        # on the negative resSeq (e.g. 3zos chain B starts at -1:
+                        # "non-creatable array value ... subscript -1").
+                        res.seqid.num = k
+                        res.seqid.icode = " "
+                        for a in res:
+                            p = a.pos
+                            v = R @ np.array([p.x, p.y, p.z]) + t
+                            a.pos = gemmi.Position(float(v[0]), float(v[1]), float(v[2]))
+                # keep first model only for a clean single-chain-set PDB
+                while len(st) > 1:
+                    del st[1]
+                pdb = st.make_pdb_string()
+                lines = [ln for ln in pdb.splitlines() if ln.startswith(("ATOM", "TER"))]
+                if not lines:
+                    lines = None
+    except Exception:
+        lines = None
+    _TPL_REC_CACHE[key] = lines
+    return lines
+
+
+def _force_alt_orientation(chosen: list, pool: list, anchors: list,
+                           k: int, rmsd_threshold: float) -> list:
+    """Guarantee an alternate-orientation MODEL for a symmetric-ligand target.
+
+    Among anchor-covering docked poses, group by which equivalent scissile group
+    faces the catalytic anchor. If every currently-``chosen`` MODEL presents the
+    same orientation, promote the best-lscore REAL pose that presents the *other*
+    orientation into the MODEL set (evicting the weakest non-primary MODEL). No
+    synthetic geometry — a genuine docked pose. Fail-open."""
+    try:
+        import numpy as np
+        from compute_submission_scores import _load_pose_mol, _pose_coord_array  # type: ignore
+        from casp17.symmetry_pose import engaged_scissile_group  # type: ignore
+    except Exception:
+        return chosen
+    if not chosen:
+        return chosen
+    apts = [np.asarray(a.xyz, dtype=float) for a in anchors]
+    mc: dict = {}
+
+    def covering(p):
+        arr = _pose_coord_array(_load_pose_mol(p, mc))
+        if arr is None:
+            return False
+        return min(float(np.linalg.norm(arr.mean(0) - ap)) for ap in apts) <= 8.0
+
+    # orientation key of each chosen MODEL; need ≥2 equivalent groups to matter
+    chosen_keys, n_groups = set(), 0
+    for p in chosen:
+        if not covering(p):
+            continue
+        key, ng = engaged_scissile_group(_load_pose_mol(p, mc), apts)
+        n_groups = max(n_groups, ng)
+        if key is not None:
+            chosen_keys.add(key)
+    if n_groups < 2 or len(chosen_keys) != 1:
+        return chosen  # asymmetric ligand, or both orientations already present
+
+    alts = []
+    for p in pool:
+        if p.lscore is None or p in chosen or not covering(p):
+            continue
+        key, ng = engaged_scissile_group(_load_pose_mol(p, mc), apts)
+        if key is not None and key not in chosen_keys:
+            alts.append(p)
+    if not alts:
+        return chosen
+    alt = max(alts, key=lambda p: p.lscore or 0.0)
+    # evict the weakest non-primary MODEL (keep MODEL 1)
+    if len(chosen) >= k:
+        victim = min(chosen[1:], key=lambda p: p.lscore or 0.0)
+        chosen = [p for p in chosen if p is not victim]
+    return chosen + [alt]
+
+
+def _force_template_flip(chosen: list, pool: list, anchors: list,
+                         k: int, rmsd_threshold: float,
+                         min_lscore: float = 0.15,
+                         flip_dot: float = -0.2) -> list:
+    """Guarantee two roughly-opposite ligand orientations at the template site.
+
+    The CASP meeting: for a (partly-)symmetric ligand, submit ~2 flipped poses at
+    the template site. Rather than require a graph automorphism (most drug-like
+    ligands have none), this is docking-grounded: if docking produced a good pose
+    at the template site in the OPPOSITE orientation, the ligand tolerates the
+    flip, so include it as a second MODEL.
+
+    Orientation = centroid→tip unit vector (tip = heavy atom furthest from the
+    ligand centroid). Two template-site poses are 'flipped' when the vectors point
+    into opposite hemispheres (dot < ``flip_dot``). Only fires at ``top_template``
+    / ``template_site`` anchors, only promotes a pose with lscore ≥ ``min_lscore``
+    that stays diverse (RMSD ≥ threshold). Fail-open — MODEL 1 never evicted."""
+    try:
+        import numpy as np
+        from compute_submission_scores import (  # type: ignore
+            _load_pose_mol, _pose_coord_array, _pose_pair_rmsd)
+    except Exception:
+        return chosen
+    if not chosen:
+        return chosen
+    tpl_pts = [np.asarray(a.xyz, dtype=float) for a in anchors
+               if getattr(a, "kind", "") in ("top_template", "template_site")]
+    if not tpl_pts:
+        return chosen
+    mc: dict = {}
+
+    def orient(p):
+        arr = _pose_coord_array(_load_pose_mol(p, mc))
+        if arr is None or len(arr) < 3:
+            return None
+        cen = arr.mean(0)
+        if min(float(np.linalg.norm(cen - tp)) for tp in tpl_pts) > 8.0:
+            return None  # not at a template site
+        tip = arr[int(np.argmax(np.linalg.norm(arr - cen, axis=1)))]
+        v = tip - cen
+        n = float(np.linalg.norm(v))
+        return (v / n) if n > 1e-6 else None
+
+    ref = next((o for o in (orient(p) for p in chosen) if o is not None), None)
+    if ref is None:
+        return chosen  # no chosen MODEL sits at a template site
+    # already two orientations at the site?
+    if any((o is not None) and float(np.dot(o, ref)) < flip_dot
+           for o in (orient(p) for p in chosen)):
+        return chosen
+
+    def diverse_ok(cm):
+        return all((pm is None) or ((_pose_pair_rmsd(cm, pm) or 9e9) >= rmsd_threshold)
+                   for pm in (_load_pose_mol(s, mc) for s in chosen))
+
+    alts = []
+    for p in pool:
+        if p in chosen or p.lscore is None or (p.lscore or 0.0) < min_lscore:
+            continue
+        o = orient(p)
+        if o is None or float(np.dot(o, ref)) >= flip_dot:
+            continue
+        cm = _load_pose_mol(p, mc)
+        if cm is not None and diverse_ok(cm):
+            alts.append(p)
+    if not alts:
+        return chosen
+    alt = max(alts, key=lambda p: p.lscore or 0.0)
+    if len(chosen) >= k:
+        victim = min(chosen[1:], key=lambda p: p.lscore or 0.0)
+        chosen = [p for p in chosen if p is not victim]
+    return chosen + [alt]
+
+
+def _force_catalytic_flip(chosen: list, pool: list, run_dir: "Path",
+                          cif_path: "Path", k: int, rmsd_threshold: float,
+                          min_lscore: float = 0.15, flip_dot: float = -0.2,
+                          cov: float = 8.0) -> list:
+    """Guarantee TWO opposite-orientation poses at the catalytic residue site.
+
+    CASP meeting: for a (pseudo-)symmetric ligand, submit two ~flipped poses at
+    the catalytic site (both plausible binding modes of the symmetric warhead).
+    Grounds the catalytic site on ``research.json`` residues; only fires for a
+    symmetric ligand (≥2 equivalent hydrolase scissile groups or a pose-symmetry
+    op). Ensures the 5 MODELs include ≥1 catalytic-site pose in EACH orientation
+    (centroid→tip hemisphere), pulling the missing orientation from the pool —
+    catalytic modes often score below a decoy pocket, so LSCORE alone drops them.
+    Fail-open; MODEL 1 kept."""
+    try:
+        import numpy as np
+        from casp17.research_prior import research_centers  # type: ignore
+        from casp17.symmetry_pose import functional_flip_ops, pose_symmetry_ops  # type: ignore
+        from compute_submission_scores import (  # type: ignore
+            _load_pose_mol, _pose_coord_array, _pose_pair_rmsd)
+    except Exception:
+        return chosen
+    if not chosen:
+        return chosen
+    try:
+        ancs = research_centers(Path(run_dir), Path(cif_path))
+    except Exception:
+        return chosen
+    apts = [np.asarray(a.xyz, dtype=float) for a in ancs]
+    if not apts:
+        return chosen
+    mc: dict = {}
+
+    def at_cat(p):
+        arr = _pose_coord_array(_load_pose_mol(p, mc))
+        return arr is not None and min(
+            float(np.linalg.norm(arr.mean(0) - ap)) for ap in apts) <= cov
+
+    def orient(p):
+        arr = _pose_coord_array(_load_pose_mol(p, mc))
+        if arr is None or len(arr) < 3:
+            return None
+        c = arr.mean(0)
+        tip = arr[int(np.argmax(np.linalg.norm(arr - c, axis=1)))]
+        v = tip - c
+        n = float(np.linalg.norm(v))
+        return (v / n) if n > 1e-6 else None
+
+    def diverse_ok(cm):
+        return all((pm is None) or ((_pose_pair_rmsd(cm, pm) or 9e9) >= rmsd_threshold)
+                   for pm in (_load_pose_mol(s, mc) for s in chosen))
+
+    def add_pose(chs, p):
+        if len(chs) >= k:
+            # protect MODEL 1 and existing catalytic-site poses from eviction,
+            # so adding the flipped orientation keeps BOTH catalytic poses.
+            evictable = [q for q in chs[1:] if not at_cat(q)] or chs[1:]
+            victim = min(evictable, key=lambda q: q.lscore or 0.0)
+            chs = [q for q in chs if q is not victim]
+        return chs + [p]
+
+    cat_oris = [o for o in (orient(p) for p in chosen if at_cat(p)) if o is not None]
+    # already two opposite orientations at the catalytic site?
+    if any(float(np.dot(a, b)) < flip_dot
+           for i, a in enumerate(cat_oris) for b in cat_oris[i + 1:]):
+        return chosen
+
+    pool_cat = []
+    for p in pool:
+        if p in chosen or p.lscore is None or (p.lscore or 0.0) < min_lscore:
+            continue
+        if not at_cat(p):
+            continue
+        o = orient(p)
+        if o is not None:
+            pool_cat.append((p, o))
+    if not pool_cat:
+        return chosen
+
+    # symmetry gate: test on a pose AT the catalytic site (its scissile group
+    # faces the anchor there — a far decoy pose reads as spuriously asymmetric).
+    rep_pose = next((p for p in chosen if at_cat(p)), None) or pool_cat[0][0]
+    rep = _load_pose_mol(rep_pose, mc)
+    try:
+        symmetric = rep is not None and bool(
+            functional_flip_ops(rep, apts) or pose_symmetry_ops(rep))
+    except Exception:
+        symmetric = False
+    if not symmetric:
+        return chosen  # only hedge orientations for a symmetric ligand
+
+    # reference orientation: an existing catalytic MODEL, else the best-lscore
+    # catalytic pose from the pool (which we then add as the first orientation).
+    ref = cat_oris[0] if cat_oris else None
+    if ref is None:
+        p0, ref = max(pool_cat, key=lambda po: po[0].lscore or 0.0)
+        m = _load_pose_mol(p0, mc)
+        if m is not None and diverse_ok(m):
+            chosen = add_pose(chosen, p0)
+    # add the best-lscore catalytic pose in the OPPOSITE orientation
+    opp = sorted((po for po in pool_cat if po[0] not in chosen
+                  and float(np.dot(po[1], ref)) < flip_dot),
+                 key=lambda po: -(po[0].lscore or 0.0))
+    for p, _o in opp:
+        m = _load_pose_mol(p, mc)
+        if m is not None and diverse_ok(m):
+            chosen = add_pose(chosen, p)
+            break
+    return chosen
+
+
+def _force_cofold_consensus(chosen: list, pool: list, k: int,
+                            rmsd_threshold: float, agree_tol: float = 2.5) -> list:
+    """Include one co-folding pose where AF3 and Boltz agree.
+
+    CASP meeting T2414: "co-folding 결과(Boltz와 AF가 유사해 보이는 것)에서 1개".
+    Self-gating — only fires when an AF3 cofold pose and a Boltz cofold pose sit
+    within ``agree_tol`` Å of each other (a genuine cross-method consensus mode),
+    then submits the higher-lscore of the pair. Skips if a cofold pose is already
+    chosen or the agreed pose duplicates a MODEL. Fail-open; MODEL 1 kept."""
+    try:
+        from compute_submission_scores import _load_pose_mol, _pose_pair_rmsd  # type: ignore
+    except Exception:
+        return chosen
+    if not chosen:
+        return chosen
+
+    def _cofold(p, tag):
+        n = (getattr(p, "name", "") or "").lower()
+        return "cofold" in n and tag in n
+
+    if any("cofold" in (getattr(p, "name", "") or "").lower() for p in chosen):
+        return chosen  # a cofold pose is already represented
+    af = [p for p in pool if p.lscore is not None and _cofold(p, "af3")]
+    bz = [p for p in pool if p.lscore is not None
+          and (_cofold(p, "boltz2") or _cofold(p, "boltz2x"))]
+    if not af or not bz:
+        return chosen
+    mc: dict = {}
+    best = None
+    for a in af:
+        am = _load_pose_mol(a, mc)
+        if am is None:
+            continue
+        for b in bz:
+            r = _pose_pair_rmsd(am, _load_pose_mol(b, mc))
+            if r is not None and r <= agree_tol:
+                pick = a if (a.lscore or 0.0) >= (b.lscore or 0.0) else b
+                if best is None or (pick.lscore or 0.0) > (best.lscore or 0.0):
+                    best = pick
+    if best is None or best in chosen:
+        return chosen
+    bm = _load_pose_mol(best, mc)
+    if bm is not None and not all(
+            (_load_pose_mol(s, mc) is None)
+            or ((_pose_pair_rmsd(bm, _load_pose_mol(s, mc)) or 9e9) >= rmsd_threshold)
+            for s in chosen):
+        return chosen  # duplicates an existing MODEL
+    if len(chosen) >= k:
+        victim = min(chosen[1:], key=lambda p: p.lscore or 0.0)
+        chosen = [p for p in chosen if p is not victim]
+    return chosen + [best]
+
+
+def _force_active_site(chosen: list, pool: list, run_dir: "Path",
+                       cif_path: "Path", k: int, rmsd_threshold: float,
+                       n_min: int, cov: float = 8.0) -> list:
+    """Force >= ``n_min`` MODELs at the dominant active site.
+
+    Active site = top-template COM ∪ dominant template cluster (share ≥ 0.5) ∪
+    catalytic pocket (research residues). Where the true binding site scores low
+    (RMSD-Pred favours snug decoy pockets, so LSCORE selection fills the 5 MODELs
+    with decoys — e.g. T2414: 4/5 at minor consensus pockets), this pulls in the
+    best available active-site poses with spatial diversity, evicting the weakest
+    NON-active MODEL each time (MODEL 1 kept). Opt-in via ``--active-site-min``.
+    Fail-open."""
+    try:
+        import numpy as np
+        from casp17.research_prior import (  # type: ignore
+            research_centers, template_com_centers)
+        from compute_submission_scores import (  # type: ignore
+            _load_pose_mol, _pose_coord_array, _pose_pair_rmsd)
+    except Exception:
+        return chosen
+    if n_min <= 0 or not chosen:
+        return chosen
+    # active site = top-template bound-ligand COM (the meeting's "top template의
+    # catalytic site") ∪ catalytic-pocket centroid. The dominant *cluster*
+    # centroid is deliberately excluded — its consensus offset can sit several Å
+    # off the true site and count decoy sub-pockets as "active".
+    apts = []
+    try:
+        for a in template_com_centers(Path(run_dir)):
+            if a.kind == "top_template":
+                apts.append(np.asarray(a.xyz, dtype=float))
+        cats = [np.asarray(a.xyz, dtype=float)
+                for a in research_centers(Path(run_dir), Path(cif_path))]
+        if cats:
+            apts.append(np.mean(cats, axis=0))
+    except Exception:
+        return chosen
+    if not apts:
+        return chosen
+    mc: dict = {}
+
+    def at_site(p):
+        arr = _pose_coord_array(_load_pose_mol(p, mc))
+        return arr is not None and min(
+            float(np.linalg.norm(arr.mean(0) - ap)) for ap in apts) <= cov
+
+    def diverse_ok(cm):
+        return all((pm is None) or ((_pose_pair_rmsd(cm, pm) or 9e9) >= rmsd_threshold)
+                   for pm in (_load_pose_mol(s, mc) for s in chosen))
+
+    need = n_min - sum(1 for p in chosen if at_site(p))
+    if need <= 0:
+        return chosen
+    cands = sorted((p for p in pool if p not in chosen and p.lscore is not None
+                    and at_site(p)), key=lambda p: -(p.lscore or 0.0))
+    for p in cands:
+        if need <= 0:
+            break
+        cm = _load_pose_mol(p, mc)
+        if cm is None or not diverse_ok(cm):
+            continue
+        if len(chosen) >= k:
+            evictable = [q for q in chosen[1:] if not at_site(q)] or chosen[1:]
+            victim = min(evictable, key=lambda q: q.lscore or 0.0)
+            chosen = [q for q in chosen if q is not victim]
+        chosen = chosen + [p]
+        need -= 1
+    return chosen
+
+
+def _force_catalytic_regions(chosen: list, pool: list, run_dir: "Path",
+                             cif_path: "Path", k: int, rmsd_threshold: float,
+                             n_regions: int = 2, per_region: int = 2,
+                             clust_cut: float = 12.0, cov: float = 6.0) -> list:
+    """Split scattered catalytic residues into spatial regions and fill each.
+
+    Some catalytic pockets span TWO+ separated residue clusters (e.g. T2414 KIT:
+    the ATP pocket vs the Cys178 covalent loop). Greedy-cluster the research
+    residues (``clust_cut`` Å), keep the ``n_regions`` regions with the most
+    docked poses nearby, and ensure ``per_region`` chosen MODELs sit at each
+    (best-lscore, spatially diverse) — e.g. 2 ATP + 2 covalent. Evicts the
+    weakest MODEL not serving any target region (MODEL 1 kept). Opt-in via
+    ``--catalytic-regions``. Fail-open."""
+    try:
+        import numpy as np
+        from casp17.research_prior import research_centers  # type: ignore
+        from compute_submission_scores import (  # type: ignore
+            _load_pose_mol, _pose_coord_array, _pose_pair_rmsd)
+    except Exception:
+        return chosen
+    if n_regions <= 0 or per_region <= 0 or not chosen:
+        return chosen
+    try:
+        pts = [np.asarray(a.xyz, dtype=float)
+               for a in research_centers(Path(run_dir), Path(cif_path))]
+    except Exception:
+        return chosen
+    if not pts:
+        return chosen
+    # greedy spatial clustering of catalytic residues
+    regions: list[dict] = []
+    for p in pts:
+        for c in regions:
+            if float(np.linalg.norm(p - c["cen"])) <= clust_cut:
+                c["mem"].append(p)
+                c["cen"] = np.mean(c["mem"], axis=0)
+                break
+        else:
+            regions.append({"mem": [p], "cen": p.copy()})
+    mc: dict = {}
+
+    def region_of(p):
+        # PRIMARY region only: the region whose residues the ligand's nearest
+        # atom is closest to (min-atom, so a covalent warhead counts for the
+        # Cys region while the ATP-pocket body counts for the ATP region). A
+        # pose spanning both is assigned once — no double counting.
+        arr = _pose_coord_array(_load_pose_mol(p, mc))
+        if arr is None:
+            return None
+        ds = [min(float(np.min(np.linalg.norm(arr - m, axis=1))) for m in c["mem"])
+              for c in regions]
+        j = int(np.argmin(ds))
+        return j if ds[j] <= cov else None
+
+    def near(p, c):
+        return region_of(p) == regions.index(c)
+
+    # rank regions by how many pool poses sit in them (binding-plausible sites)
+    for c in regions:
+        c["npose"] = sum(1 for p in pool
+                         if p.lscore is not None and near(p, c))
+    ranked = [c for c in sorted(regions, key=lambda c: -c["npose"]) if c["npose"] > 0]
+    if not ranked:
+        return chosen
+    # If research flags a covalent warhead, GUARANTEE the region holding that
+    # residue is one of the chosen regions (its warhead-contact poses are sparse
+    # and would otherwise be out-ranked by the main pocket + its neighbours).
+    chosen_regions = ranked[:n_regions]
+    try:
+        import json
+        cov_s = json.loads((Path(run_dir) / "research.json").read_text()).get(
+            "covalent_suspicion") or {}
+        resi = (cov_s.get("proposed_link") or {}).get("resi") if cov_s.get("suspected") else None
+    except Exception:
+        resi = None
+    if resi is not None:
+        # covalent residue point = the research anchor nearest that resi
+        try:
+            from casp17.research_prior import research_centers as _rc  # type: ignore
+            cov_pt = next((np.asarray(a.xyz, dtype=float)
+                           for a in _rc(Path(run_dir), Path(cif_path))
+                           if str(resi) in a.label), None)
+        except Exception:
+            cov_pt = None
+        if cov_pt is not None:
+            cov_reg = min(regions, key=lambda c: float(np.linalg.norm(c["cen"] - cov_pt)))
+            if cov_reg["npose"] > 0 and cov_reg not in chosen_regions:
+                chosen_regions = ([ranked[0]] + [cov_reg])[:n_regions]
+    regions = chosen_regions
+    if not regions:
+        return chosen
+
+    def diverse_ok(cm):
+        return all((pm is None) or ((_pose_pair_rmsd(cm, pm) or 9e9) >= rmsd_threshold)
+                   for pm in (_load_pose_mol(s, mc) for s in chosen))
+
+    def in_any_region(p):
+        return any(near(p, c) for c in regions)
+
+    for c in regions:
+        need = per_region - sum(1 for p in chosen if near(p, c))
+        if need <= 0:
+            continue
+        cands = sorted((p for p in pool if p not in chosen and p.lscore is not None
+                        and near(p, c)), key=lambda p: -(p.lscore or 0.0))
+        for p in cands:
+            if need <= 0:
+                break
+            cm = _load_pose_mol(p, mc)
+            if cm is None or not diverse_ok(cm):
+                continue
+            if len(chosen) >= k:
+                # evict weakest MODEL not serving any target region (keep MODEL 1)
+                evictable = [q for q in chosen[1:] if not in_any_region(q)] or chosen[1:]
+                victim = min(evictable, key=lambda q: q.lscore or 0.0)
+                chosen = [q for q in chosen if q is not victim]
+            chosen = chosen + [p]
+            need -= 1
+    return chosen
+
+
+def _force_residue_contact(chosen: list, pool: list, run_dir: "Path",
+                           cif_path: "Path", k: int, rmsd_threshold: float,
+                           resids: list, n: int = 1, cut: float = 5.0) -> list:
+    """Force ``n`` MODELs that CONTACT a specified residue set (any ligand heavy
+    atom within ``cut`` Å of any of those residues). Use to guarantee coverage of
+    a residue cluster the ranker missed (e.g. T2414 upper catalytic loop
+    ASP182/ASN187/ASP200/TYR213). Best-lscore, spatially diverse, receptor-clash-
+    free (pool is pre-filtered); evicts the weakest non-contacting MODEL (MODEL 1
+    kept). Fail-open."""
+    try:
+        import numpy as np
+        from casp17.research_prior import research_centers  # type: ignore
+        from compute_submission_scores import (  # type: ignore
+            _load_pose_mol, _pose_coord_array, _pose_pair_rmsd)
+    except Exception:
+        return chosen
+    if n <= 0 or not resids or not chosen:
+        return chosen
+    want = {str(r) for r in resids}
+    try:
+        pts = [np.asarray(a.xyz, dtype=float)
+               for a in research_centers(Path(run_dir), Path(cif_path))
+               if any(re.search(rf"\b{r}\b|{r}$", a.label) for r in want)]
+    except Exception:
+        return chosen
+    if not pts:
+        return chosen
+    mc: dict = {}
+
+    def contacts(p):
+        arr = _pose_coord_array(_load_pose_mol(p, mc))
+        return arr is not None and any(
+            float(np.min(np.linalg.norm(arr - m, axis=1))) <= cut for m in pts)
+
+    def diverse_ok(cm):
+        return all((pm is None) or ((_pose_pair_rmsd(cm, pm) or 9e9) >= rmsd_threshold)
+                   for pm in (_load_pose_mol(s, mc) for s in chosen))
+
+    need = n - sum(1 for p in chosen if contacts(p))
+    if need <= 0:
+        return chosen
+    cands = sorted((p for p in pool if p not in chosen and p.lscore is not None
+                    and contacts(p)), key=lambda p: -(p.lscore or 0.0))
+    for p in cands:
+        if need <= 0:
+            break
+        cm = _load_pose_mol(p, mc)
+        if cm is None or not diverse_ok(cm):
+            continue
+        if len(chosen) >= k:
+            evictable = [q for q in chosen[1:] if not contacts(q)] or chosen[1:]
+            victim = min(evictable, key=lambda q: q.lscore or 0.0)
+            chosen = [q for q in chosen if q is not victim]
+        chosen = chosen + [p]
+        need -= 1
+    return chosen
+
+
+def _force_covalent_split(chosen: list, pool: list, run_dir: "Path",
+                          cif_path: "Path", k: int, rmsd_threshold: float,
+                          n_cov: int = 2, n_noncov: int = 2,
+                          cov_cut: float = 5.0, noncov_gap: float = 6.0,
+                          site_cov: float = 8.0) -> list:
+    """Split the active-cleft MODELs into covalent vs non-covalent orientations.
+
+    For a target with a covalent-capable residue in the binding cleft (e.g. T2414
+    Cys178), the ligand binds ONE pocket but its warhead may or may not engage the
+    residue. This hedges both: force ``n_cov`` poses whose nearest atom is within
+    ``cov_cut`` Å of the nucleophile SG (warhead engaged) AND ``n_noncov`` poses in
+    the same cleft (centroid ≤ ``site_cov`` Å of the top-template COM) whose atoms
+    stay > ``noncov_gap`` Å from the SG (not engaged). Best-lscore, spatially
+    diverse; evicts the weakest MODEL serving neither class (MODEL 1 kept).
+    Opt-in. Fail-open."""
+    try:
+        import json
+        import numpy as np
+        from casp17.research_prior import research_centers, template_com_centers  # type: ignore
+        from compute_submission_scores import (  # type: ignore
+            _load_pose_mol, _pose_coord_array, _pose_pair_rmsd)
+    except Exception:
+        return chosen
+    if not chosen or (n_cov <= 0 and n_noncov <= 0):
+        return chosen
+    try:
+        cov = json.loads((Path(run_dir) / "research.json").read_text()).get(
+            "covalent_suspicion") or {}
+        resi = (cov.get("proposed_link") or {}).get("resi") if cov.get("suspected") else None
+        ancs = research_centers(Path(run_dir), Path(cif_path))
+        sg = next((np.asarray(a.xyz, dtype=float) for a in ancs
+                   if resi is not None and str(resi) in a.label), None)
+        top = next((np.asarray(a.xyz, dtype=float)
+                    for a in template_com_centers(Path(run_dir))
+                    if a.kind == "top_template"), None)
+    except Exception:
+        return chosen
+    if sg is None or top is None:
+        return chosen
+    mc: dict = {}
+
+    def coords(p):
+        return _pose_coord_array(_load_pose_mol(p, mc))
+
+    def is_cov(p):
+        a = coords(p)
+        return a is not None and float(np.min(np.linalg.norm(a - sg, axis=1))) <= cov_cut
+
+    def is_noncov(p):
+        a = coords(p)
+        return (a is not None
+                and float(np.linalg.norm(a.mean(0) - top)) <= site_cov
+                and float(np.min(np.linalg.norm(a - sg, axis=1))) > noncov_gap)
+
+    def diverse_ok(cm):
+        return all((pm is None) or ((_pose_pair_rmsd(cm, pm) or 9e9) >= rmsd_threshold)
+                   for pm in (_load_pose_mol(s, mc) for s in chosen))
+
+    def fill(pred, need):
+        nonlocal chosen
+        if need <= 0:
+            return
+        cands = sorted((p for p in pool if p not in chosen and p.lscore is not None
+                        and pred(p)), key=lambda p: -(p.lscore or 0.0))
+        for p in cands:
+            if need <= 0:
+                break
+            cm = _load_pose_mol(p, mc)
+            if cm is None or not diverse_ok(cm):
+                continue
+            if len(chosen) >= k:
+                evictable = [q for q in chosen[1:]
+                             if not is_cov(q) and not is_noncov(q)] or chosen[1:]
+                victim = min(evictable, key=lambda q: q.lscore or 0.0)
+                chosen = [q for q in chosen if q is not victim]
+            chosen = chosen + [p]
+            need -= 1
+
+    fill(is_cov, n_cov - sum(1 for p in chosen if is_cov(p)))
+    fill(is_noncov, n_noncov - sum(1 for p in chosen if is_noncov(p)))
+    return chosen
+
+
+def _force_covalent_pose(chosen: list, pool: list, run_dir: "Path",
+                         cif_path: "Path", k: int, rmsd_threshold: float,
+                         cov_cutoff: float = 3.6) -> list:
+    """When research flags a covalent warhead, force in a covalent-geometry pose.
+
+    CASP meeting T2414: "Cys178 부근 covalent 가능한 pose가 있으면 Model 5에 하나".
+    Uses ``research.json`` covalent_suspicion → the nucleophile residue (e.g.
+    Cys178 SG); includes the docked pose whose nearest ligand heavy atom sits
+    within ``cov_cutoff`` Å of that SG/OG. LSCORE is IGNORED (RMSD-Pred is
+    non-covalent-trained and scores these ~0) — it is a candidate to eyeball, per
+    the meeting. Self-gating (only when covalent suspected + such a pose exists).
+    Fail-open; MODEL 1 kept."""
+    try:
+        import json
+        import numpy as np
+        from casp17.research_prior import research_centers  # type: ignore
+        from compute_submission_scores import (  # type: ignore
+            _load_pose_mol, _pose_coord_array, _pose_pair_rmsd)
+    except Exception:
+        return chosen
+    rj = Path(run_dir) / "research.json"
+    if not rj.is_file():
+        return chosen
+    try:
+        cov = (json.loads(rj.read_text()).get("covalent_suspicion") or {})
+    except Exception:
+        return chosen
+    if not cov.get("suspected"):
+        return chosen
+    pl = cov.get("proposed_link") or {}
+    resi = pl.get("resi")
+    resn = (pl.get("residue_name") or "").upper()
+    try:
+        ancs = research_centers(Path(run_dir), Path(cif_path))
+    except Exception:
+        return chosen
+    sg = None
+    for a in ancs:
+        lab = a.label.upper()
+        if resi is not None and str(resi) in lab and (not resn or resn[:3] in lab):
+            sg = np.asarray(a.xyz, dtype=float)
+            break
+    if sg is None:  # fall back to any Cys/Ser nucleophile anchor
+        for a in ancs:
+            if a.label.upper().startswith(("CYS", "SER")):
+                sg = np.asarray(a.xyz, dtype=float)
+                break
+    if sg is None:
+        return chosen
+    mc: dict = {}
+
+    def min_atom(p):
+        arr = _pose_coord_array(_load_pose_mol(p, mc))
+        return None if arr is None else float(np.min(np.linalg.norm(arr - sg, axis=1)))
+
+    if any((min_atom(p) or 9e9) <= cov_cutoff for p in chosen):
+        return chosen  # a covalent-contact pose is already submitted
+    near = [(d, p) for d, p in ((min_atom(p), p) for p in pool if p not in chosen)
+            if d is not None and d <= cov_cutoff]
+    if not near:
+        return chosen
+    near.sort(key=lambda dp: (dp[0], -(dp[1].lscore or 0.0)))  # closest, then best lscore
+    alt = near[0][1]
+    am = _load_pose_mol(alt, mc)
+    if am is not None and not all(
+            (_load_pose_mol(s, mc) is None)
+            or ((_pose_pair_rmsd(am, _load_pose_mol(s, mc)) or 9e9) >= rmsd_threshold)
+            for s in chosen):
+        return chosen
+    if len(chosen) >= k:
+        victim = min(chosen[1:], key=lambda p: p.lscore or 0.0)
+        chosen = [p for p in chosen if p is not victim]
+    return chosen + [alt]
 
 
 def _cofold_fallback_mdl(
@@ -663,8 +1526,9 @@ def main() -> int:
                         help="CASP target identifier (e.g., L2001)")
     parser.add_argument("--ligand-name", type=str, default="LIG",
                         help="Ligand name from SMILES file (default: LIG per CASP convention)")
-    parser.add_argument("--author", type=str, required=True,
-                        help="CASP registration code (XXXX-XXXX-XXXX)")
+    parser.add_argument("--author", type=str, default="6095-5696-9732",
+                        help="CASP registration code (default: group LCDD "
+                             "6095-5696-9732)")
     parser.add_argument("--method", type=str, required=True,
                         help="Description of prediction method")
     parser.add_argument("--remark", type=str, default="")
@@ -685,9 +1549,69 @@ def main() -> int:
                         help="Manual AFFNTY override (Kd in nM, applied to every MODEL)")
     parser.add_argument("--include-affinity", action="store_true",
                         help="Include AFFNTY record (auto-computed from scores)")
-    parser.add_argument("--output", type=Path, required=True,
-                        help="Output LG file path")
+    parser.add_argument("--output", type=Path, default=None,
+                        help="Output LG path. CASP17 group convention forces "
+                             "the basename to '{target}_LCDD.lg' regardless of "
+                             "what is passed (only the directory is honoured). "
+                             "Default: experiments/CASP17/submissions/{target}_LCDD.lg.")
+    parser.add_argument("--no-slack", action="store_true",
+                        help="skip the post-build viewer HTML + Slack summary "
+                             "(default: build viz/standalone + notify when a "
+                             "Slack webhook is configured)")
+    parser.add_argument("--no-research-anchor", action="store_true",
+                        help="disable research/dominant-consensus pocket anchoring "
+                             "in pose selection (default: on — guarantees a MODEL "
+                             "at a dominant functional site when one exists)")
+    parser.add_argument("--no-symflip", action="store_true",
+                        help="disable pseudo-symmetry pose expansion (default: on — "
+                             "adds the ~180°-flipped pose of a symmetric ligand at "
+                             "an anchor so both orientations can be submitted)")
+    parser.add_argument("--no-cofold-consensus", action="store_true",
+                        help="disable the cofold-consensus MODEL (default: on — when "
+                             "an AF3 and a Boltz cofold pose converge, include one so "
+                             "a cross-method-agreed binding mode is submitted)")
+    parser.add_argument("--no-covalent", action="store_true",
+                        help="disable the covalent-pose MODEL (default: on — when "
+                             "research flags a covalent warhead, include a pose with a "
+                             "ligand atom within ~3.6 Å of the nucleophile SG/OG)")
+    parser.add_argument("--active-site-min", type=int, default=0, metavar="N",
+                        help="force >= N MODELs at the dominant active site "
+                             "(top-template / dominant cluster / catalytic pocket). "
+                             "0 = off. Use when the true site scores low and LSCORE "
+                             "selection fills the MODELs with decoy pockets (e.g. T2414).")
+    parser.add_argument("--catalytic-regions", type=int, default=0, metavar="N",
+                        help="split scattered catalytic residues into N spatial "
+                             "regions (most-populated first) and force --per-region "
+                             "MODELs at each (e.g. 2 regions x 2 = ATP + Cys178). "
+                             "0 = off.")
+    parser.add_argument("--per-region", type=int, default=2, metavar="M",
+                        help="MODELs per catalytic region for --catalytic-regions "
+                             "(default 2).")
+    parser.add_argument("--covalent-split", type=int, default=0, metavar="N",
+                        help="hedge covalent vs non-covalent in the binding cleft: "
+                             "force N warhead-engaged (atom<=5Å of nucleophile SG) "
+                             "+ N non-engaged cleft poses. 0 = off (e.g. T2414 Cys178).")
+    parser.add_argument("--contact-residues", type=str, default="", metavar="LIST",
+                        help="comma-separated residue numbers; force --contact-n "
+                             "MODEL(s) with a ligand atom within 5Å of any of them "
+                             "(e.g. 182,187,200,213 for the T2414 upper catalytic loop).")
+    parser.add_argument("--contact-n", type=int, default=1, metavar="N",
+                        help="number of residue-contact MODELs for --contact-residues.")
+    parser.add_argument("--template-first", action="store_true",
+                        help="promote the best-lscore Track-2 template-based pose to "
+                             "MODEL 1 (template-guided primary; PARENT=<template>).")
     args = parser.parse_args()
+
+    # CASP17 group convention (LCDD): the submission basename MUST be
+    # '{target}_LCDD.lg'. Only the output directory is honoured; the
+    # filename is forced. See docs/casp17_lg_format.md and the
+    # casp_author_code memory.
+    forced_name = f"{args.target_id}_LCDD.lg"
+    out_dir = args.output.parent if args.output is not None else Path("experiments/CASP17/submissions")
+    if args.output is not None and args.output.name != forced_name:
+        print(f"NOTE: overriding output name '{args.output.name}' -> "
+              f"'{forced_name}' (CASP17 LCDD naming convention)")
+    args.output = out_dir / forced_name
 
     run_dir = args.run_dir.resolve()
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -710,6 +1634,18 @@ def main() -> int:
     print(f"  Protein source: {protein_model}")
     print(f"  CIF: {cif_path}")
 
+    # research / dominant-template-consensus pocket anchors (same frame as cif)
+    anchors: list = []
+    if not args.no_research_anchor:
+        try:
+            from casp17.research_prior import anchor_centers  # type: ignore
+            anchors = anchor_centers(run_dir, cif_path)
+            if anchors:
+                print("  Pocket anchors: "
+                      + ", ".join(f"{a.kind}:{a.label}" for a in anchors))
+        except Exception as e:
+            print(f"  research anchors skipped: {e}")
+
     protein_pdb = workdir / "protein.pdb"
     cif_to_pdb_with_plddt(cif_path, protein_pdb, args.target_id)
     protein_lines = extract_pdb_atom_lines(protein_pdb)
@@ -720,7 +1656,7 @@ def main() -> int:
     if not target_ligands:
         print("  WARNING: no ligands found in docking_prep_summary.json. "
               "Submission will emit a single LIGAND block using CLI defaults.")
-        target_ligands = [{"ligand_id": "L", "ligand_number": 1, "ligand_name": args.ligand_name}]
+        target_ligands = [{"ligand_id": "L", "ligand_number": args.ligand_id, "ligand_name": args.ligand_name}]
     else:
         for lig in target_ligands:
             lig["ligand_name"] = args.ligand_name
@@ -742,6 +1678,29 @@ def main() -> int:
             print(f"  WARNING: no poses with source={args.pose_source}, falling back to all sources")
             candidate_pool = scores.pose_scores
 
+    # Drop poses that interpenetrate the receptor. A template-docked pose (docked
+    # against a different receptor conformation) can, once aligned onto the cofold
+    # receptor, jam into it (T2414 3zos: 88 heavy-atom contacts < 2 Å). Such a
+    # MODEL is physically invalid, so remove clashers before any selection/hedge.
+    try:
+        from compute_submission_scores import _load_pose_mol as _lpm  # type: ignore
+        _rec = _receptor_heavy_coords(cif_path)
+        if _rec is not None:
+            _mc0: dict = {}
+            _before = len(candidate_pool)
+            # Every submitted MODEL uses the cofold (TARGET-sequence) receptor —
+            # CASP rejects a template receptor ("chain A sequence doesn't match").
+            # So ALL poses must fit the cofold receptor; drop any that clash
+            # (template-docked poses that jam into the cofold conformation).
+            candidate_pool = [p for p in candidate_pool
+                              if not _pose_clashes(_lpm(p, _mc0), _rec)]
+            _dropped = _before - len(candidate_pool)
+            if _dropped:
+                print(f"  clash filter: dropped {_dropped} receptor-clashing pose(s) "
+                      f"({len(candidate_pool)} remain)")
+    except Exception as _e:  # fail-open — never block submission on the filter
+        print(f"  clash filter skipped: {_e}")
+
     print(f"\nSelecting per-ligand top-{args.top_k} poses (diversity >= {args.diversity_rmsd}Å)...")
     per_ligand_selected: dict[str, list] = {}
     for i, lig in enumerate(target_ligands):
@@ -749,8 +1708,74 @@ def main() -> int:
         chosen = _select_poses_for_ligand(
             lig["ligand_id"], candidate_pool,
             k=args.top_k, rmsd_threshold=args.diversity_rmsd,
-            primary=primary,
+            primary=primary, anchors=anchors,
         )
+        # symmetric-ligand hedge: force in a REAL docked pose whose alternate
+        # scissile group faces the catalytic anchor (opposite orientation), if
+        # the current MODELs only show one orientation.
+        if not args.no_symflip and anchors:
+            pool_lig = [p for p in candidate_pool
+                        if (p.ligand_id == lig["ligand_id"]) or (primary and p.ligand_id is None)]
+            chosen = _force_alt_orientation(chosen, pool_lig, anchors,
+                                            k=args.top_k, rmsd_threshold=args.diversity_rmsd)
+            # template-site orientation hedge: 2 roughly-flipped poses at the
+            # template site when docking found them (partly-symmetric ligand).
+            chosen = _force_template_flip(chosen, pool_lig, anchors,
+                                          k=args.top_k, rmsd_threshold=args.diversity_rmsd)
+            # catalytic-site orientation hedge: 2 flipped poses at the catalytic
+            # residue site for a symmetric ligand (both warhead orientations).
+            if cif_path is not None:
+                chosen = _force_catalytic_flip(chosen, pool_lig, run_dir, cif_path,
+                                               k=args.top_k, rmsd_threshold=args.diversity_rmsd)
+        # active-site fill (opt-in): pull >= N MODELs to the dominant active site
+        # when LSCORE selection filled them with decoy pockets.
+        if args.active_site_min > 0 and cif_path is not None:
+            pool_lig = [p for p in candidate_pool
+                        if (p.ligand_id == lig["ligand_id"]) or (primary and p.ligand_id is None)]
+            chosen = _force_active_site(chosen, pool_lig, run_dir, cif_path,
+                                        k=args.top_k, rmsd_threshold=args.diversity_rmsd,
+                                        n_min=args.active_site_min)
+        # multi-region catalytic fill (opt-in): split scattered catalytic residues
+        # into N regions and force --per-region MODELs at each (e.g. ATP + Cys178).
+        if args.catalytic_regions > 0 and cif_path is not None:
+            pool_lig = [p for p in candidate_pool
+                        if (p.ligand_id == lig["ligand_id"]) or (primary and p.ligand_id is None)]
+            chosen = _force_catalytic_regions(chosen, pool_lig, run_dir, cif_path,
+                                              k=args.top_k, rmsd_threshold=args.diversity_rmsd,
+                                              n_regions=args.catalytic_regions,
+                                              per_region=args.per_region)
+        # force MODEL(s) contacting a specified residue set (opt-in)
+        if args.contact_residues.strip() and cif_path is not None:
+            resids = [r.strip() for r in args.contact_residues.split(",") if r.strip()]
+            pool_lig = [p for p in candidate_pool
+                        if (p.ligand_id == lig["ligand_id"]) or (primary and p.ligand_id is None)]
+            chosen = _force_residue_contact(chosen, pool_lig, run_dir, cif_path,
+                                            k=args.top_k, rmsd_threshold=args.diversity_rmsd,
+                                            resids=resids, n=args.contact_n)
+        # covalent vs non-covalent cleft hedge (opt-in)
+        if args.covalent_split > 0 and cif_path is not None:
+            pool_lig = [p for p in candidate_pool
+                        if (p.ligand_id == lig["ligand_id"]) or (primary and p.ligand_id is None)]
+            chosen = _force_covalent_split(chosen, pool_lig, run_dir, cif_path,
+                                           k=args.top_k, rmsd_threshold=args.diversity_rmsd,
+                                           n_cov=args.covalent_split,
+                                           n_noncov=args.covalent_split)
+        if not args.no_cofold_consensus:
+            pool_lig = [p for p in candidate_pool
+                        if (p.ligand_id == lig["ligand_id"]) or (primary and p.ligand_id is None)]
+            chosen = _force_cofold_consensus(chosen, pool_lig,
+                                             k=args.top_k, rmsd_threshold=args.diversity_rmsd)
+        if not args.no_covalent and cif_path is not None:
+            pool_lig = [p for p in candidate_pool
+                        if (p.ligand_id == lig["ligand_id"]) or (primary and p.ligand_id is None)]
+            chosen = _force_covalent_pose(chosen, pool_lig, run_dir, cif_path,
+                                          k=args.top_k, rmsd_threshold=args.diversity_rmsd)
+        # promote a Track-2 template-based pose to MODEL 1 (template-guided primary)
+        if args.template_first and chosen:
+            ti = next((j for j, p in enumerate(chosen)
+                       if _track2_template(getattr(p, "pose_name", "") or "")), None)
+            if ti is not None and ti != 0:
+                chosen.insert(0, chosen.pop(ti))
         per_ligand_selected[lig["ligand_id"]] = chosen
         note = "(primary)" if primary else ""
         if not chosen:
@@ -818,6 +1843,10 @@ def main() -> int:
                   f"{len(target_ligands)} ligands), stopping.")
             break
 
+        # Receptor = the cofold (TARGET-sequence) prediction for EVERY MODEL.
+        # CASP validates the receptor sequence against the target, so a homolog
+        # template receptor is rejected — poses are placed on our predicted
+        # (cofold) structure regardless of where they were docked.
         models.append({
             "protein_pdb_lines": protein_lines,
             "parent": args.parent,
@@ -863,6 +1892,17 @@ def main() -> int:
     if affinity_nM is not None:
         print(f"  AFFNTY per MODEL: {affinity_nM:.3g} nM")
     print(f"{'='*60}")
+
+    if not args.no_slack:
+        # viewer HTML + standalone + Slack summary (no-op if no webhook).
+        # Subprocess-isolated so a notify failure never fails the build.
+        import subprocess
+        import sys as _sys
+        subprocess.run(
+            [_sys.executable, str(Path(__file__).resolve().parent / "notify_lg.py"),
+             "--lg", str(args.output)],
+            check=False,
+        )
 
     return 0
 

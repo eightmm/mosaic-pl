@@ -14,13 +14,14 @@ mcp:
 lint:
 	uv run ruff check src
 
-# Validate every LG-format file under experiments/submissions against the
+# Validate every LG-format file under the CASP17 submission homes against the
 # CASP17 LG grammar (docs/casp17_lg_format.md). Exits non-zero on any ERROR.
+# Covers central CASP17/submissions/ and per-target CASP17/<T>/submissions/.
 # Override with: make lint-lg LG_FILES="path/to/foo.lg"
-LG_FILES ?= $(wildcard experiments/submissions/*.lg)
+LG_FILES ?= $(wildcard experiments/CASP17/submissions/*.lg experiments/CASP17/*/submissions/*.lg)
 lint-lg:
 	@if [ -z "$(LG_FILES)" ]; then \
-		echo "no LG files found under experiments/submissions/"; exit 0; \
+		echo "no LG files found under experiments/CASP17/**/submissions/"; exit 0; \
 	fi
 	uv run python scripts/lint_lg_submission.py $(LG_FILES)
 

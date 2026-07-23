@@ -204,7 +204,7 @@ def audit_target(base: Path, max_padding: float = 30.0) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--runs-dir", type=Path,
-                    default=Path("experiments/msa_e2e_test/runs"))
+                    default=Path("experiments/novel2025_runs/runs"))
     ap.add_argument("--n", type=int, default=50)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--output-tsv", type=Path,

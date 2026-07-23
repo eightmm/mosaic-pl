@@ -20,6 +20,8 @@ to re-derive it from the website each time.
 | R2318 | 140 nt | `CACUGGAUGAGGUUUUCAGGAGAACAGGGUAAGCUAACCAUGAUGAACUGAAAACGGACAGAACUCUGGAGAGUUCCGCAAGGACGCCGAAGGGGCAAGACAGCAAAGCUGUUCAAUCUCUCAGGCAAAAGGACAGAGCG`                                                                                                                  | Glycine (Dha riboswitch) | GLY | `NCC(=O)O`                                        | 2026-05-07          |
 | R2329 | 60 nt  | `CGGAGUCAUGGCUCAGGGCUGUUCGCAGCCGCUGCAGUCAGUCGAAAGACUGAGACUCCG`                                                                                                                                                                                                    | S-adenosylmethionine (SAMURI ribozyme holo) | SAM | `C[S@@+](CC[C@H](N)C(=O)[O-])C[C@H]1O[C@@H](n2cnc3c(N)ncnc32)[C@H](O)[C@@H]1O` | 2026-05-14          |
 | R2330 | 75 nt  | `ACUCGGGGUGCCCUUCAAAAGAAGGCUGAGAAAUACCCGUAUCACCUGAUCUGGAUAAUGCCAGCGUAGGGAAGU`                                                                                                                                                                                    | Thiamine pyrophosphate (E. coli TPP riboswitch) | TPP | `Cc1ncc(C[n+]2csc(CCOP(=O)([O-])OP(=O)([O-])[O-])c2C)c(N)n1` | 2026-05-14          |
+| R2387 | 43 nt  | `GGUGCGUUGCUUCCGAUGACGGCACCUUAAAAACAAUAGGAGA`                                                                                                                                                                                                                    | NAD+ (RNA-NAD+ complex; id=153) | NAD | `NC(=O)c1ccc[n+](c1)[C@@H]2O[C@H](CO[P]([O-])(=O)O[P@](O)(=O)OC[C@H]3O[C@H]([C@H](O)[C@@H]3O)n4cnc5c(N)ncnc45)[C@@H](O)[C@H]2O` | 2026-06-17 (human 2026-06-29) |
+| R2390 | 34 nt  | `GGUGGGUUCUUCCUCGCCACGGUAAAAACAAGGA`                                                                                                                                                                                                                             | NMN (RNA-NMN complex; id=154) | NMN | `NC(=O)c1ccc[n+](c1)[C@@H]2O[C@H](CO[P](O)(O)=O)[C@@H](O)[C@H]2O` | 2026-06-19 (human 2026-07-01) |
 
 Sequences also stored as fasta in `inputs/casp17_rna_lig/{R2314,R2317,R2318}.fasta`
 (downloaded via `target.cgi?id={34,37,38}&view=sequence` — note **numeric id**,
@@ -192,12 +194,12 @@ samples, fall back to lowest-RMSD acceptable poses; never duplicate.
 uv run casp17-pl prepare-wrapper \
   --input inputs/casp17_rna_lig/R2314.yaml \
   --config inputs/casp17_rna_lig/runner.yaml \
-  --output-root experiments/casp17_rna_lig \
+  --output-root experiments/CASP17 \
   --backend slurm
 
 # 2. submit:
 sbatch --partition=heavy --time=06:00:00 \
-  experiments/casp17_rna_lig/R2314/scripts/run_wrapper.sbatch.sh
+  experiments/CASP17/R2314/scripts/run_wrapper.sbatch.sh
 
 # Wrapper executes (RNA-only path):
 #   1) AF3 data pipeline (jackhmmer + nhmmer + Rfam + RNAcentral + nt_rna)
@@ -209,19 +211,20 @@ sbatch --partition=heavy --time=06:00:00 \
 
 # 3. build LG submission:
 uv run python scripts/build_rna_ligand_lg_submission.py \
-  --run-dir experiments/casp17_rna_lig/R2314 \
+  --run-dir experiments/CASP17/R2314 \
   --target-id R2314 \
   --ligand-name TRP \
   --author <12-DIGIT-REG-CODE> \
-  --method "Boltz-2 + Protenix + AF3 cofolding (5 seeds × 5 samples; AF3 unified RNA MSA pipeline; whole-system USalign superposition + ligand pose clustering at 3 Å)" \
-  --output experiments/submissions/R2314.lg
+  --method "Boltz-2 + Protenix + AF3 cofolding (5 seeds × 5 samples; AF3 unified RNA MSA pipeline; whole-system USalign superposition + ligand pose clustering at 3 Å)"
+  # default --output is now experiments/CASP17/submissions/R2314_LCDD.lg
+  # (pass --output only to override the directory)
 
 # Builder consumes only *_aligned.cif so every MODEL is in the same frame.
 # Ligand poses are heavy-atom RMSD clustered (--cluster-rmsd, default 3 Å);
 # the highest-confidence member of each top cluster becomes a MODEL.
 
 # 4. routine validation:
-make lint-lg LG_FILES=experiments/submissions/R2314.lg
+make lint-lg LG_FILES=experiments/CASP17/submissions/R2314_LCDD.lg
 # (or `make test` to exercise the linter unit tests under tests/test_lg_lint.py)
 ```
 

@@ -1423,6 +1423,188 @@ def select_diverse_top_k(
     return selected
 
 
+def _pose_centroid(p: "PoseScore", mol_cache: dict):
+    import numpy as np
+    arr = _pose_coord_array(_load_pose_mol(p, mol_cache))
+    return None if arr is None else arr.mean(axis=0)
+
+
+def select_diverse_top_k_anchored(
+    poses: list["PoseScore"],
+    anchors: list,
+    k: int = 5,
+    rmsd_threshold: float = 2.0,
+    bonus_weight: float = 0.15,
+    lam: float = 6.0,
+    coverage_dist: float = 8.0,
+    ligand_heavy: int | None = None,
+    size_gain: float = 1.5,
+    size_lo: int = 15,
+    size_hi: int = 35,
+) -> list["PoseScore"]:
+    """``select_diverse_top_k`` with research/template anchors folded in.
+
+    1. Soft: each pose gets ``bonus_weight · size · weight · exp(-d/lam)`` added
+       to its lscore (d = ligand-centroid → nearest anchor), so poses in a known
+       functional pocket rank up. ``size`` = ``1 + size_gain·f`` where
+       ``f = clamp((ligand_heavy - size_lo)/(size_hi - size_lo), 0, 1)`` — a
+       **larger ligand pulls harder toward the template** (a big ligand's
+       template binding mode is more diagnostic than its LSCORE; CASP meeting
+       request). Small ligands (f≈0) keep LSCORE-dominated ranking.
+    2. Hard coverage: if no selected MODEL lands within ``coverage_dist`` Å of an
+       anchor, the best-scoring pose that *does* is force-promoted into the MODEL
+       set (evicting the weakest, diversity kept when possible). With ≥2 major
+       ``template_site`` anchors this splits the MODELs across both sites.
+    3. Final order: MODELs are returned sorted by effective score, so for a large
+       ligand a template-anchored pose leads (MODEL 1) even at a lower raw
+       LSCORE, and the meeting's per-target reordering falls out.
+
+    Falls back to plain ``select_diverse_top_k`` when there are no anchors or no
+    lscore-bearing poses (fail-open — submission unchanged).
+    """
+    import numpy as np
+    if not anchors or k <= 0 or not poses:
+        return select_diverse_top_k(poses, k=k, rmsd_threshold=rmsd_threshold)
+    cand = [p for p in poses if p.lscore is not None]
+    if not cand:
+        return select_diverse_top_k(poses, k=k, rmsd_threshold=rmsd_threshold)
+
+    mol_cache: dict = {}
+    apts = [np.asarray(a.xyz, dtype=float) for a in anchors]
+    aw = [float(getattr(a, "weight", 1.0)) for a in anchors]
+
+    # ligand-size gain: derive heavy-atom count from a pose mol if not supplied
+    if ligand_heavy is None:
+        m0 = _load_pose_mol(cand[0], mol_cache)
+        try:
+            ligand_heavy = m0.GetNumHeavyAtoms() if m0 is not None else size_lo
+        except Exception:
+            ligand_heavy = size_lo
+    f = max(0.0, min(1.0, (ligand_heavy - size_lo) / float(max(1, size_hi - size_lo))))
+    size_mult = 1.0 + size_gain * f
+
+    def nearest(cen):
+        if cen is None:
+            return None, None
+        ds = [float(np.linalg.norm(cen - ap)) for ap in apts]
+        j = int(np.argmin(ds))
+        return ds[j], j
+
+    eff: dict[int, float] = {}
+    dmin: dict[int, float] = {}
+    for p in cand:
+        cen = _pose_centroid(p, mol_cache)
+        d, j = nearest(cen)
+        dmin[id(p)] = d if d is not None else 1e9
+        bonus = 0.0 if d is None else bonus_weight * size_mult * aw[j] * math.exp(-d / lam)
+        eff[id(p)] = (p.lscore or 0.0) + bonus
+
+    # SET membership is LSCORE-driven (keep the genuinely best diverse poses);
+    # the template `eff` bonus only drives coverage-promotion choice + final
+    # ORDER, so a strong template pose leads without evicting good non-template
+    # poses (meeting T2413: template→MODEL 1 but keep old 1-3).
+    ordered = sorted(cand, key=lambda p: -(p.lscore or 0.0))
+    selected, selected_mols = [], []
+    for c in ordered:
+        cmol = _load_pose_mol(c, mol_cache)
+        if not selected:
+            selected.append(c); selected_mols.append(cmol)
+        else:
+            if cmol is None:
+                continue
+            if all((pm is None) or ((_pose_pair_rmsd(cmol, pm) or 9e9) >= rmsd_threshold)
+                   for pm in selected_mols):
+                selected.append(c); selected_mols.append(cmol)
+        if len(selected) == k:
+            break
+
+    # hard coverage: every anchor should have a MODEL within coverage_dist.
+    # Process HIGH-WEIGHT anchors first (template/site before individual catalytic
+    # residues) and, when evicting, never remove the *sole* cover of another
+    # anchor — so covering a minor anchor can't un-cover the top template (fixes
+    # the multi-anchor thrashing seen on targets with many catalytic residues).
+    promote_floor = 0.05  # don't force a worthless pose just to tick an anchor
+
+    def _covers(p, ai):
+        cen = _pose_centroid(p, mol_cache)
+        return cen is not None and float(np.linalg.norm(cen - apts[ai])) <= coverage_dist
+
+    for ai in sorted(range(len(anchors)), key=lambda i: -aw[i]):
+        if any(_covers(p, ai) for p in selected):
+            continue
+        near_pool = [p for p in cand if p not in selected and _covers(p, ai)
+                     and (p.lscore or 0.0) >= promote_floor]
+        if not near_pool:
+            continue  # docking never sampled this site → can't force (flag upstream)
+        promote = max(near_pool, key=lambda p: eff[id(p)])
+        if len(selected) < k:
+            selected.append(promote)
+            continue
+        # evict weakest-eff MODEL that (a) is not the sole cover of another anchor
+        # and (b) is weaker than the pose we'd add
+        def _sole_cover(p):
+            for aj in range(len(anchors)):
+                if aj == ai:
+                    continue
+                covs = [q for q in selected if _covers(q, aj)]
+                if len(covs) == 1 and covs[0] is p:
+                    return True
+            return False
+        evictable = [p for p in selected
+                     if not _sole_cover(p) and eff[id(p)] < eff[id(promote)]]
+        if not evictable:
+            continue  # can't add without un-covering a stronger anchor → skip
+        victim = min(evictable, key=lambda p: eff[id(p)])
+        selected[selected.index(victim)] = promote
+
+    # multi-site balance: with >=2 major template_site anchors, ensure each site
+    # gets at least `min_per_site` MODELs so the submission splits across both
+    # sites (e.g. 3:2, not 4:1) — CASP meeting "2개 site에 나눠서 뽑기". Fail-open.
+    try:
+        site_pts = [apts[i] for i, a in enumerate(anchors)
+                    if getattr(a, "kind", "") == "template_site"]
+        if len(site_pts) >= 2 and k >= 2:
+            min_per_site = 2 if k >= 4 else 1
+
+            def _site_of(p):
+                cen = _pose_centroid(p, mol_cache)
+                if cen is None:
+                    return None
+                return int(np.argmin([float(np.linalg.norm(cen - sp)) for sp in site_pts]))
+
+            def _diverse_ok(cm):
+                return all((pm is None) or ((_pose_pair_rmsd(cm, pm) or 9e9) >= rmsd_threshold)
+                           for pm in (_load_pose_mol(s, mol_cache) for s in selected))
+
+            for si in range(len(site_pts)):
+                while sum(1 for p in selected if _site_of(p) == si) < min_per_site:
+                    pool = sorted((p for p in cand if p not in selected and _site_of(p) == si),
+                                  key=lambda p: -eff[id(p)])
+                    promoted = next((c for c in pool
+                                     if (_load_pose_mol(c, mol_cache) is not None)
+                                     and _diverse_ok(_load_pose_mol(c, mol_cache))), None)
+                    if promoted is None:
+                        break
+                    evictable = [p for p in selected
+                                 if (_site_of(p) is not None)
+                                 and sum(1 for q in selected if _site_of(q) == _site_of(p)) > min_per_site]
+                    if evictable:
+                        victim = min(evictable, key=lambda p: eff[id(p)])
+                        selected[selected.index(victim)] = promoted
+                    elif len(selected) < k:
+                        selected.append(promoted)
+                    else:
+                        break
+    except Exception:
+        pass
+
+    # final MODEL order = effective score desc (template-boosted). For a large
+    # ligand this lifts a template-anchored pose to MODEL 1 even at lower raw
+    # LSCORE; force-promoted site poses no longer sit forced at the tail.
+    selected = sorted(selected[:k], key=lambda p: -eff.get(id(p), p.lscore or 0.0))
+    return selected
+
+
 def select_diverse_top_k_rrf_legacy(
     poses: list[PoseScore],
     k: int = 5,

@@ -23,6 +23,15 @@ RNA-ligand specifics (chain id `0` convention, OP3 5'-end residue,
 ENDMDL handling vs. TS-style templates) live in
 `docs/casp17_rna_ligand_recipe.md`.
 
+## Filename convention (group LCDD) — ENFORCED
+
+Every LG submission file MUST be named **`{target}_LCDD.lg`** (e.g.
+`R2387_LCDD.lg`, `L2001_LCDD.lg`). Both builders force this: they honour
+only the output *directory* you pass via `--output` and override the
+basename to `{target}_LCDD.lg` (printing a `NOTE:` when overriding). The
+`--author` default is the LCDD registration code `6095-5696-9732`.
+Do not hand-rename submission files away from this pattern.
+
 ## 0. Server-verified rules (override the spec page when they conflict)
 
 These items were confirmed against the live CASP17 LG validator on

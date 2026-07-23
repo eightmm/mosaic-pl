@@ -18,10 +18,10 @@ the user passes ``--strict`` and at least one target fails.
 Usage::
 
     .venv/bin/python scripts/check_frame_consistency.py \\
-        --runs-dir experiments/msa_e2e_test/runs
+        --runs-dir experiments/novel2025_runs/runs
 
     .venv/bin/python scripts/check_frame_consistency.py \\
-        --target-dir experiments/msa_e2e_test/runs/7hqq_input/7hqq_input
+        --target-dir experiments/novel2025_runs/runs/7hqq_input/7hqq_input
 """
 
 from __future__ import annotations

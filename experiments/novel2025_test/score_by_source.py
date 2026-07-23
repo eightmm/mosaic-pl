@@ -12,7 +12,9 @@ from collections import defaultdict
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-CSV_PATH = ROOT / "per_pose_scores.csv"
+# Run outputs + per_pose_scores.csv live in the sibling data dir
+# (experiments/novel2025_runs), not in this harness dir.
+CSV_PATH = ROOT.parent / "novel2025_runs" / "per_pose_scores.csv"
 
 
 def _f(v):

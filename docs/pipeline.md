@@ -552,7 +552,7 @@ python scripts/make_casp_submission.py \
     --include-affinity \
     --top-k 5 \
     --diversity-rmsd 2.0 \
-    --output experiments/submissions/L2001.lg
+    --output experiments/CASP17/submissions/L2001.lg
 ```
 
 CLI knobs: `--top-k 5`, `--diversity-rmsd 2.0`, `--pose-source auto|vina|autodock_gpu|protenix_dock|template|lig_align`, `--include-affinity`, `--lscore N` / `--affinity-nM N` (manual override, MODEL 1 만).
@@ -797,7 +797,7 @@ experiments/runs/<target>/
 ├── run_manifest.json
 └── wrapper_manifest.json
 
-experiments/submissions/                            # Stage 7 output (separate dir)
-├── <target>.lg                                      # CASP17 LG format (MODEL 1..5)
+experiments/CASP17/submissions/                     # Stage 7 output (CASP submission home)
+├── <target>_LCDD.lg                                 # CASP17 LG format (MODEL 1..5)
 └── ...
 ```

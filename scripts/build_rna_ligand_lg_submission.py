@@ -15,12 +15,12 @@ There is no docking stage to draw poses from, so every MODEL is a
 
 Usage:
     uv run python scripts/build_rna_ligand_lg_submission.py \
-        --run-dir experiments/casp17_rna_lig/R2314 \
+        --run-dir experiments/CASP17/R2314 \
         --target-id R2314 \
         --ligand-name TRP \
         --author 0000-0000-0000 \
-        --method "Boltz-2 + Boltz-2x + Protenix + AF3 cofolding (5 seeds × 5 samples; AF3 unified RNA MSA)" \
-        --output experiments/submissions/R2314.lg
+        --method "Boltz-2 + Boltz-2x + Protenix + AF3 cofolding (5 seeds × 5 samples; AF3 unified RNA MSA)"
+        # default --output: experiments/CASP17/submissions/R2314_LCDD.lg
 """
 
 from __future__ import annotations
@@ -334,16 +334,13 @@ def _extract_ligand_mdl(sample: CofoldSample, workdir: Path,
     if ligand_smiles:
         try:
             ref = Chem.MolFromSmiles(ligand_smiles)
-            if ref is not None and ref.GetNumAtoms() == raw.GetNumAtoms():
-                mol = Chem.Mol(ref)
-                conf = Chem.Conformer(mol.GetNumAtoms())
-                raw_conf = raw.GetConformer()
-                for atom in raw.GetAtoms():
-                    pos = raw_conf.GetAtomPosition(atom.GetIdx())
-                    conf.SetAtomPosition(atom.GetIdx(), pos)
-                mol.RemoveAllConformers()
-                mol.AddConformer(conf, assignId=True)
-            elif ref is not None:
+            if ref is not None:
+                # AssignBondOrdersFromTemplate keeps raw's atom order + 3D
+                # coords and transfers only the bond orders from the template.
+                # NEVER copy coords ref<-raw by atom index: PDB/CCD atom order
+                # != SMILES parse order, so an index copy scrambles the
+                # connectivity (phantom multi-Angstrom edges across the
+                # ligand). This bug shipped earlier on R2390 (NMN).
                 mol = AllChem.AssignBondOrdersFromTemplate(ref, raw)
         except Exception:
             mol = raw
@@ -411,15 +408,19 @@ def main() -> int:
                              "auto-matches the LG output to it (overrides "
                              "--receptor-chain-id). Also reports any atom-set "
                              "diffs vs the cofolding output.")
-    parser.add_argument("--author", default="0887-0325-2808",
-                        help="CASP 12-digit registration code (default: own "
-                             "group code 0887-0325-2808).")
+    parser.add_argument("--author", default="6095-5696-9732",
+                        help="CASP 12-digit registration code (default: group "
+                             "LCDD code 6095-5696-9732).")
     parser.add_argument("--method", required=True,
                         help="Method description line. The fixed footer "
                              "'Pipeline configured and executed via Claude "
                              "Code agentic decision-making' is appended "
                              "automatically.")
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--output", type=Path, default=None,
+                        help="Output LG path. CASP17 group convention forces "
+                             "the basename to '{target}_LCDD.lg' regardless of "
+                             "what is passed (only the directory is honoured). "
+                             "Default: experiments/CASP17/submissions/{target}_LCDD.lg.")
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--cluster-rmsd", type=float, default=3.0,
                         help="Single-link clustering threshold on heavy-atom "
@@ -428,7 +429,22 @@ def main() -> int:
                              "cluster; we emit the highest-confidence member "
                              "of the top-K clusters as MODEL 1..K.")
     parser.add_argument("--parent", default="N/A")
+    parser.add_argument("--no-slack", action="store_true",
+                        help="skip the post-build viewer HTML + Slack summary "
+                             "(default: build viz/standalone + notify when a "
+                             "Slack webhook is configured)")
     args = parser.parse_args()
+
+    # CASP17 group convention (LCDD): the submission basename MUST be
+    # '{target}_LCDD.lg'. We honour only the output *directory*; the
+    # filename is forced. See docs/casp17_lg_format.md and the
+    # casp_author_code memory.
+    forced_name = f"{args.target_id}_LCDD.lg"
+    out_dir = args.output.parent if args.output is not None else Path("experiments/CASP17/submissions")
+    if args.output is not None and args.output.name != forced_name:
+        print(f"NOTE: overriding output name '{args.output.name}' -> "
+              f"'{forced_name}' (CASP17 LCDD naming convention)")
+    args.output = out_dir / forced_name
 
     run_dir = args.run_dir.resolve()
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -562,6 +578,16 @@ def main() -> int:
     args.output.write_text(submission_text)
     print(f"\nWrote {args.output} ({len(submission_text)} chars, "
           f"{len(models)} MODEL block(s))")
+
+    if not args.no_slack:
+        # viewer HTML + standalone + Slack summary (no-op if no webhook).
+        # Isolated in a subprocess so a notify failure never fails the build.
+        import subprocess
+        subprocess.run(
+            [sys.executable, str(Path(__file__).resolve().parent / "notify_lg.py"),
+             "--lg", str(args.output)],
+            check=False,
+        )
     return 0
 
 

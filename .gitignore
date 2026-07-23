@@ -49,6 +49,8 @@ experiments/**/rerun_runs.txt
 experiments/poses_unified/
 experiments/poses_unified_collect.log
 experiments/submissions/
+experiments/CASP17/submissions/
+experiments/CASP17/**/submissions/
 
 # casp16_test bulky archives
 experiments/casp16_test/**/*.tgz
@@ -65,3 +67,22 @@ experiments/runs/**/*.bak
 .agents/
 .omc/
 plugins/
+
+# CASP ligand watcher (local state + logs; secret webhook lives in ~/.config/casp)
+experiments/.casp_ligand_seen.json
+experiments/logs/casp_ligand_watch.log
+config/casp_slack_webhook
+
+config/casp_slack_bot_token
+config/casp_slack_channel_id
+config/casp_slack_webhook.disabled_by_request
+
+# Per-target working data + run outputs (not source; large, machine-generated)
+experiments/ligand_series/
+experiments/CASP17/
+experiments/novel2025_runs/
+inputs/
+viz/
+
+# Scratch / temp
+.tmp/

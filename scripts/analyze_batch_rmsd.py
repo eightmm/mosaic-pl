@@ -22,7 +22,7 @@ PDB serializer the docking pipeline uses, so RDKit always parses it.
 Usage::
 
     .venv/bin/python scripts/analyze_batch_rmsd.py \\
-        --runs-dir experiments/msa_e2e_test/runs \\
+        --runs-dir experiments/novel2025_runs/runs \\
         --targets 7hqq 9av3 9e72 \\
         --output-tsv /tmp/rmsd.tsv
 """
@@ -281,7 +281,7 @@ def analyze_one(target: str, run_root: Path, pipeline_dir: Path) -> dict | None:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--runs-dir", type=Path,
-                   default=_REPO_ROOT / "experiments/msa_e2e_test/runs")
+                   default=_REPO_ROOT / "experiments/novel2025_runs/runs")
     p.add_argument("--pipeline-dir", type=Path,
                    default=_REPO_ROOT / "experiments/novel2025_test/pipeline",
                    help="Directory holding ``<target>_input.yaml`` files")

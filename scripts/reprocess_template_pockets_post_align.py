@@ -121,7 +121,7 @@ def _reprocess_one(target_dir: Path) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--runs-dir", type=Path,
-                    default=Path("experiments/msa_e2e_test/runs"))
+                    default=Path("experiments/novel2025_runs/runs"))
     ap.add_argument("--targets", nargs="*", default=None)
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--limit", type=int, default=0,
