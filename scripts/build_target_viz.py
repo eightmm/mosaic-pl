@@ -34,6 +34,9 @@ import argparse
 import csv
 import html
 import json
+import tempfile
+import subprocess
+import os
 import re
 from pathlib import Path
 
@@ -390,6 +393,15 @@ def _slim_pdb(pdb_str: str, center=None, radius: float = 22.0,
     keep = []
     for ln in lines:
         rec = ln[:6].strip()
+        # Coordinates and chain breaks only. Everything else is either dead
+        # weight in the embedded HTML (ANISOU, SEQRES, REMARK, HEADER) or
+        # actively harmful: the trailing END record terminates 3Dmol's PDB
+        # parse, so the template ligand appended after this block was silently
+        # never read — T2451's top-10 templates all have a cartoon and showed
+        # no ligand at all except 5xgd, whose ligand happens to sit inside its
+        # own cartoon block ahead of the END.
+        if rec not in ("ATOM", "HETATM", "TER"):
+            continue
         if rec == "ATOM":
             if ln[17:20].strip() in _WATER:
                 continue
@@ -407,6 +419,37 @@ def _slim_pdb(pdb_str: str, center=None, radius: float = 22.0,
                     continue
         keep.append(ln)
     return "\n".join(keep) + "\n"
+
+
+def _check_page_js(html: str, target: str) -> None:
+    """Syntax-check the page's own script before writing it.
+
+    The viewer's JavaScript lives inside a Python f-string, so a `\\n` that
+    should reach the browser as an escape is one backslash away from becoming a
+    real newline inside a JS string literal — which is a SyntaxError that kills
+    the whole page while the HTML still looks perfectly fine. That shipped once
+    (`lg.molblock.split("\\n")`), and nothing caught it because the build only
+    ever checked the Python. Fails the build rather than the browser; skipped
+    silently when node is unavailable.
+    """
+    import shutil
+    node = shutil.which("node")
+    if not node:
+        return
+    scripts = re.findall(r"<script>(.*?)</script>", html, re.S)
+    if not scripts:
+        return
+    body = max(scripts, key=len)
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
+        fh.write(body)
+        tmp = fh.name
+    try:
+        r = subprocess.run([node, "--check", tmp], capture_output=True, text=True)
+    finally:
+        os.unlink(tmp)
+    if r.returncode != 0:
+        raise SystemExit(f"{target}: generated JavaScript is invalid\n"
+                         f"{r.stderr.strip()[:600]}")
 
 
 def load_template_structures(templates: dict, top_n: int, seq_n: int = 3,
@@ -507,6 +550,7 @@ def load_template_structures(templates: dict, top_n: int, seq_n: int = 3,
             if gi in cartoon_set:
                 st = gemmi.read_structure(str(align_input))
                 st.remove_alternative_conformations()
+                st.remove_waters()
                 st.remove_empty_chains()
                 for model in st:
                     for chain in model:
@@ -518,7 +562,7 @@ def load_template_structures(templates: dict, top_n: int, seq_n: int = 3,
                     break  # first model only
                 # full backbone (N,CA,C,O) — 3Dmol cartoon needs it (CA-only draws
                 # nothing). Single host chain, so size stays bounded.
-                cartoon = _slim_pdb(st.make_pdb_string())
+                cartoon = _slim_pdb(_strip_crystallisation_junk(st.make_pdb_string()))
         except Exception:
             continue
         if not (cartoon.strip() or lig.strip()):
@@ -530,6 +574,65 @@ def load_template_structures(templates: dict, top_n: int, seq_n: int = 3,
 
 
 _LIG_SKIP = _WATER | {"HOH"}  # never render water as a "ligand"
+
+
+def _crystallisation_junk() -> frozenset:
+    """CCD codes that are crystallisation artefacts, not bound ligands.
+
+    Reuses the project's CCD categories (buffers, cryoprotectants, solvents,
+    free ions, glycans, detergents) so the viewer and the template filter agree
+    on what counts as a ligand.
+    """
+    try:
+        from casp17.ccd import ccd_categories as cc
+    except ImportError:
+        # keep the viewer buildable without the package on the path
+        return frozenset({"EDO", "GOL", "PEG", "SO4", "PO4", "ACT", "DMS",
+                          "IMD", "MES", "TRS", "CL", "IOD", "NA", "K", "CA"})
+    return frozenset(cc.ALL_EXCLUDED | cc.METAL_CLUSTERS)
+
+
+_JUNK = _crystallisation_junk()
+
+
+def _is_polymer_residue(name: str) -> bool:
+    """True for an amino-acid or nucleotide residue name (incl. MSE and friends)."""
+    try:
+        import gemmi
+        info = gemmi.find_tabulated_residue(name)
+    except Exception:
+        return False
+    return bool(info) and (info.is_amino_acid() or info.is_nucleic_acid())
+
+
+def _strip_crystallisation_junk(pdb: str) -> str:
+    """Drop crystallisation additives from a PDB fragment.
+
+    A crystal entry carries whatever the drop contained — ethylene glycol,
+    glycerol, DMSO, acetate, sulfate, imidazole, stray halides. Overlaying all
+    of it buries the one thing the template is shown for: its bound ligand
+    (T2413v1's cartoons alone carried 216 EDO and 40 SO4 atoms). The polymer
+    and any candidate ligand are kept.
+
+    A bare name test against ``ALL_EXCLUDED`` is NOT enough: free amino acids
+    are themselves crystallisation additives, so that set legitimately holds
+    GLU, LYS, MET, MSE and PRO. Filtering on name alone punched those residues
+    out of every protein chain and left the cartoons visibly broken. Residues
+    that gemmi recognises as amino acids or nucleotides are therefore kept
+    unconditionally, and only the rest are name-tested.
+
+    (Chain membership would be the more direct test, but these fragments are
+    extracted host chains with no entity records, so ``get_polymer()`` comes
+    back empty and would classify an entire protein as non-polymer.)
+    """
+    out = []
+    for ln in pdb.splitlines():
+        if ln.startswith(("ATOM", "HETATM")):
+            name = ln[17:20].strip().upper()
+            if name in _JUNK and not _is_polymer_residue(name):
+                continue
+        out.append(ln)
+    return "\n".join(out) + "\n"
 
 
 def _ligand_on_own_chain(cif_path, ccds, refp, focus, timeout=90, max_chains=4):
@@ -644,7 +747,12 @@ def _template_ligand_hetatm(cif_path, ccds, Rm, tv, focus, host_chain: str = "",
     lines = []
     for i, (name, elem, v) in enumerate(atoms, 1):
         an = name if len(name) >= 4 else f" {name:<3}"
-        lines.append("HETATM%5d %-4.4s%3.3s A%4d    %8.3f%8.3f%8.3f  1.00  0.00          %2.2s"
+        # PDB columns: name 13-16, altLoc 17, resName 18-20, chain 22, resSeq 23-26.
+        # The altLoc blank after the atom name is not optional — without it the
+        # whole record shifts one column left and a 3-character CCD is read as
+        # its last two characters with the chain id taken from the resName field
+        # (3Dmol showed "1OB" as residue "OB").
+        lines.append("HETATM%5d %-4.4s %3.3s A%4d    %8.3f%8.3f%8.3f  1.00  0.00          %2.2s"
                      % (i % 100000, an, resn, 1, v[0], v[1], v[2], elem))
     return "\n".join(lines) + "\n", chosen_d
 
@@ -950,6 +1058,113 @@ def _molblock_heavy_coords(molblock: str) -> list[tuple[float, float, float]]:
     return out
 
 
+def _rigid_fit(mobile, target):
+    """Kabsch rotation+translation carrying ``mobile`` onto ``target``.
+
+    Returns ``(R, t, raw_rmsd, fitted_rmsd)``; both point sets are N x 3.
+    """
+    import numpy as np
+    P = np.asarray(mobile, float)
+    Q = np.asarray(target, float)
+    raw = float(np.sqrt(((P - Q) ** 2).sum(1).mean()))
+    pc, qc = P.mean(0), Q.mean(0)
+    H = (P - pc).T @ (Q - qc)
+    U, _S, Vt = np.linalg.svd(H)
+    R = Vt.T @ np.diag([1.0, 1.0, np.sign(np.linalg.det(Vt.T @ U.T))]) @ U.T
+    t = qc - R @ pc
+    fitted = float(np.sqrt(((P @ R.T + t - Q) ** 2).sum(1).mean()))
+    return R, t, raw, fitted
+
+
+def _apply_pdb(pdb: str, R, t) -> str:
+    """Rewrite ATOM/HETATM coordinates through ``R``/``t``, columns intact."""
+    out = []
+    for ln in pdb.splitlines():
+        if not ln.startswith(("ATOM", "HETATM")) or len(ln) < 54:
+            out.append(ln)
+            continue
+        try:
+            v = (R @ [float(ln[30:38]), float(ln[38:46]), float(ln[46:54])]) + t
+        except ValueError:
+            out.append(ln)
+            continue
+        out.append(f"{ln[:30]}{v[0]:8.3f}{v[1]:8.3f}{v[2]:8.3f}{ln[54:]}")
+    return "\n".join(out) + "\n"
+
+
+def _apply_molblock(molblock: str, R, t) -> str:
+    """Rewrite an MDL V2000 atom block through ``R``/``t``."""
+    lines = molblock.splitlines()
+    ci = next((i for i, ln in enumerate(lines)
+               if ln.rstrip().endswith("V2000")), None)
+    if ci is None:
+        return molblock
+    try:
+        na = int(lines[ci][:3])
+    except ValueError:
+        return molblock
+    for i in range(ci + 1, min(ci + 1 + na, len(lines))):
+        ln = lines[i]
+        try:
+            v = (R @ [float(ln[0:10]), float(ln[10:20]), float(ln[20:30])]) + t
+        except (ValueError, IndexError):
+            continue
+        lines[i] = f"{v[0]:10.4f}{v[1]:10.4f}{v[2]:10.4f}{ln[30:]}"
+    return "\n".join(lines)
+
+
+def superpose_models(parsed: dict) -> None:
+    """Put every MODEL in MODEL 1's frame, in place.
+
+    An LG MODEL is a self-contained snapshot, so nothing forces the MODELs to
+    share a frame — and for RNA they routinely do not: each MODEL keeps the
+    frame of the cofold sample it came from. Switching MODELs in the viewer then
+    jumps the whole molecule (R2365 MODEL 5: 20.8 Å receptor RMSD to MODEL 1,
+    half of it pure rigid-body offset), which buries the differences that
+    actually matter.
+
+    Superposing on the shared receptor atoms removes only the rigid-body part;
+    genuine fold differences survive untouched and become visible instead of
+    being swamped. Each MODEL's ligands travel with its receptor, so pose
+    geometry is preserved exactly. The LG submission itself is never rewritten —
+    this is display-only, and CASP scores each MODEL independently anyway.
+    """
+    models = parsed.get("models") or []
+    if len(models) < 2:
+        return
+
+    def keyed(pdb: str) -> dict:
+        d = {}
+        for ln in (pdb or "").splitlines():
+            if not ln.startswith("ATOM") or len(ln) < 54:
+                continue
+            try:
+                d[(ln[21], int(ln[22:26]), ln[12:16].strip())] = (
+                    float(ln[30:38]), float(ln[38:46]), float(ln[46:54]))
+            except ValueError:
+                continue
+        return d
+
+    ref = keyed(models[0].get("receptor_pdb") or "")
+    models[0]["frame_rmsd"] = 0.0
+    if not ref:
+        return
+    for m in models[1:]:
+        cur = keyed(m.get("receptor_pdb") or "")
+        shared = sorted(set(ref) & set(cur))
+        if len(shared) < 3:
+            continue
+        R, t, raw, fitted = _rigid_fit([cur[k] for k in shared],
+                                       [ref[k] for k in shared])
+        m["frame_rmsd"] = round(fitted, 2)
+        if raw - fitted < 0.05:      # already in MODEL 1's frame — leave it be
+            continue
+        m["receptor_pdb"] = _apply_pdb(m["receptor_pdb"], R, t)
+        for lig in m.get("ligands", []):
+            lig["molblock"] = _apply_molblock(lig["molblock"], R, t)
+        m["frame_shift"] = round(raw - fitted, 2)
+
+
 def _pdb_heavy_coords(pdb: str) -> list[tuple[float, float, float]]:
     """Heavy-atom xyz from PDB ATOM/HETATM records (element col 77-78, skip H)."""
     out = []
@@ -1179,6 +1394,18 @@ _TARGET_TEMPLATE = """<!DOCTYPE html>
   .mdl .met {{ font-size:11px; color:#9aa3b2; margin-top:3px; line-height:1.5; }}
   .mdl .met b {{ color:#cdd3df; font-weight:600; }}
   .mdl .src {{ font-size:10px; color:#6b7280; word-break:break-all; margin-top:2px; }}
+  .ctabs {{ display:flex; flex-wrap:wrap; gap:4px; margin-top:4px; }}
+  .tglBtn {{ display:inline-flex; align-items:center; gap:4px; font-size:10.5px; padding:2px 6px; }}
+  .tglBtn.on {{ background:#233047; border-color:#3b4a66; color:#e6e8ee; }}
+  .tglBtn .sw {{ width:9px; height:9px; border-radius:2px; }}
+  .clist {{ max-height:190px; overflow-y:auto; margin-top:4px; border:1px solid #2a2f3a; border-radius:5px; }}
+  .crow {{ display:flex; align-items:baseline; gap:6px; padding:2px 6px; cursor:pointer;
+           font-size:11px; font-variant-numeric:tabular-nums; }}
+  .crow:hover {{ background:#1a1f2b; }}
+  .crow.on {{ background:#233047; }}
+  .crow .cid {{ flex:0 0 68px; color:#e6e8ee; }}
+  .crow .cd {{ flex:0 0 44px; color:#9aa3b2; text-align:right; }}
+  .crow .cat {{ flex:1; min-width:0; color:#7f8896; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
   .badge {{ font-size:10px; font-weight:600; padding:1px 6px; border-radius:8px; margin-left:6px; flex:0 0 auto; white-space:nowrap; font-variant-numeric:tabular-nums; }}
   .badge.ok {{ background:#10331c; color:#5fd38a; border:1px solid #1d5e34; }}
   .badge.bad {{ background:#3a1115; color:#ff7a86; border:1px solid #6e1f27; }}
@@ -1231,7 +1458,26 @@ _TARGET_TEMPLATE = """<!DOCTYPE html>
         <option value="none">hide receptor</option>
       </select>
       <label class="row"><input type="checkbox" id="plddt"><span class="txt">color by pLDDT (B-factor)</span></label>
-      <label class="row"><input type="checkbox" id="pocketRes"><span class="txt">show pocket residues (≤4.5Å)</span></label>
+      <label class="row"><input type="checkbox" id="pocketRes"><span class="txt">show pocket residues</span></label>
+      <div class="row" style="gap:6px">
+        <span class="txt">contact cutoff</span>
+        <select id="contactCut" style="flex:0 0 auto">
+          <option value="3.5">3.5 Å</option>
+          <option value="4.0">4.0 Å</option>
+          <option value="4.5" selected>4.5 Å</option>
+          <option value="5.0">5.0 Å</option>
+        </select>
+      </div>
+      <div id="contactBox" style="display:none">
+        <div class="row" style="justify-content:space-between">
+          <span class="txt" id="contactHead">contacts</span>
+          <button class="btn" id="contactAll" title="pin every contact residue">all</button>
+          <button class="btn" id="contactNone" title="unpin all">none</button>
+          <button class="btn" id="contactCopy" title="copy the residue list">copy</button>
+        </div>
+        <div id="contactTabs" class="ctabs"></div>
+        <div id="contactList" class="clist"></div>
+      </div>
     </div>
     <div class="sec">
       <h2>MODELs (receptor + pose)</h2>
@@ -1306,6 +1552,56 @@ _TARGET_TEMPLATE = """<!DOCTYPE html>
 <script>
 const DATA = {data_json};
 const $ = (id) => document.getElementById(id);
+// residues the shown pose touches, and which of them the user pinned
+let CONTACTS = [];               // residues touched by the ligand currently picked
+let CONTACT_GROUPS = [];         // one entry per ligand on screen
+let CONTACT_GRP = 0;             // which of those groups the list is showing
+let CONTACT_KEY = null;          // that group's identity, so it survives re-renders
+const CONTACT_SEL = new Set();
+const LIG_SRC = [];              // {{id, model, lig, color}} per ligand model
+let CONTACT_ZOOM = null;         // key of the row just clicked — zoomed once, then cleared
+
+function renderContacts() {{
+  const box = $("contactBox"), list = $("contactList"), tabs = $("contactTabs");
+  if (!box || !list) return;
+  if (!CONTACT_GROUPS.length) {{
+    box.style.display = "none"; list.innerHTML = ""; tabs.innerHTML = ""; return;
+  }}
+  box.style.display = "";
+  // one tab per ligand: with several MODELs on screen a merged list cannot say
+  // which pocket belongs to which pose
+  tabs.innerHTML = CONTACT_GROUPS.map((g, i) =>
+    `<button class="btn tglBtn${{i === CONTACT_GRP ? " on" : ""}}" data-i="${{i}}"
+       title="${{g.res.length}} residues within the cutoff">
+       <span class="sw" style="background:${{g.color}}"></span>MODEL ${{g.model}}</button>`
+  ).join("");
+  tabs.querySelectorAll(".tglBtn").forEach(b => {{
+    b.onclick = () => {{ CONTACT_GRP = +b.dataset.i;
+                         CONTACT_KEY = CONTACT_GROUPS[CONTACT_GRP].key;
+                         CONTACT_SEL.clear(); CONTACT_ZOOM = null; render(); }};
+  }});
+  const g = CONTACT_GROUPS[CONTACT_GRP];
+  $("contactHead").textContent =
+    `MODEL ${{g.model}} · ${{g.lig}} — ${{CONTACTS.length}} residue${{CONTACTS.length === 1 ? "" : "s"}}`;
+  list.innerHTML = CONTACTS.map(e => {{
+    const atoms = e.atoms.slice(0, 3)
+      .map(a => `${{a.name}}→${{a.lig || "?"}} ${{a.d.toFixed(2)}}`).join(", ");
+    const more = e.atoms.length > 3 ? ` +${{e.atoms.length - 3}}` : "";
+    return `<div class="crow${{CONTACT_SEL.has(e.key) ? " on" : ""}}" data-k="${{e.key}}"
+              title="${{e.atoms.map(a => a.name + " -> " + (a.lig || "?") + "  " + a.d.toFixed(2) + " A").join("\\n")}}">
+              <span class="cid">${{e.resn}}${{e.resi}}.${{e.chain}}</span>
+              <span class="cd">${{e.min.toFixed(2)}}</span>
+              <span class="cat">${{atoms}}${{more}}</span></div>`;
+  }}).join("");
+  list.querySelectorAll(".crow").forEach(row => {{
+    row.onclick = () => {{
+      const k = row.dataset.k;
+      if (CONTACT_SEL.has(k)) {{ CONTACT_SEL.delete(k); CONTACT_ZOOM = null; }}
+      else {{ CONTACT_SEL.add(k); CONTACT_ZOOM = k; }}
+      render();
+    }};
+  }});
+}}
 let viewer, bgWhite = true;
 let spinning = false, orthographic = false, surfOn = false;
 let recModelIds = [], ligModelIds = [];
@@ -1548,7 +1844,20 @@ function init() {{
     $("tplAnchorLegend").innerHTML = parts.length ? parts.join(" · ")
       : '<span style="color:#6b7280">no template anchors (no hits / RNA)</span>';
   }}
-  document.querySelectorAll(".mChk,.bsChk,.pgChk,.cfChk,.tplChk,#boxShow,#lblShow,#tplLbl,#tplAnchor,#tplLigOnly,#resMark,#plddt,#pocketRes,#tplColor").forEach(el => el.addEventListener("change", render));
+  document.querySelectorAll(".mChk,.bsChk,.pgChk,.cfChk,.tplChk,#boxShow,#lblShow,#tplLbl,#tplAnchor,#tplLigOnly,#resMark,#plddt,#pocketRes,#tplColor,#contactCut").forEach(el => el.addEventListener("change", render));
+  $("contactAll").onclick = () => {{
+    CONTACTS.forEach(e => CONTACT_SEL.add(e.key)); CONTACT_ZOOM = null; render();
+  }};
+  $("contactNone").onclick = () => {{ CONTACT_SEL.clear(); CONTACT_ZOOM = null; render(); }};
+  $("contactCopy").onclick = () => {{
+    const txt = CONTACTS.map(e =>
+      `${{e.resn}}${{e.resi}}.${{e.chain}}\\t${{e.min.toFixed(2)}}\\t` +
+      e.atoms.map(a => a.name + ":" + a.d.toFixed(2)).join(" ")).join("\\n");
+    navigator.clipboard.writeText(txt).then(
+      () => {{ $("contactCopy").textContent = "copied";
+               setTimeout(() => {{ $("contactCopy").textContent = "copy"; }}, 1200); }},
+      () => {{ $("contactCopy").textContent = "failed"; }});
+  }};
   $("pgAll").onclick = () => {{ setChk(".pgChk", true); render(); }};
   $("pgNone").onclick = () => {{ setChk(".pgChk", false); render(); }};
   $("pgTpl").onclick = () => {{  // sources with a pose within 8 Å of a template COM
@@ -1637,7 +1946,7 @@ function render(initial) {{
   // independently — toggling MODEL N draws MODEL N's own receptor + pose, as
   // written in the LG file. (For protein the receptor is byte-identical across
   // MODELs, so multiple-on overlap exactly; view one at a time for a clean snapshot.)
-  recModelIds = []; ligModelIds = [];
+  recModelIds = []; ligModelIds = []; LIG_SRC.length = 0;
   // Draw a receptor for EVERY distinct receptor among the checked MODELs. Protein
   // targets share ONE predicted structure across MODEL 1-5 (only the ligand pose
   // differs), so the distinct-set is a single receptor drawn once — that is the
@@ -1672,6 +1981,12 @@ function render(initial) {{
       const lcs = carbonScheme(m.color);  // C = MODEL colour, heteroatoms by element
       lm.setStyle({{}}, {{ stick: {{ radius: 0.15, colorscheme: lcs }}, sphere: {{ scale: 0.22, colorscheme: lcs }} }});
       ligModelIds.push(lm.getID());
+      // Keep each ligand identifiable so its pocket can be reported separately —
+      // a merged contact list is unreadable once two MODELs, or two ligands of
+      // one MODEL, are on screen at the same time.
+      const title = (lg.molblock.split("\\n")[0] || "").trim();
+      LIG_SRC.push({{ id: lm.getID(), model: m.model, color: m.color,
+                      lig: title || "ligand", key: m.model + "|" + title }});
     }});
   }});
   // if MODELs are shown but recStyle hid nothing was drawn, still nothing — but
@@ -1685,12 +2000,91 @@ function render(initial) {{
   if (surfOn && recModelIds.length)
     recModelIds.forEach(rid =>
       viewer.addSurface($3Dmol.SurfaceType.VDW, {{ opacity: 0.45, color: "white" }}, {{ model: rid }}));
-  // pocket residues: receptor atoms within 4.5Å of any shown ligand -> add sticks
+  // pocket residues: receptor atoms within the chosen cutoff of any shown ligand
+  const CCUT = parseFloat($("contactCut").value) || 4.5;
   if ($("pocketRes").checked && recModelIds.length && ligModelIds.length) {{
     recModelIds.forEach(rid => ligModelIds.forEach(lid =>
-      viewer.addStyle({{ model: rid, byres: true, within: {{ distance: 4.5, sel: {{ model: lid }} }} }},
+      viewer.addStyle({{ model: rid, byres: true, within: {{ distance: CCUT, sel: {{ model: lid }} }} }},
                       {{ stick: {{ radius: 0.18, colorscheme: "cyanCarbon" }} }})));
   }}
+  // Which residues the submitted pose actually touches, atom by atom. 3Dmol's
+  // `within` draws them but never says *which*, so the distances are recomputed
+  // here from the atoms already in the scene — no extra payload, and it stays
+  // correct when a different MODEL (hence a different receptor) is shown.
+  CONTACT_GROUPS = [];
+  if (recModelIds.length && LIG_SRC.length) {{
+    const rec = [];
+    recModelIds.forEach(id => (viewer.getModel(id).selectedAtoms({{}}) || [])
+      .forEach(a => {{ if (a.elem !== "H") rec.push(a); }}));
+    LIG_SRC.forEach(src => {{
+      const lig = (viewer.getModel(src.id).selectedAtoms({{}}) || [])
+        .filter(a => a.elem !== "H");
+      if (!lig.length) return;
+      const acc = new Map();
+      rec.forEach(a => {{
+        let best = Infinity, bestLig = null;
+        for (let i = 0; i < lig.length; i++) {{
+          const l = lig[i];
+          const dx = a.x - l.x, dy = a.y - l.y, dz = a.z - l.z;
+          const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+          if (d < best) {{ best = d; bestLig = l; }}
+        }}
+        if (best > CCUT) return;
+        const key = (a.chain || "?") + ":" + a.resi;
+        let e = acc.get(key);
+        if (!e) {{ e = {{ key: key, chain: a.chain || "?", resi: a.resi, resn: a.resn,
+                          min: Infinity, atoms: [] }}; acc.set(key, e); }}
+        e.min = Math.min(e.min, best);
+        e.atoms.push({{ name: (a.atom || "").trim(), d: best,
+                        lig: (bestLig && (bestLig.atom || "").trim()) || "" }});
+      }});
+      const res = [...acc.values()].sort((x, y) => x.min - y.min);
+      res.forEach(e => e.atoms.sort((p, q) => p.d - q.d));
+      CONTACT_GROUPS.push({{ id: src.id, model: src.model, lig: src.lig,
+                             key: src.key, color: src.color, res: res }});
+    }});
+  }}
+  // follow the MODEL the user picked: hold the selection by identity so
+  // toggling other MODELs on and off does not silently switch pockets, and
+  // fall back to the first group when that ligand leaves the scene
+  const keep = CONTACT_GROUPS.findIndex(g => g.key === CONTACT_KEY);
+  CONTACT_GRP = keep >= 0 ? keep : 0;
+  CONTACT_KEY = CONTACT_GROUPS.length ? CONTACT_GROUPS[CONTACT_GRP].key : null;
+  CONTACTS = CONTACT_GROUPS.length ? CONTACT_GROUPS[CONTACT_GRP].res : [];
+  renderContacts();
+  // Pinned residues are drawn as shapes, not only as a model style: a stick
+  // style lands inside whatever the receptor is already drawn as (and vanishes
+  // entirely when the receptor is hidden), whereas shapes render regardless.
+  let zoomSel = null;
+  CONTACT_SEL.forEach(k => {{
+    const e = CONTACTS.find(c => c.key === k);
+    if (!e) return;
+    const names = new Set(e.atoms.map(a => a.name));
+    let anchor = null;
+    recModelIds.forEach(rid => {{
+      viewer.addStyle({{ model: rid, chain: e.chain, resi: e.resi }},
+                      {{ stick: {{ radius: 0.25, colorscheme: "yellowCarbon" }} }});
+      (viewer.getModel(rid).selectedAtoms({{ chain: e.chain, resi: e.resi }}) || [])
+        .forEach(a => {{
+          if (a.elem === "H") return;
+          const touching = names.has((a.atom || "").trim());
+          viewer.addSphere({{ center: {{ x: a.x, y: a.y, z: a.z }},
+                              radius: touching ? 0.32 : 0.20,
+                              color: touching ? "#ffd400" : "#8a7a20",
+                              opacity: touching ? 0.95 : 0.6 }});
+          if (!anchor) anchor = a;
+        }});
+    }});
+    if (anchor) {{
+      const terse = recModelIds.length > 1 || CONTACT_SEL.size > 6;
+      viewer.addLabel(`${{e.resn}}${{e.resi}}${{terse ? "" : " " + e.min.toFixed(1)}}`,
+        {{ position: {{ x: anchor.x, y: anchor.y, z: anchor.z }}, fontSize: 8,
+           borderThickness: 0, backgroundOpacity: 0.7, backgroundColor: "#4a3a00",
+           fontColor: "#ffe680", inFront: true }});
+      if (k === CONTACT_ZOOM) zoomSel = {{ chain: e.chain, resi: e.resi }};
+    }}
+  }});
+  if (zoomSel) {{ viewer.zoomTo(zoomSel); CONTACT_ZOOM = null; }}
   // cofolding receptors (compare folds) — cartoon in tool colour
   document.querySelectorAll(".cfChk").forEach(chk => {{
     if (!chk.checked) return;
@@ -1957,6 +2351,7 @@ def main() -> None:
     entries = []
     for target, lg in sorted(by_target.items()):
         parsed = parse_lg(lg)
+        superpose_models(parsed)
         roots = _target_run_roots(lg, target, scan_roots)
         bsites = find_binding_sites(roots, target)
         metrics = load_pose_metrics(roots)
@@ -1971,10 +2366,11 @@ def main() -> None:
             research = load_research(r, Path(rc) if rc else None)
             if research:
                 break
-        (out / f"{target}.html").write_text(
-            build_target_html(parsed, bsites, metrics, pose_groups,
-                              cofold_receptors, ASSET_REL, templates, tstructs,
-                              research, anchors))
+        html = build_target_html(parsed, bsites, metrics, pose_groups,
+                                 cofold_receptors, ASSET_REL, templates, tstructs,
+                                 research, anchors)
+        _check_page_js(html, target)
+        (out / f"{target}.html").write_text(html)
         if tstructs:
             print(f"    + {len(tstructs)} embedded template structures")
         ligs = parsed["models"][0]["ligands"] if parsed["models"] else []
@@ -1990,10 +2386,18 @@ def main() -> None:
         is_protein = (n_metrics > 0 or len(bsites["sites"]) > 0)
         entries[-1]["kind"] = "protein-lig" if is_protein else "RNA-lig"
         n_extra = sum(len(g["poses"]) for g in pose_groups)
+        shifted = [m for m in parsed["models"] if m.get("frame_shift")]
+        frame = ""
+        if shifted:
+            worst = max(m["frame_shift"] for m in shifted)
+            resid = max(m.get("frame_rmsd") or 0.0 for m in parsed["models"])
+            frame = (f", superposed {len(shifted)} MODEL(s) onto MODEL 1 "
+                     f"(removed up to {worst:.1f} Å of frame offset; "
+                     f"{resid:.1f} Å real difference remains)")
         print(f"  {target}: {len(parsed['models'])} MODELs, {len(ligs)} ligand(s), "
               f"{len(bsites['sites'])} bsites, {n_metrics} pose-metrics, "
               f"{len(pose_groups)} pose-groups/{n_extra} extra-poses, "
-              f"{len(cofold_receptors)} cofold-receptors -> {target}.html")
+              f"{len(cofold_receptors)} cofold-receptors{frame} -> {target}.html")
 
     (out / "index.html").write_text(build_index_html(entries))
     print(f"\nWrote {len(entries)} viewer(s) + index -> {out/'index.html'}")

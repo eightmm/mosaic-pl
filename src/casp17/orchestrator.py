@@ -396,7 +396,6 @@ def write_example_config(path: Path, preset: str = "balanced") -> None:
     config["autodock_gpu"]["size_x"] = 20.0
     config["autodock_gpu"]["size_y"] = 20.0
     config["autodock_gpu"]["size_z"] = 20.0
-    config["slurm"]["partition"] = "gpu"
     dump_structured_file(config, path)
 
 

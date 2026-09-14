@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -189,7 +188,18 @@ def patch_boltz_yaml(
             _write_a3m(unpaired, rna_a3m)
             rna["msa"] = str(rna_a3m)
 
-    # Per-chain MSA injection
+    # Per-chain MSA injection.
+    #
+    # Boltz rejects a target where two chains carry the same sequence but
+    # point at different MSA files:
+    #
+    #   Error: All proteins with the same sequence must share the same MSA!
+    #
+    # Homo-multimers hit this because the AF3 data pipeline emits one MSA per
+    # chain id (A_unpaired.a3m, B_unpaired.a3m, ...). Identical sequences get
+    # identical MSAs anyway, so key the written a3m by sequence and let every
+    # chain sharing that sequence reference the same file.
+    seq_to_a3m: dict[str, str] = {}
     for entry in spec.get("sequences", []) or []:
         if not isinstance(entry, dict) or "protein" not in entry:
             continue
@@ -207,9 +217,17 @@ def patch_boltz_yaml(
         af3_chain = af3_chains[primary]
         unpaired = af3_chain.get("unpairedMsa")
         if unpaired:
-            a3m_path = _per_chain_msa_paths(msa_pipeline_dir, primary, "unpaired")
-            _write_a3m(unpaired, a3m_path)
-            prot["msa"] = str(a3m_path)
+            seq = str(prot.get("sequence") or primary)
+            shared = seq_to_a3m.get(seq)
+            if shared is None:
+                a3m_path = _per_chain_msa_paths(msa_pipeline_dir, primary, "unpaired")
+                _write_a3m(unpaired, a3m_path)
+                shared = str(a3m_path)
+                seq_to_a3m[seq] = shared
+            elif shared != str(_per_chain_msa_paths(msa_pipeline_dir, primary, "unpaired")):
+                print(f"[bridge] boltz chain {primary}: reusing {Path(shared).name} "
+                      "(identical sequence — Boltz requires one MSA per sequence)")
+            prot["msa"] = shared
         paired = af3_chain.get("pairedMsa")
         if paired:
             paired_path = _per_chain_msa_paths(msa_pipeline_dir, primary, "paired")
@@ -374,18 +392,102 @@ def patch_protenix_json(
     )
 
 
+def _entity_kind(entry: dict) -> str:
+    for k in ("protein", "rna", "dna", "ligand"):
+        if k in entry:
+            return k
+    return next(iter(entry), "")
+
+
+def _entity_ids(entry: dict) -> list[str]:
+    body = entry.get(_entity_kind(entry)) or {}
+    cid = body.get("id")
+    if cid is None:
+        return []
+    return list(cid) if isinstance(cid, list) else [cid]
+
+
 def replace_alphafold3_json(
     af3_input_path: Path, af3_data_json: Path
 ) -> None:
-    """The data-pipeline-produced JSON IS the input AF3 inference wants.
-    Just copy it over the prep-time stub so the inference stage reads
-    the populated MSA + templates instead of the empty placeholder."""
+    """Merge the data-pipeline output into the AF3 inference input.
+
+    The data-pipeline JSON carries the expensive part — protein chains with
+    their populated MSAs and templates — so its polymer entries win. But it is
+    NOT a drop-in replacement: when the MSA is reused from another run (a fixed
+    receptor screened against a fragment library, where one apo data.json is
+    shared by every holo run) that JSON describes the receptor ONLY. Copying it
+    wholesale silently dropped the ligand, so AF3 folded apo in every run.
+
+    So: polymer entries come from the data pipeline, and any entity the current
+    input has that the data JSON lacks (the ligand, ions, …) is carried over,
+    together with the run's own name and ligand-related top-level fields.
+    """
     if not af3_data_json.exists():
         print(f"[bridge] missing AF3 data json at {af3_data_json}; skipping replace")
         return
     af3_input_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(af3_data_json, af3_input_path)
-    print(f"[bridge] replaced {af3_input_path} with data-pipeline output")
+
+    data = json.loads(af3_data_json.read_text())
+    try:
+        original = json.loads(af3_input_path.read_text())
+    except Exception:
+        original = {}
+
+    merged = dict(data)
+    if original:
+        # keep this run's identity, not the donor run's
+        if original.get("name"):
+            merged["name"] = original["name"]
+        seqs = list(data.get("sequences") or [])
+        have = {i for e in seqs for i in _entity_ids(e)}
+        # The donor JSON is authoritative for MSA/templates but NOT for chemistry.
+        # A reused receptor MSA is typically computed from an apo input that knows
+        # nothing about this run's modified residues (e.g. L02's oxidised C253 /
+        # CSO), so carry `modifications` over from the run's own entry — including
+        # its absence, which means "this run says the chain is unmodified".
+        original_by_id = {
+            i: entry for entry in (original.get("sequences") or [])
+            for i in _entity_ids(entry)
+        }
+        for entry in seqs:
+            kind = _entity_kind(entry)
+            block = entry.get(kind) if isinstance(entry.get(kind), dict) else None
+            if block is None:
+                continue
+            src = original_by_id.get(next(iter(_entity_ids(entry)), None))
+            src_block = (src or {}).get(kind) if isinstance((src or {}).get(kind), dict) else None
+            if src_block is None:
+                continue
+            mods = src_block.get("modifications")
+            if mods != block.get("modifications"):
+                if mods:
+                    block["modifications"] = mods
+                else:
+                    block.pop("modifications", None)
+                print(f"[bridge] AF3: took `modifications` for {kind} "
+                      f"{','.join(_entity_ids(entry))} from this run's input "
+                      f"({mods or 'none'}), not the donor MSA json")
+        added = []
+        for entry in original.get("sequences") or []:
+            ids = _entity_ids(entry)
+            if ids and all(i in have for i in ids):
+                continue          # already described (with MSA) by the pipeline
+            seqs.append(entry)
+            added.append(f"{_entity_kind(entry)}:{','.join(ids) or '?'}")
+        merged["sequences"] = seqs
+        # ligand-dependent fields the donor JSON cannot know about
+        for key in ("bondedAtomPairs", "userCCD", "userCCDPath"):
+            if key not in merged and key in original:
+                merged[key] = original[key]
+        if added:
+            print(f"[bridge] AF3: carried over {len(added)} entity(ies) missing from "
+                  f"the data JSON: {', '.join(added)}")
+
+    af3_input_path.write_text(json.dumps(merged, indent=2))
+    kinds = [_entity_kind(e) for e in merged.get("sequences") or []]
+    print(f"[bridge] merged data-pipeline output into {af3_input_path} "
+          f"(entities: {', '.join(kinds) or 'none'})")
 
 
 def main() -> int:

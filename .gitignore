@@ -77,6 +77,14 @@ config/casp_slack_bot_token
 config/casp_slack_channel_id
 config/casp_slack_webhook.disabled_by_request
 
+# Private operations, draft submissions, and regenerated visual artifacts
+PROJECT.md
+docs/status.md
+docs/CASP17_*_abstract_draft.docx
+docs/figures/index.html
+experiments/backups/
+experiments/scorer_gpu_verify/
+
 # Per-target working data + run outputs (not source; large, machine-generated)
 experiments/ligand_series/
 experiments/CASP17/

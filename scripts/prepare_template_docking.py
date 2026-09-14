@@ -598,6 +598,13 @@ def main() -> int:
              "single-PDB clusters that don't add receptor diversity."
     )
     parser.add_argument("--box-size", type=float, default=22.5)
+    parser.add_argument("--min-tmscore", type=float, default=0.5, metavar="TM",
+                        help="skip a Track 2 template whose USalign TM to the "
+                             "cofold reference is below this (default 0.5, the "
+                             "Zhang/Skolnick same-fold cutoff already used by "
+                             "extract_template_pockets). Below it the "
+                             "template→cofold transform is meaningless and every "
+                             "pose off that template is noise.")
     parser.add_argument(
         "--cofold-ref-cif", type=Path, default=None,
         help="Path to the cofolding reference CIF (e.g. the best aligned "
@@ -698,6 +705,15 @@ def main() -> int:
                       "Track 2 outputs will be in template frame")
             else:
                 R, t, tm_score, _aligned_rmsd = align
+                if tm_score < args.min_tmscore:
+                    # Below the same-fold cutoff the transform is not an
+                    # approximation, it is meaningless — the ligand lands in
+                    # arbitrary space and every Track 2 pose off this template
+                    # is noise. Skip rather than warn-and-continue (T2455's
+                    # 9yps came through at TM=0.194).
+                    print(f"  USalign TM={tm_score:.3f} < {args.min_tmscore} "
+                          f"for {pdb_id}; skipping this template.")
+                    continue
                 if tm_score < 0.4:
                     print(f"  WARNING: low USalign TM={tm_score:.3f} for {pdb_id}; "
                           "transform may be unreliable")
@@ -752,10 +768,20 @@ def main() -> int:
         target_ccds = {c.strip() for c in ligand_codes if c.strip()}
         if template_ligand_ccd:
             target_ccds.add(template_ligand_ccd)
-        receptor_pdb = cif_to_receptor_pdb(
-            cif, template_dir / "receptor.pdb",
-            target_ccds=target_ccds,
-        )
+        try:
+            receptor_pdb = cif_to_receptor_pdb(
+                cif, template_dir / "receptor.pdb",
+                target_ccds=target_ccds,
+            )
+        except (RuntimeError, ValueError) as exc:
+            # One unusable template must not take the other nine with it. This
+            # raised uncaught on T2455: 9yps has > 26 protein chains, so chain-id
+            # allocation blew up and the whole Track 2 loop died at template 2 —
+            # discarding 8OGB (pident 96.1 %, TM 0.986) that had already been
+            # prepared at template 1.
+            print(f"  WARNING: receptor prep failed for {pdb_id}: {exc}")
+            print(f"  Skipping Track 2 docking for template {pdb_id}.")
+            continue
         try:
             protonated_pdb, receptor_pdbqt = prepare_receptor_pdbqt(receptor_pdb, template_dir)
         except RuntimeError as exc:

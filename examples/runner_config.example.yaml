@@ -147,9 +147,9 @@ vina:
   extra_args: []
 slurm:
   account: null
-  partition: gpu
+  partition: 6000ada
+  qos: normal
   gpus: 1
-  cpus_per_task: 8
   mem: 64G
   time: 04:00:00
   extra_sbatch_args: []

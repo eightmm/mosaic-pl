@@ -768,7 +768,31 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run BA-Pred and RMSD-Pred on pipeline results.")
     parser.add_argument("--run-dir", type=Path, required=True, help="Pipeline run directory.")
     parser.add_argument("--device", default="cuda", choices=["cpu", "cuda"])
+    parser.add_argument(
+        "--stage-only",
+        action="store_true",
+        help="Stage cofolding + docking poses into outputs/analysis/poses and stop; "
+             "skip BA-Pred/RMSD-Pred. Use when the poses are wanted for external "
+             "rescoring (~11 min/fragment cheaper than the full analysis).",
+    )
     args = parser.parse_args()
+
+    if args.stage_only:
+        analysis_dir = args.run_dir / "outputs" / "analysis"
+        analysis_dir.mkdir(parents=True, exist_ok=True)
+        receptors = find_receptor_pdbs(args.run_dir)
+        ligands = find_ligand_files(args.run_dir)   # this is what stages the poses
+        staged = sorted((analysis_dir / "poses").glob("*.sdf"))
+        print(f"Receptors: {list(receptors.keys())}")
+        print(f"Ligand pose sets: {len(ligands)}; staged SDFs: {len(staged)}")
+        (analysis_dir / "staging_summary.json").write_text(json.dumps({
+            "receptor": str(receptors.get("docking_prep")
+                            or (next(iter(receptors.values())) if receptors else "")),
+            "ligands": {k: str(v) for k, v in ligands.items()},
+            "staged_sdf_count": len(staged),
+            "stage_only": True,
+        }, indent=2))
+        return 0 if staged else 1
 
     cap_ok, cap_msg = _verify_cuda_capability(args.device)
     print(f"Compute capability check: {cap_msg}")

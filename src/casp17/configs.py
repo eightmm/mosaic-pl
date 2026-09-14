@@ -477,9 +477,9 @@ class AlphaFold3Config:
 @dataclass(slots=True)
 class SlurmConfig:
     account: str | None = None
-    partition: str | None = None
+    partition: str | None = "6000ada"
+    qos: str | None = "normal"
     gpus: int = 1
-    cpus_per_task: int = 8
     mem: str = "64G"
     time: str = "04:00:00"
     extra_sbatch_args: list[str] = field(default_factory=list)
@@ -490,9 +490,9 @@ class SlurmConfig:
             return cls()
         return cls(
             account=_optional_string(data.get("account"), "slurm.account"),
-            partition=_optional_string(data.get("partition"), "slurm.partition"),
+            partition=_optional_string(data.get("partition", "6000ada"), "slurm.partition"),
+            qos=_optional_string(data.get("qos", "normal"), "slurm.qos"),
             gpus=int(data.get("gpus", 1)),
-            cpus_per_task=int(data.get("cpus_per_task", 8)),
             mem=str(data.get("mem", "64G")),
             time=str(data.get("time", "04:00:00")),
             extra_sbatch_args=[str(arg) for arg in data.get("extra_sbatch_args", [])],
@@ -897,6 +897,10 @@ class MSAPipelineConfig:
 class PostAnalysisConfig:
     enabled: bool = True
     device: str = "cuda"
+    # Stage cofolding + docking poses into outputs/analysis/poses and stop,
+    # skipping BA-Pred/RMSD-Pred. For runs whose poses are consumed by external
+    # rescoring (AKScore2/GenScore/EquiScore), the predictors are dead weight.
+    stage_only: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "PostAnalysisConfig":
@@ -905,6 +909,7 @@ class PostAnalysisConfig:
         return cls(
             enabled=_to_bool(data.get("enabled"), True),
             device=str(data.get("device", "cuda")),
+            stage_only=_to_bool(data.get("stage_only"), False),
         )
 
 

@@ -620,18 +620,23 @@ def build_wrapper_shell_script(
             "",
         ])
 
-    # Post-analysis: BA-Pred + RMSD-Pred on all docking results
+    # Post-analysis: BA-Pred + RMSD-Pred on all docking results, or (stage_only)
+    # just collect the poses for downstream external rescoring.
     if has_docking and config.post_analysis.enabled:
         run_dir = stage_scripts[0][1].parent.parent
+        stage_only = config.post_analysis.stage_only
+        banner = ("POSE STAGING (analysis/poses, no BA/RMSD-Pred)" if stage_only
+                  else "POST-ANALYSIS (BA-Pred + RMSD-Pred)")
         lines.extend([
             'echo ""',
             'echo "================================================================"',
-            'echo "  POST-ANALYSIS (BA-Pred + RMSD-Pred)"',
+            f'echo "  {banner}"',
             'echo "================================================================"',
             f"{shlex.quote(str(pred_python))} {shlex.quote(str(post_analysis_script))} "
             f"--run-dir {shlex.quote(str(run_dir))} "
             f"--device {shlex.quote(config.post_analysis.device)} "
-            f"|| echo '  (post-analysis failed, continuing)'",
+            + ("--stage-only " if stage_only else "")
+            + "|| echo '  (post-analysis failed, continuing)'",
             "",
         ])
 
@@ -694,7 +699,6 @@ def build_sbatch_header(job_name: str, config: RunnerConfig) -> list[str]:
         f"#SBATCH --output={logs_dir / 'slurm-%j.out'}",
         f"#SBATCH --error={logs_dir / 'slurm-%j.err'}",
         f"#SBATCH --gres=gpu:{slurm.gpus}",
-        f"#SBATCH --cpus-per-task={slurm.cpus_per_task}",
         f"#SBATCH --mem={slurm.mem}",
         f"#SBATCH --time={_fmt_slurm_time(slurm.time)}",
     ]
@@ -702,6 +706,8 @@ def build_sbatch_header(job_name: str, config: RunnerConfig) -> list[str]:
         lines.append(f"#SBATCH --partition={slurm.partition}")
     if slurm.account:
         lines.append(f"#SBATCH --account={slurm.account}")
+    if slurm.qos:
+        lines.append(f"#SBATCH --qos={slurm.qos}")
     for extra_arg in slurm.extra_sbatch_args:
         lines.append(f"#SBATCH {extra_arg}")
     lines.append("")

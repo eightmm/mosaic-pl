@@ -357,7 +357,7 @@ Stage 1-5 에서 만든 `template_pocket_clusters.json` 의 top-K cluster centro
 #### Track 1 — Cofolding-based docking (항상)
 
 Cofolding best model 을 receptor, **위에서 등록된 binding-site source (≤3 cofold cluster + ≤6 predictor (3 swinsite + 3 p2rank) + ≤10 consensus = 최대 19) 각각을 독립 box 로** 사용.
-Vina + AutoDock-GPU 가 **최대 19 × 2 = 30 variant** 로 병렬 실행 (실제 수 = 등록된 source 수).
+Vina + AutoDock-GPU 가 **최대 19 × 2 = 38 variant** 로 병렬 실행 (실제 수 = 등록된 source 수). 각 variant 는 `docking_seeds` (default 5) 만큼 반복 → 최대 190 run/target.
 PxDock 은 **default 비활성화** (`protenix_dock.enabled=false` since commit `d04e2c9`+) — single run 이지만 ~5–30 min/타겟 소요로 docking wall-clock 의 ~77 % 차지함. novel2025 batch 의 native rate 기여도 ~10 % vs cost ~77 % 라 ROI 낮음. 명시적으로 enable 한 target 에서만 실행 (cache-map 재생성 비용 때문에 fan-out 없이 priority-picked single box).
 
 | Tool | Variants | Type | Time/seed | Output |

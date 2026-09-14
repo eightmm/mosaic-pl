@@ -1441,6 +1441,7 @@ def select_diverse_top_k_anchored(
     size_gain: float = 1.5,
     size_lo: int = 15,
     size_hi: int = 35,
+    max_anchorless: int | None = 2,
 ) -> list["PoseScore"]:
     """``select_diverse_top_k`` with research/template anchors folded in.
 
@@ -1556,6 +1557,62 @@ def select_diverse_top_k_anchored(
             continue  # can't add without un-covering a stronger anchor → skip
         victim = min(evictable, key=lambda p: eff[id(p)])
         selected[selected.index(victim)] = promote
+
+    # hedge: cap how many MODELs may sit at NO anchor at all.
+    #
+    # The coverage pass above is anchor-driven — it fills an *uncovered anchor*
+    # and gives up when docking never sampled there. Nothing removes the mirror
+    # case: a pose that covers no anchor, contradicting both the research
+    # briefing and the template consensus, yet surviving on raw LSCORE alone
+    # (T2455: 3 of 5 MODELs 13-18 Å from the only anchor; T2451: 3 of 5).
+    #
+    # Keeping `max_anchorless` of them is deliberate — the prior can be wrong
+    # (T2451's c-di-GMP pocket is an explicit, unconfirmed homology hypothesis),
+    # so the strongest off-anchor pose stays as the hedge. The rest are swapped
+    # for the best-scoring anchor-covering poses that keep MODEL diversity.
+    if max_anchorless is not None and anchors:
+        def _covers_any(p):
+            return any(_covers(p, ai) for ai in range(len(anchors)))
+
+        stray = [p for p in selected if not _covers_any(p)]
+        n_drop = len(stray) - max_anchorless
+        if n_drop > 0:
+            # weakest LSCORE strays go first — the top-scoring one is the hedge
+            stray.sort(key=lambda p: (p.lscore or 0.0))
+            pool = [p for p in cand
+                    if p not in selected and _covers_any(p)
+                    and (p.lscore or 0.0) >= promote_floor]
+
+            # Replacement preference: a pose covering an anchor the MODEL set
+            # still leaves UNCOVERED beats one piling onto an already-covered
+            # site. Ranking by `eff` alone deepens the pocket that already won
+            # and can leave the strongest template site empty — T2451 kept
+            # site1/91% (392 unique PDB) uncovered while MODELs sat at 1-3 PDB
+            # clusters, because every at-site pose there scores below 0.15.
+            def _rank(p, unc):
+                gain = max((aw[ai] for ai in unc if _covers(p, ai)), default=0.0)
+                return (-gain, -eff[id(p)])
+
+            for victim in stray[:n_drop]:
+                keep = [s for s in selected if s is not victim]
+                unc = [ai for ai in range(len(anchors))
+                       if not any(_covers(p, ai) for p in keep)]
+                pool.sort(key=lambda p: _rank(p, unc))
+                keep_mols = [_load_pose_mol(s, mol_cache) for s in keep]
+                repl = None
+                for c in pool:
+                    cm = _load_pose_mol(c, mol_cache)
+                    if cm is None:
+                        continue
+                    if all((pm is None)
+                           or ((_pose_pair_rmsd(cm, pm) or 9e9) >= rmsd_threshold)
+                           for pm in keep_mols):
+                        repl = c
+                        break
+                if repl is None:
+                    break  # no anchored pose left that stays diverse — keep stray
+                selected[selected.index(victim)] = repl
+                pool.remove(repl)
 
     # multi-site balance: with >=2 major template_site anchors, ensure each site
     # gets at least `min_per_site` MODELs so the submission splits across both

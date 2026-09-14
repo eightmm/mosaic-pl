@@ -46,6 +46,17 @@ _THREE = {
 _THREE_SET = set(_THREE.values())
 _RES_RE = re.compile(r"^\s*([A-Za-z]{0,3})\s*(\d+)")
 
+#: Free standard residues deposited as ligands are crystallisation / covalent-
+#: modification remnants, not binding-site markers. They pass the CCD candidate
+#: filter (a free CYS is ``peptide_like``, 7 heavy atoms), so a template whose
+#: only "bound ligand" is one of these would otherwise anchor the ranker on a
+#: surface residue. Observed on T2451, where 4LYK's CYS sat 15 Å from the real
+#: cofactor site.
+_MONOMER_LIGANDS = _THREE_SET | {
+    "MSE", "SEC", "PYL", "UNK",
+    "A", "C", "G", "U", "T", "DA", "DC", "DG", "DT", "DU", "N",
+}
+
 
 @dataclass(frozen=True)
 class Anchor:
@@ -109,10 +120,20 @@ def research_centers(run_dir: Path, receptor_cif: Path) -> list[Anchor]:
     if not len(st):
         return []
     model = st[0]
+    # One anchor per (chain, residue), NOT per residue. A homodimer carries the
+    # catalytic set once per protomer, so stopping at the first chain leaves the
+    # other protomer's site unanchored — a pose bound there then reads as
+    # "covers nothing" and the ranker treats it as off-site (T2451: chains A and
+    # B are both residues 1-255; 3 of 5 submitted MODELs bound chain B).
+    polymers = [ch for ch in model
+                # polymer chains only — a ligand/ion het residue can share a
+                # seqid with a catalytic residue number and would otherwise be
+                # grounded as one.
+                if any(res.find_atom("CA", "*") is not None for res in ch)]
+    multi = len(polymers) > 1
     out: list[Anchor] = []
-    for name, num in residues:
-        pos = None
-        for chain in model:
+    for chain in polymers:
+        for name, num in residues:
             for res in chain:
                 if res.seqid.num != num:
                     continue
@@ -124,12 +145,10 @@ def research_centers(run_dir: Path, receptor_cif: Path) -> list[Anchor]:
                     atom = res[0]
                 if atom is not None:
                     p = atom.pos
-                    pos = (float(p.x), float(p.y), float(p.z))
+                    label = f"{name or ''}{num}" + (chain.name if multi else "")
+                    out.append(Anchor((float(p.x), float(p.y), float(p.z)),
+                                      "research", 1.0, label))
                     break
-            if pos is not None:
-                break
-        if pos is not None:
-            out.append(Anchor(pos, "research", 1.0, f"{name or ''}{num}"))
     return out
 
 
@@ -167,29 +186,34 @@ def dominant_cluster_center(
     centroid = top.get("centroid") or top.get("center")
     if (not centroid or len(centroid) != 3
             or share < min_share
-            or int(top.get("n_unique_pdb", 0) or 0) < min_unique_pdb):
+            or int(top.get("n_unique_pdb", 0) or 0) < min_unique_pdb
+            or not _cluster_supported(centroid, _pocket_points(run_dir))):
         return []
     return [Anchor(tuple(float(v) for v in centroid), "template_consensus",
                    round(share, 3), f"consensus/{share:.0%}")]
 
 
-def template_com_centers(
+def dominant_site_mode(
     run_dir: Path,
     *,
-    top_weight: float = 1.5,
-    lig_weight: float = 1.0,
-    min_lig_tanimoto: float = 0.3,
+    radius: float = 5.0,
+    min_neighbours: int = 20,
+    weight: float = 2.0,
 ) -> list[Anchor]:
-    """Bound-ligand COM of the **top template** (best TM-score) and the **ligand
-    template** (best Tanimoto), in the pose coordinate frame.
+    """Densest point of the raw template-pocket cloud — the *mode*, not the mean.
 
-    These are the anchors the CASP meeting asked MODEL selection to follow so a
-    pose that reproduces the top template's binding mode is guaranteed a MODEL
-    even when its LSCORE is mediocre. Read from ``template_pockets.json`` (each
-    pocket already carries a bound-ligand centroid in the aligned frame). The
-    ligand-template anchor is emitted only when it sits at a *different* site
-    than the top template and its ligand is genuinely similar
-    (``best_tanimoto >= min_lig_tanimoto``). Fail-open: missing/broken file → []."""
+    ``dominant_cluster_center`` / ``template_site_centers`` report a cluster's
+    running weighted **centroid**, which the greedy first-match clusterer lets
+    drift: a 392-pocket cluster chains outward and its mean can land several Å
+    off the actual pile-up, in shallower ground (T2451: centroid 4 Å from the
+    mode, with 7 receptor heavy atoms within 5 Å against the mode's pile of 377
+    pockets). Recomputing the mode straight from ``template_pockets.json``
+    removes that drift and gives a point that is, by construction, where the
+    most template ligands actually sit.
+
+    Emitted only when the mode is backed by ``min_neighbours`` pockets, so a
+    thin template set yields nothing rather than a noisy anchor. Fail-open.
+    """
     for rel in ("outputs/template_pockets/template_pockets.json",
                 "template_pockets.json"):
         p = Path(run_dir) / rel
@@ -202,14 +226,156 @@ def template_com_centers(
         data = json.loads(path.read_text())
     except (OSError, ValueError):
         return []
-    pockets = data.get("pockets") if isinstance(data, dict) else None
+    pockets = data if isinstance(data, list) else data.get("pockets")
     if not isinstance(pockets, list) or not pockets:
         return []
+    pts = []
+    for pk in pockets:
+        c = (pk.get("centroid_x"), pk.get("centroid_y"), pk.get("centroid_z"))
+        if not any(v is None for v in c):
+            pts.append([float(v) for v in c])
+    if len(pts) < min_neighbours:
+        return []
+    try:
+        import numpy as np
+    except ImportError:
+        return []
+    X = np.asarray(pts, dtype=float)
+    d2 = ((X[:, None, :] - X[None, :, :]) ** 2).sum(-1)
+    near = d2 <= radius * radius
+    counts = near.sum(1)
+    i = int(np.argmax(counts))
+    n = int(counts[i])
+    if n < min_neighbours:
+        return []
+    # local mean of the mode's own neighbourhood: same pile-up, less quantised
+    centre = X[near[i]].mean(axis=0)
+    return [Anchor(tuple(float(v) for v in centre), "template_mode",
+                   float(weight), f"mode/{n}pk")]
 
+
+#: Radius (Å) within which a surviving pocket must sit for a consensus cluster
+#: to count as real. Matches ``cluster_template_pockets.py --cutoff``, so a
+#: cluster keeps its anchor as long as one of its own members survived.
+_CLUSTER_SUPPORT_A = 5.0
+
+
+def _load_pockets(run_dir: Path) -> list[dict]:
+    """``template_pockets.json`` with mis-transformed protomer copies dropped.
+
+    Until 2026-09-09 ``extract_template_pockets.py`` aligned one chain per hit
+    row and moved *every* ligand in the entry with that transform, so copies
+    bound to the other protomers landed wherever that chain was not. Those
+    points are identifiable after the fact: a pocket placed by a chain-specific
+    alignment has ``template_chain == ligand_chain``. On L01 half of every run's
+    pockets fail that test and they formed two whole phantom clusters, one of
+    which reached MODEL selection as a weight-1.20 anchor sitting in open
+    solvent (1 receptor heavy atom within 8 Å against 59 for the real site).
+
+    Filtering here rather than rewriting the run files keeps existing runs
+    usable without re-running USalign, and is a no-op on runs produced by the
+    fixed extractor. Fail-open: older files that carry neither chain field are
+    returned unchanged.
+    """
+    for rel in ("outputs/template_pockets/template_pockets.json",
+                "template_pockets.json"):
+        path = Path(run_dir) / rel
+        if path.is_file():
+            break
+    else:
+        return []
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return []
+    pockets = data.get("pockets") if isinstance(data, dict) else data
+    if not isinstance(pockets, list):
+        return []
+
+    keep, seen = [], set()
+    for pk in pockets:
+        tc = str(pk.get("template_chain") or "").strip().upper()
+        lc = str(pk.get("ligand_chain") or "").strip().upper()
+        if tc and lc and tc != lc:
+            continue
+        key = (pk.get("template_pdb_id"), tc, pk.get("ligand_ccd"),
+               round(float(pk.get("centroid_x") or 0), 1),
+               round(float(pk.get("centroid_y") or 0), 1),
+               round(float(pk.get("centroid_z") or 0), 1))
+        if key in seen:
+            continue
+        seen.add(key)
+        keep.append(pk)
+    # A file with no chain provenance at all would filter to nothing; keep it.
+    return keep or pockets
+
+
+def _pocket_points(run_dir: Path) -> list[tuple[float, float, float]]:
+    out = []
+    for pk in _load_pockets(run_dir):
+        c = (pk.get("centroid_x"), pk.get("centroid_y"), pk.get("centroid_z"))
+        if not any(v is None for v in c):
+            out.append(tuple(float(v) for v in c))
+    return out
+
+
+def _cluster_supported(centroid, pts, radius: float = _CLUSTER_SUPPORT_A) -> bool:
+    """True when a surviving pocket sits within ``radius`` of the centroid.
+
+    A cluster built entirely from mis-transformed copies has none, which is what
+    separates a phantom from a real site without re-clustering anything.
+    """
+    if not pts:
+        return True  # no provenance to judge by — fail open
+    r2 = radius * radius
+    cx, cy, cz = (float(v) for v in centroid)
+    return any((q[0] - cx) ** 2 + (q[1] - cy) ** 2 + (q[2] - cz) ** 2 <= r2
+               for q in pts)
+
+
+def template_com_centers(
+    run_dir: Path,
+    *,
+    top_weight: float = 1.5,
+    lig_weight: float = 1.0,
+    min_lig_tanimoto: float = 0.3,
+    min_corroboration: int = 3,
+    corroboration_radius: float = 5.0,
+) -> list[Anchor]:
+    """Bound-ligand COM of the **top template** (best TM-score) and the **ligand
+    template** (best Tanimoto), in the pose coordinate frame.
+
+    These are the anchors the CASP meeting asked MODEL selection to follow so a
+    pose that reproduces the top template's binding mode is guaranteed a MODEL
+    even when its LSCORE is mediocre. Read from ``template_pockets.json`` (each
+    pocket already carries a bound-ligand centroid in the aligned frame). The
+    ligand-template anchor is emitted only when it sits at a *different* site
+    than the top template and its ligand is genuinely similar
+    (``best_tanimoto >= min_lig_tanimoto``).
+
+    Two guards keep a single mis-annotated template from anchoring the ranker on
+    a non-site, since these COMs come from ONE structure and have no averaging to
+    fall back on:
+
+    * pockets whose ligand is a free standard residue are ignored outright
+      (``_MONOMER_LIGANDS``);
+    * an emitted COM must be *corroborated* — at least ``min_corroboration``
+      other template pockets within ``corroboration_radius`` Å. A COM that sits
+      alone in the pocket cloud is an outlier, not a binding site.
+
+    Fail-open: missing/broken file → []."""
+    pockets = _load_pockets(run_dir)
+    if not pockets:
+        return []
+
+    all_pts: list[tuple[float, float, float]] = []
     by_pdb: dict[str, dict] = {}
     for pk in pockets:
         c = (pk.get("centroid_x"), pk.get("centroid_y"), pk.get("centroid_z"))
         if any(v is None for v in c):
+            continue
+        all_pts.append(tuple(float(v) for v in c))
+        if str(pk.get("ligand_ccd") or "").strip().upper() in _MONOMER_LIGANDS:
             continue
         pdb = pk.get("template_pdb_id") or ""
         g = by_pdb.setdefault(pdb, {"pts": [], "tm": None, "tan": None})
@@ -229,14 +395,33 @@ def template_com_centers(
     def com(pts):
         return tuple(sum(v[k] for v in pts) / len(pts) for k in range(3))
 
+    r2 = corroboration_radius * corroboration_radius
+
+    def corroborated(pt) -> bool:
+        """≥ ``min_corroboration`` *other* template pockets within the radius."""
+        if min_corroboration <= 0:
+            return True
+        n = 0
+        for q in all_pts:
+            d2 = sum((q[k] - pt[k]) ** 2 for k in range(3))
+            if d2 <= r2:
+                n += 1
+                if n > min_corroboration:  # >: the anchor's own pocket counts once
+                    return True
+        return False
+
     out: list[Anchor] = []
     top_pdb, top_g = max(by_pdb.items(), key=lambda kv: (kv[1]["tm"] or 0.0))
-    out.append(Anchor(com(top_g["pts"]), "top_template", top_weight,
-                      f"top/{top_pdb} TM{top_g['tm'] or 0:.2f}"))
+    top_com = com(top_g["pts"])
+    if corroborated(top_com):
+        out.append(Anchor(top_com, "top_template", top_weight,
+                          f"top/{top_pdb} TM{top_g['tm'] or 0:.2f}"))
     lig_pdb, lig_g = max(by_pdb.items(), key=lambda kv: (kv[1]["tan"] or 0.0))
     if lig_pdb != top_pdb and (lig_g["tan"] or 0.0) >= min_lig_tanimoto:
-        out.append(Anchor(com(lig_g["pts"]), "ligand_template", lig_weight,
-                          f"lig/{lig_pdb} sim{lig_g['tan']:.2f}"))
+        lig_com = com(lig_g["pts"])
+        if corroborated(lig_com):
+            out.append(Anchor(lig_com, "ligand_template", lig_weight,
+                              f"lig/{lig_pdb} sim{lig_g['tan']:.2f}"))
     return out
 
 
@@ -272,6 +457,7 @@ def template_site_centers(
     if not clusters:
         return []
     total = sum(float(c.get("evidence_score", 0) or 0) for c in clusters) or 1.0
+    pts = _pocket_points(run_dir)
     out: list[Anchor] = []
     for c in clusters:
         if len(out) >= top_k:
@@ -281,7 +467,8 @@ def template_site_centers(
         centroid = c.get("centroid") or c.get("center")
         if (not centroid or len(centroid) != 3
                 or share < min_share
-                or int(c.get("n_unique_pdb", 0) or 0) < min_unique_pdb):
+                or int(c.get("n_unique_pdb", 0) or 0) < min_unique_pdb
+                or not _cluster_supported(centroid, pts)):
             continue
         # weight > research (1.0) so a major template site is covered/protected
         # before individual catalytic residues in the hard-coverage pass.

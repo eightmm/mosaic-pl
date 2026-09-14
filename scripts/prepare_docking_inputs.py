@@ -151,6 +151,30 @@ def cif_to_pdb(
 
     structure = gemmi.read_structure(str(cif_path))
 
+    def _fit_chain_names(st) -> None:
+        """Rename chains PDB cannot hold, in place.
+
+        gemmi writes a two-character chain id into the PDB chain column pair,
+        but raises ``chain name too long for the PDB format`` on three. An
+        input that names a cofactor chain ``X11`` therefore takes the whole
+        docking preparation down — and the wrapper reports "docking prep
+        failed, continuing", so the job still exits 0 and the run looks
+        complete with an empty docking stage. Renaming keeps the receptor
+        intact; a cofactor's chain letter carries no meaning downstream, and
+        the dockable ligands have already been removed by the time this runs.
+        """
+        used = {ch.name for model in st for ch in model if len(ch.name) <= 2}
+        pool = [c for c in "BCDEFGHIJKMNOPQRSTUVW0123456789" if c not in used]
+        for model in st:
+            for ch in model:
+                if len(ch.name) <= 2:
+                    continue
+                new = pool.pop(0) if pool else ch.name[:2]
+                print(f"  chain {ch.name!r} renamed to {new!r} "
+                      f"(PDB holds at most two characters)")
+                used.add(new)
+                ch.name = new
+
     if dockable_ligand_chains is None:
         # Backward-compat: caller didn't supply the dockable list, fall
         # back to the old whole-non-polymer wipe. Logged so reruns spot
@@ -158,6 +182,7 @@ def cif_to_pdb(
         structure.remove_ligands_and_waters()
         print("  WARNING: cif_to_pdb called without dockable_ligand_chains; "
               "every non-polymer (incl. metals) is being stripped from receptor")
+        _fit_chain_names(structure)
         structure.write_pdb(str(output_path))
         print(f"  Receptor PDB: {output_path}")
         return output_path
@@ -188,6 +213,7 @@ def cif_to_pdb(
                     n_dropped_lig += 1
                 elif is_nonpoly:
                     n_kept_metal_or_cofactor += 1
+    _fit_chain_names(structure)
     structure.write_pdb(str(output_path))
     print(f"  Receptor PDB: {output_path}")
     print(f"    dropped: {n_dropped_lig} dockable-ligand residue(s), "
@@ -329,6 +355,68 @@ def _extract_metal_pdbqt_lines(pdb_path: Path) -> list[str]:
     return out
 
 
+def _reattach_dropped_hetatms(pdb_path: Path, pdbqt_lines: list[str],
+                              workdir: Path) -> list[str]:
+    """PDBQT lines for HETATM residues that pdb2pqr silently discarded.
+
+    ``_extract_metal_pdbqt_lines`` covers bare metals, but pdb2pqr's AMBER
+    force field has no parameters for an organic cofactor either — an SFG
+    (sinefungin) bound in every L02 receptor vanished between ``receptor.pdb``
+    and ``receptor.pdbqt``, so docking treated the occupied cofactor site as
+    empty pocket and put fragment poses inside it. Anything the PQR pass lost
+    is handed to obabel, which types and charges it properly.
+    """
+    kept = {(ln[17:20].strip().upper(), ln[21:22], ln[22:26].strip())
+            for ln in pdbqt_lines if ln.startswith(("ATOM", "HETATM"))}
+    missing: list[str] = []
+    for line in pdb_path.read_text().splitlines():
+        if not line.startswith("HETATM"):
+            continue
+        resname = line[17:20].strip().upper()
+        if resname in {"HOH", "WAT", "DOD"} or resname in _METAL_TYPE_CHARGE:
+            continue
+        if (resname, line[21:22], line[22:26].strip()) in kept:
+            continue
+        missing.append(line)
+    if not missing:
+        return []
+
+    frag_pdb = workdir / "_dropped_hetatm.pdb"
+    frag_pdbqt = workdir / "_dropped_hetatm.pdbqt"
+    frag_pdb.write_text("\n".join(missing) + "\nEND\n")
+    ok = _pdb_to_pdbqt_obabel(frag_pdb, frag_pdbqt)
+    if not ok or not frag_pdbqt.exists():
+        print(f"  WARNING: {len(missing)} HETATM line(s) dropped by pdb2pqr could "
+              "not be re-typed by obabel — the receptor is missing a cofactor")
+        return []
+    raw = [ln for ln in frag_pdbqt.read_text().splitlines()
+           if ln.startswith(("ATOM", "HETATM"))]
+    frag_pdb.unlink(missing_ok=True)
+    frag_pdbqt.unlink(missing_ok=True)
+
+    # obabel relabels everything ``UNL 1``. Restore the residue identity so the
+    # receptor still says which cofactor this is: input atoms keep their order,
+    # and hydrogens obabel added take the label of the atom they are nearest.
+    def xyz(ln):
+        return (float(ln[30:38]), float(ln[38:46]), float(ln[46:54]))
+
+    src_xyz = [xyz(ln) for ln in missing]
+    out = []
+    for i, ln in enumerate(raw):
+        if i < len(missing):
+            label = missing[i][17:27]
+        else:
+            p = xyz(ln)
+            j = min(range(len(missing)),
+                    key=lambda k: sum((p[d] - src_xyz[k][d]) ** 2 for d in range(3)))
+            label = missing[j][17:27]
+        out.append(f"HETATM{ln[6:17]}{label}{ln[27:]}")
+    names = sorted({ln[17:20].strip() for ln in missing})
+    print(f"  Re-attached {len(out)} cofactor atom(s) [{', '.join(names)}] to "
+          "receptor PDBQT (pdb2pqr's AMBER FF has no parameters for them)")
+    return out
+
+
 def pdb_to_pdbqt(pdb_path: Path, output_path: Path) -> Path:
     """Convert PDB to PDBQT for receptor: pdb2pqr (protonation + charges) → PDBQT format.
 
@@ -395,14 +483,18 @@ def pdb_to_pdbqt(pdb_path: Path, output_path: Path) -> Path:
     # Step 3: re-attach metal HETATMs that pdb2pqr dropped (see helper for
     # rationale). Insert before the trailing END so they live in the same
     # ATOM block downstream tools iterate.
-    metal_lines = _extract_metal_pdbqt_lines(pdb_path)
-    if metal_lines:
+    extra = _extract_metal_pdbqt_lines(pdb_path)
+    if extra:
+        print(f"  Re-attached {len(extra)} metal HETATM(s) to receptor PDBQT "
+              f"(pdb2pqr drops bare metals)")
+    # Step 3b: same problem, non-metal cofactors — an organic HETATM the AMBER
+    # FF doesn't cover is dropped just as silently.
+    extra += _reattach_dropped_hetatms(pdb_path, pdbqt_lines, output_path.parent)
+    if extra:
         # Splice before END if present, else just append.
         end_idx = next((i for i, line in enumerate(pdbqt_lines)
                         if line.strip().startswith("END")), len(pdbqt_lines))
-        pdbqt_lines = pdbqt_lines[:end_idx] + metal_lines + pdbqt_lines[end_idx:]
-        print(f"  Re-attached {len(metal_lines)} metal HETATM(s) to receptor PDBQT "
-              f"(pdb2pqr drops bare metals)")
+        pdbqt_lines = pdbqt_lines[:end_idx] + extra + pdbqt_lines[end_idx:]
 
     output_path.write_text("\n".join(pdbqt_lines) + "\n")
     print(f"  Receptor PDBQT: {output_path} (protonated, Gasteiger charges)")
@@ -793,9 +885,20 @@ def extract_smiles_from_yaml(input_yaml: Path) -> list[tuple[str, str]]:
         smi = lig.get("smiles")
         if not smi:
             continue  # CCD-only ligand (metal/ion) — not dockable
-        lid = str(lig.get("id") or "L").strip()
+        # A ligand present in several copies declares a *list* of chain ids.
+        # ``str()`` on that produced filenames like ``ligand_['L1', 'L2'].sdf``
+        # — a Python repr on disk, which nothing downstream could open. Dock
+        # one copy, under the first id.
+        lid = _yaml_ligand_ids(lig)[0]
         results.append((lid, str(smi).strip().strip("'\"")))
     return results
+
+
+def _yaml_ligand_ids(lig: dict) -> list[str]:
+    """Every chain id a YAML ligand entry declares, copies included."""
+    raw = lig.get("id") or "L"
+    ids = raw if isinstance(raw, list) else [raw]
+    return [str(i).strip() for i in ids if str(i).strip()] or ["L"]
 
 
 def extract_smiles_from_json(input_json: Path) -> list[tuple[str, str]]:
@@ -1240,7 +1343,10 @@ def main() -> int:
                     # Dockable ligand = entry has SMILES (vs ccd-only entries
                     # like metals which we want to keep on the receptor).
                     if lig.get("smiles") and lig.get("id"):
-                        dockable_chains.add(str(lig["id"]))
+                        # Every copy has to be stripped, not just the first:
+                        # a leftover copy stays baked into the receptor and
+                        # the docking box then contains its own answer.
+                        dockable_chains.update(_yaml_ligand_ids(lig))
         except Exception as e:
             print(f"  WARNING: could not parse dockable chain ids from YAML: {e}")
     elif args.input_json and args.input_json.exists():

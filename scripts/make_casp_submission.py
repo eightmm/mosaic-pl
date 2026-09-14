@@ -148,11 +148,75 @@ def _read_plddt(model_dir: Path, model: str) -> float:
     return 0.0
 
 
+#: Modified residues rewritten to the parent CASP names in the target sequence,
+#: as ``{CCD: (parent, atoms to drop)}``. The validator checks each modelled
+#: residue against the target sequence and rejects a mismatch outright:
+#:
+#:   # ERROR! Check atom number 2057 residue: # 253 chain 'A' (In TARGET: C 253)
+#:
+#: L02 (MmaA1) is the case that caught this — AF3/Protenix model the redox-gated
+#: Cys253 as **CSO** (S-hydroxycysteine), which also carries `het_flag='H'`, so
+#: depending on which cofold model won the receptor slot the residue either
+#: shipped as `CSO` (rejected) or was dropped entirely by an ATOM-only copy
+#: (2 of 29 L02 complexes had no residue 253 at all). Normalising here fixes
+#: both, because every receptor path runs through this function.
+#:
+#: Only entries verified against a real target are listed. Anything else
+#: non-standard is reported rather than guessed at.
+MODIFIED_PARENT: dict[str, tuple[str, set[str]]] = {
+    "CSO": ("CYS", {"OD"}),        # S-hydroxycysteine → cysteine
+}
+
+_STANDARD_AA = {
+    "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
+    "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
+}
+
+
+def normalize_modified_residues(structure, target_id: str = "") -> list[str]:
+    """Rewrite modified polymer residues to the parent the target sequence has.
+
+    Mutates ``structure`` in place; returns one note per residue changed. Must
+    run **before** ``remove_ligands_and_waters``, which is what strips a residue
+    the model flagged as a heteroatom.
+    """
+    import gemmi
+
+    notes: list[str] = []
+    unknown: set[str] = set()
+    for model in structure:
+        for chain in model:
+            for residue in chain:
+                name = residue.name.upper()
+                ent = MODIFIED_PARENT.get(name)
+                if ent is None:
+                    if name not in _STANDARD_AA and residue.entity_type == gemmi.EntityType.Polymer:
+                        unknown.add(name)
+                    continue
+                parent, drop = ent
+                for i in range(len(residue) - 1, -1, -1):
+                    if residue[i].name.strip().upper() in drop:
+                        del residue[i]
+                residue.name = parent
+                residue.het_flag = "A"
+                notes.append(f"{name}{residue.seqid.num} → {parent}")
+        break  # first model only
+    for name in sorted(unknown):
+        print(f"WARNING: {target_id or 'receptor'} carries non-standard polymer "
+              f"residue {name} with no MODIFIED_PARENT entry — CASP will reject "
+              f"it if the target sequence disagrees.")
+    return notes
+
+
 def cif_to_pdb_with_plddt(cif_path: Path, output_pdb: Path, target_id: str) -> Path:
     """Convert CIF → PDB, preserving B-factor (pLDDT) column."""
     import gemmi
 
     structure = gemmi.read_structure(str(cif_path))
+    fixed = normalize_modified_residues(structure, target_id)
+    if fixed:
+        print(f"    receptor: normalised {len(fixed)} modified residue(s): "
+              + ", ".join(fixed))
     structure.remove_ligands_and_waters()
 
     # Ensure B-factors vary (CASP rejects uniform B-factors)
@@ -176,6 +240,19 @@ def cif_to_pdb_with_plddt(cif_path: Path, output_pdb: Path, target_id: str) -> P
                         atom.b_iso = 80.0 + 15.0 * (0.5 - (ri % 10) / 10.0)
             break
 
+    # PDB holds at most a two-character chain id; gemmi raises on a third
+    # ("chain name too long for the PDB format"). A cofolding input that names
+    # a cofactor chain X11 would otherwise take the whole submission build down
+    # at the last step.
+    _used = {ch.name for model in structure for ch in model if len(ch.name) <= 2}
+    _pool = [c for c in "BCDEFGHIJKMNOPQRSTUVW0123456789" if c not in _used]
+    for _model in structure:
+        for _ch in _model:
+            if len(_ch.name) > 2:
+                _new = _pool.pop(0) if _pool else _ch.name[:2]
+                print(f"  chain {_ch.name!r} renamed to {_new!r} for PDB output")
+                _used.add(_new)
+                _ch.name = _new
     structure.write_pdb(str(output_pdb))
     return output_pdb
 
@@ -189,6 +266,608 @@ def extract_pdb_atom_lines(pdb_path: Path) -> list[str]:
     if not any(line.startswith("TER") for line in lines):
         lines.append("TER")
     return lines
+
+
+# --------------------------------------------------------------------------- #
+# Multi-conformation targets
+#
+# The LG format normally caps a file at 5 MODELs, but an organizer can request
+# more for a target that crystallises in several conformations. T2451 (BifA):
+#
+#   "The protein is a homodimer that crystallizes in two distinct conformations
+#    (v1 and v2). Please submit models for conformation 1 as models 1-5, and
+#    those for conformation 2 as 6,7,8,9,0."
+#
+# So MODEL numbers are a per-target *label sequence*, not a 1..k counter, and
+# the second group needs its own receptor conformation — not the same receptor
+# with different ligand poses.
+#
+# Conformation 1 keeps the existing behaviour exactly (docked poses on the
+# auto-selected cofold receptor). Conformation 2 is built from the cofold
+# ensemble: every cofold prediction is a receptor conformation with its own
+# bound-ligand pose, so we cluster that ensemble in two and take the group the
+# docking receptor does *not* belong to.
+# --------------------------------------------------------------------------- #
+
+#: MODEL labels per conformation group, verbatim from the T2451 target page.
+CONFORMATION_LABELS: tuple[tuple[int, ...], ...] = ((1, 2, 3, 4, 5), (6, 7, 8, 9, 0))
+
+#: Cap on how many cofold cifs enter the pairwise-RMSD clustering. Clustering is
+#: O(n²) superpositions at ~3.5 ms each, so a full 4-model × 5-seed × 5-sample
+#: ensemble (~100 structures, ~5k pairs, ~20 s) fits under the cap without
+#: subsampling. Beyond it we subsample evenly and say how many were dropped.
+_CONFORMATION_MAX_CIFS = 128
+
+#: Below this CA-RMSD the two "conformations" are sampling noise, not the
+#: distinct crystal forms the organizer is asking about.
+_CONFORMATION_MIN_SEPARATION = 1.0
+
+
+def enumerate_cofold_cifs(run_dir: Path) -> list[tuple[str, Path]]:
+    """Every cofold prediction in the run as ``(model_name, cif)``.
+
+    Mirrors :func:`find_best_cofolding_cif`'s per-model globs but returns the
+    whole ensemble instead of the first hit, preferring an ``_aligned.cif``
+    when the alignment bridge produced one.
+    """
+    out: list[tuple[str, Path]] = []
+    for model in ("boltz2x", "boltz2", "protenix", "alphafold3"):
+        model_dir = run_dir / "outputs" / model
+        if not model_dir.exists():
+            continue
+        if model.startswith("boltz"):
+            raw = sorted(c for c in model_dir.rglob("predictions/**/*.cif")
+                         if "_aligned" not in c.name)
+        elif model == "alphafold3":
+            raw = sorted(c for c in model_dir.rglob("*model*.cif")
+                         if "_aligned" not in c.name)
+        else:
+            raw = sorted(c for c in model_dir.rglob("*.cif")
+                         if "_aligned" not in c.name)
+        for cif in raw:
+            aligned = cif.with_name(cif.stem + "_aligned.cif")
+            out.append((model, aligned if aligned.exists() else cif))
+    return out
+
+
+def _ca_map(cif_path: Path) -> dict[tuple[str, int], tuple[float, float, float]]:
+    """CA coordinates keyed by (chain, residue number) — the cofold ensemble all
+    predicts the same target sequence, so the key is a 1:1 correspondence."""
+    import gemmi
+
+    st = gemmi.read_structure(str(cif_path))
+    st.setup_entities()
+    out: dict[tuple[str, int], tuple[float, float, float]] = {}
+    for chain in st[0]:
+        for res in chain:
+            tab = gemmi.find_tabulated_residue(res.name)
+            if not (tab and tab.is_amino_acid()):
+                continue
+            atom = res.find_atom("CA", "*")
+            if atom is not None:
+                out[(chain.name, res.seqid.num)] = (atom.pos.x, atom.pos.y, atom.pos.z)
+    return out
+
+
+def _kabsch(mobile, target):
+    """Optimal rotation+translation taking ``mobile`` onto ``target``.
+
+    Returns ``(rotation 3x3, translation 3, rmsd)``. Plain Kabsch on numpy so
+    the routine does not depend on a particular gemmi superposition API.
+    """
+    import numpy as np
+
+    P = np.asarray(mobile, dtype=float)
+    Q = np.asarray(target, dtype=float)
+    pc, qc = P.mean(axis=0), Q.mean(axis=0)
+    P0, Q0 = P - pc, Q - qc
+    V, _, Wt = np.linalg.svd(P0.T @ Q0)
+    d = np.sign(np.linalg.det(V @ Wt))
+    D = np.diag([1.0, 1.0, d])
+    R = V @ D @ Wt                      # row-vector convention: x @ R
+    rmsd = float(np.sqrt((((P0 @ R) - Q0) ** 2).sum() / len(P)))
+    return R, qc - pc @ R, rmsd
+
+
+def _pair_rmsd(map_a, map_b, keys) -> float:
+    a = [map_a[k] for k in keys]
+    b = [map_b[k] for k in keys]
+    return _kabsch(a, b)[2]
+
+
+def split_conformations(
+    cifs: list[tuple[str, Path]],
+    primary_cif: Path,
+    max_cifs: int = _CONFORMATION_MAX_CIFS,
+) -> tuple[list[Path], list[Path], float]:
+    """Split the cofold ensemble into two receptor conformations.
+
+    Seeds on the most distant pair by CA-RMSD, assigns every structure to the
+    nearer seed, then returns ``(group_containing_primary, other_group,
+    seed_separation_rmsd)``. Deterministic: no random initialisation.
+    """
+    paths = [c for _, c in cifs]
+    if primary_cif not in paths:
+        paths.insert(0, primary_cif)
+    if len(paths) > max_cifs:
+        step = len(paths) / max_cifs
+        keep = {paths[int(i * step)] for i in range(max_cifs)}
+        keep.add(primary_cif)
+        dropped = len(paths) - len(keep)
+        print(f"  conformation split: subsampled {len(keep)} of {len(paths)} "
+              f"cofold structures for clustering ({dropped} not compared)")
+        paths = [p for p in paths if p in keep]
+
+    maps = {}
+    for p in paths:
+        try:
+            m = _ca_map(p)
+            if m:
+                maps[p] = m
+        except Exception as exc:
+            print(f"  conformation split: skipping {p.name} ({type(exc).__name__}: {exc})")
+    paths = [p for p in paths if p in maps]
+    if len(paths) < 2:
+        return paths, [], 0.0
+
+    keys = set(maps[paths[0]])
+    for p in paths[1:]:
+        keys &= set(maps[p])
+    keys = sorted(keys)
+    if len(keys) < 20:
+        print(f"  conformation split: only {len(keys)} shared CA positions — "
+              "cannot cluster reliably, treating the ensemble as one conformation")
+        return paths, [], 0.0
+
+    n = len(paths)
+    D = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = _pair_rmsd(maps[paths[i]], maps[paths[j]], keys)
+            D[i][j] = D[j][i] = d
+
+    # seeds = most distant pair
+    si, sj, best = 0, 1, -1.0
+    for i in range(n):
+        for j in range(i + 1, n):
+            if D[i][j] > best:
+                si, sj, best = i, j, D[i][j]
+
+    g1 = [paths[i] for i in range(n) if D[i][si] <= D[i][sj]]
+    g2 = [paths[i] for i in range(n) if D[i][si] > D[i][sj]]
+    if primary_cif in g2:
+        g1, g2 = g2, g1
+    return g1, g2, best
+
+
+def _ligand_plddt(cif_path: Path) -> float:
+    """Mean pLDDT over the cofolded ligand's atoms, on [0, 1].
+
+    Used as the LSCORE of a conformation-2 MODEL: those poses come straight
+    from cofolding, so the model's own per-atom confidence is the honest pose
+    confidence — the RMSD-Pred GNN never saw them.
+    """
+    import gemmi
+
+    st = gemmi.read_structure(str(cif_path))
+    vals: list[float] = []
+    for chain in st[0]:
+        for res in chain:
+            if res.name in {"HOH", "WAT", "DOD"}:
+                continue
+            tab = gemmi.find_tabulated_residue(res.name)
+            if tab and (tab.is_amino_acid() or tab.is_nucleic_acid()):
+                continue
+            vals.extend(a.b_iso for a in res)
+    if not vals:
+        return 0.0
+    return max(0.0, min(1.0, (sum(vals) / len(vals)) / 100.0))
+
+
+def _ligand_coords_in_frame(cif_path: Path, ref_map, keys):
+    """Ligand heavy-atom coordinates transformed into the reference receptor's
+    frame, so poses from different cofold structures can be RMSD-compared."""
+    import gemmi
+    import numpy as np
+
+    own = _ca_map(cif_path)
+    shared = [k for k in keys if k in own]
+    if len(shared) < 20:
+        return None
+    R, t, _ = _kabsch([own[k] for k in shared], [ref_map[k] for k in shared])
+
+    st = gemmi.read_structure(str(cif_path))
+    pts = []
+    for chain in st[0]:
+        for res in chain:
+            if res.name in {"HOH", "WAT", "DOD"}:
+                continue
+            tab = gemmi.find_tabulated_residue(res.name)
+            if tab and (tab.is_amino_acid() or tab.is_nucleic_acid()):
+                continue
+            for atom in res:
+                if atom.element == gemmi.Element("H"):
+                    continue
+                pts.append((atom.pos.x, atom.pos.y, atom.pos.z))
+    if not pts:
+        return None
+    return np.asarray(pts, dtype=float) @ R + t
+
+
+# --------------------------------------------------------------------------- #
+# Template-framed conformation 2
+#
+# Cofolding often samples a single conformation: on T2451 the whole 51-structure
+# ensemble spans 1.45 Å CA-RMSD from the primary, so ``split_conformations``
+# hands back a 50/1 split and MODELs 6,7,8,9,0 would be near-copies of 1-5.
+#
+# When an experimental structure of the same protein exists in a different
+# arrangement, it is a better source for conformation 2 than the ensemble tail.
+# T2451 is BifA; 8ARV ("EAL domain of BifA", 1.9 Å) is the same 255-residue
+# homodimer and sits 1.78 Å from our dimer — but its *monomer* is within 0.80 Å
+# of ours, i.e. the whole difference is quaternary. So conformation 2 is built
+# by re-packing our own predicted monomer into the template's dimer frame:
+# superpose each receptor chain onto its assigned template chain and carry the
+# ligand along with the chain it binds. Internal geometry, pocket, and ligand
+# pose are untouched; only the subunit arrangement changes.
+# --------------------------------------------------------------------------- #
+
+def _pdb_lines_by_chain(lines: list[str]) -> dict[str, list[str]]:
+    """Group ATOM/TER lines by PDB chain id, preserving order."""
+    groups: dict[str, list[str]] = {}
+    for line in lines:
+        if not line.startswith("ATOM"):
+            continue
+        groups.setdefault(line[21], []).append(line)
+    return groups
+
+
+def _pdb_line_xyz(line: str) -> tuple[float, float, float]:
+    return float(line[30:38]), float(line[38:46]), float(line[46:54])
+
+
+def _pdb_line_with_xyz(line: str, x: float, y: float, z: float) -> str:
+    return f"{line[:30]}{x:8.3f}{y:8.3f}{z:8.3f}{line[54:]}"
+
+
+def _chain_ca_coords(lines: list[str]):
+    """CA coordinates of a chain's ATOM lines, in file order."""
+    import numpy as np
+    pts = [ln for ln in lines if ln[12:16].strip() == "CA"]
+    pts = [_pdb_line_xyz(ln) for ln in pts]
+    return np.asarray(pts, dtype=float) if pts else None
+
+
+def _template_chain_files(template_path: Path, workdir: Path) -> dict[str, Path]:
+    """Write one single-chain PDB per protein chain of the template.
+
+    USalign is invoked with ``-ter 1`` (stop at the first TER), so each chain
+    must live in its own file for a per-chain transform.
+    """
+    import gemmi
+
+    st = gemmi.read_structure(str(template_path))
+    st.setup_entities()
+    st.remove_ligands_and_waters()
+    st.remove_hydrogens()
+    out: dict[str, Path] = {}
+    for chain in st[0]:
+        n_ca = sum(1 for res in chain if res.find_atom("CA", "*") is not None)
+        if n_ca < 30:
+            continue
+        sub = gemmi.Structure()
+        sub.add_model(gemmi.Model("1"))
+        sub[0].add_chain(chain.clone())
+        sub.setup_entities()
+        path = workdir / f"conf2_tpl_{template_path.stem}_{chain.name}.pdb"
+        sub.write_pdb(str(path))
+        out[chain.name] = path
+    return out
+
+
+def _quaternary_rmsd(before, after) -> float:
+    """CA-RMSD between two arrangements of the same atoms after optimal
+    superposition — i.e. the part of the difference that is *not* a rigid
+    move of the whole assembly."""
+    if before is None or after is None or before.shape != after.shape:
+        return 0.0
+    _r, _t, rmsd = _kabsch(before, after)
+    return float(rmsd)
+
+
+def build_template_conformation_models(
+    conf1_models: list[dict],
+    template_path: Path,
+    workdir: Path,
+    *,
+    parent: str,
+) -> tuple[list[dict], float]:
+    """Re-pack the conformation-1 receptor into ``template_path``'s subunit
+    arrangement and carry each MODEL's ligand along with the chain it binds.
+
+    Returns ``(models, quaternary_rmsd)``. ``quaternary_rmsd`` is the CA-RMSD
+    between the original and re-packed receptors after optimal superposition,
+    i.e. how much of a different conformation this actually is. Returns
+    ``([], 0.0)`` when the template cannot be matched.
+    """
+    import numpy as np
+
+    from casp17.usalign import run_usalign
+
+    if not conf1_models:
+        return [], 0.0
+
+    chain_files = _template_chain_files(template_path, workdir)
+    if not chain_files:
+        print(f"  conformation 2: no usable protein chain in {template_path.name}")
+        return [], 0.0
+
+    # Receptor chains come from MODEL 1; every conformation-1 MODEL shares the
+    # same receptor, so one set of transforms serves all of them.
+    ref_lines = conf1_models[0]["protein_pdb_lines"]
+    rec_chains = _pdb_lines_by_chain(ref_lines)
+    if not rec_chains:
+        print("  conformation 2: receptor has no ATOM records")
+        return [], 0.0
+
+    # Per-receptor-chain single-chain PDBs for USalign.
+    rec_files: dict[str, Path] = {}
+    for cid, lines in rec_chains.items():
+        path = workdir / f"conf2_rec_{cid}.pdb"
+        path.write_text("\n".join(lines) + "\nTER\nEND\n")
+        rec_files[cid] = path
+
+    # Score every (receptor chain → template chain) pair, then assign
+    # one-to-one, best TM first. A homodimer's chains are interchangeable, so
+    # the assignment only has to be consistent, not sequence-derived.
+    scored: list[tuple[float, str, str, object]] = []
+    for cid, rpath in rec_files.items():
+        for tid, tpath in chain_files.items():
+            res = run_usalign(rpath, tpath, timeout=300)
+            if res is None:
+                continue
+            R, t, tm, rmsd = res
+            scored.append((tm, cid, tid, (R, t, rmsd)))
+    if not scored:
+        print(f"  conformation 2: USalign produced no transform against "
+              f"{template_path.name}")
+        return [], 0.0
+
+    scored.sort(key=lambda s: -s[0])
+    transforms: dict[str, tuple] = {}
+    used_tpl: set[str] = set()
+    for tm, cid, tid, payload in scored:
+        if cid in transforms or tid in used_tpl:
+            continue
+        transforms[cid] = (*payload, tid, tm)
+        used_tpl.add(tid)
+    unmatched = [c for c in rec_chains if c not in transforms]
+    if unmatched:
+        print(f"  conformation 2: no template chain left for receptor chain(s) "
+              f"{unmatched} — cannot build a complete assembly")
+        return [], 0.0
+    for cid, (_, _, rmsd, tid, tm) in transforms.items():
+        print(f"  chain {cid} → template {tid}: TM={tm:.4f} RMSD={rmsd:.2f} Å")
+
+    def move(lines: list[str]) -> list[str]:
+        out: list[str] = []
+        for line in lines:
+            if not line.startswith("ATOM"):
+                out.append(line)
+                continue
+            R, t = transforms[line[21]][0], transforms[line[21]][1]
+            x, y, z = _pdb_line_xyz(line)
+            p = R @ np.asarray([x, y, z], dtype=float) + t
+            out.append(_pdb_line_with_xyz(line, p[0], p[1], p[2]))
+        return out
+
+    moved_lines = move(ref_lines)
+    sep = _quaternary_rmsd(_chain_ca_coords(ref_lines), _chain_ca_coords(moved_lines))
+
+    # The per-chain transforms land the assembly in the *template's* coordinate
+    # frame, tens of Å from conformation 1 (8ARV: 50.4 Å). That offset is a rigid
+    # move of the whole thing, so it carries no information — but it makes the
+    # two conformations impossible to compare side by side in a viewer, and any
+    # consumer that superposes once and reuses the transform would read it as a
+    # 50 Å error. Fit the re-packed assembly back onto conformation 1 as one
+    # rigid body: the quaternary difference (``sep``) is untouched by
+    # construction, and both MODEL groups end up in a common frame.
+    ca_before = _chain_ca_coords(ref_lines)
+    ca_after = _chain_ca_coords(moved_lines)
+    back_R = back_t = None
+    if ca_before is not None and ca_after is not None and ca_before.shape == ca_after.shape:
+        back_R, back_t, _ = _kabsch(ca_after, ca_before)
+
+    def to_conf1_frame(lines: list[str]) -> list[str]:
+        if back_R is None:
+            return lines
+        out: list[str] = []
+        for line in lines:
+            if not line.startswith("ATOM"):
+                out.append(line)
+                continue
+            x, y, z = _pdb_line_xyz(line)
+            # _kabsch is row-vector convention (target ~= mobile @ R + t),
+            # unlike the USalign transforms above (ref ~= R @ pred + t).
+            p = np.asarray([x, y, z], dtype=float) @ back_R + back_t
+            out.append(_pdb_line_with_xyz(line, p[0], p[1], p[2]))
+        return out
+
+    models: list[dict] = []
+    for model in conf1_models:
+        mdl_text = model["ligands"][0]["ligand_mdl"]
+        binder = _mdl_binding_chain(mdl_text, rec_chains)
+        if binder is None:
+            print("  conformation 2: ligand has no receptor contact — skipping MODEL")
+            continue
+        R, t = transforms[binder][0], transforms[binder][1]
+        if back_R is not None:
+            # Compose chain-into-template with assembly-back-into-conf1 so the
+            # ligand takes exactly the path its receptor chain takes. The chain
+            # step is column convention (R @ x + t), the back step row (x @ B),
+            # and x @ B == B.T @ x, hence the transpose.
+            R = back_R.T @ R
+            t = back_R.T @ t + back_t
+        new_model = dict(model)
+        new_model["protein_pdb_lines"] = to_conf1_frame(move(model["protein_pdb_lines"]))
+        new_model["parent"] = parent
+        new_model["remark"] = (
+            f"conformation 2 — predicted monomer re-packed into "
+            f"{template_path.stem.upper()} subunit arrangement "
+            f"(CA-RMSD {sep:.2f} A from conformation 1); ligand carried with chain {binder}"
+        )
+        lig = dict(model["ligands"][0])
+        lig["ligand_mdl"] = _transform_mdl(mdl_text, R, t)
+        new_model["ligands"] = [lig]
+        models.append(new_model)
+    return models, sep
+
+
+def _mdl_atom_slice(mdl_text: str) -> tuple[list[str], int, int]:
+    """Return ``(lines, first_atom_index, n_atoms)`` for a V2000 block."""
+    lines = mdl_text.split("\n")
+    ci = next(i for i, ln in enumerate(lines) if ln.rstrip().endswith("V2000"))
+    return lines, ci + 1, int(lines[ci][:3])
+
+
+def _mdl_binding_chain(mdl_text: str, rec_chains: dict[str, list[str]]) -> str | None:
+    """Receptor chain with the most heavy-atom contacts to the ligand.
+
+    T2451's ligand sits entirely inside one subunit (15 contacts, all chain A),
+    which is what makes the rigid re-pack safe: the pose travels with its own
+    chain and the pocket never changes shape.
+    """
+    import numpy as np
+
+    try:
+        lines, first, n = _mdl_atom_slice(mdl_text)
+    except StopIteration:
+        return None
+    pts = []
+    for line in lines[first:first + n]:
+        try:
+            pts.append((float(line[0:10]), float(line[10:20]), float(line[20:30])))
+        except ValueError:
+            continue
+    if not pts:
+        return None
+    lig = np.asarray(pts, dtype=float)
+
+    best_cid, best_n = None, 0
+    for cid, clines in rec_chains.items():
+        rec = np.asarray([_pdb_line_xyz(ln) for ln in clines], dtype=float)
+        d = np.linalg.norm(rec[:, None, :] - lig[None, :, :], axis=-1)
+        n_contact = int((d < 5.0).any(axis=1).sum())
+        if n_contact > best_n:
+            best_cid, best_n = cid, n_contact
+    return best_cid
+
+
+def _transform_mdl(mdl_text: str, R, t) -> str:
+    """Apply ``R @ x + t`` to every atom of a V2000 MDL block."""
+    import numpy as np
+
+    lines, first, n = _mdl_atom_slice(mdl_text)
+    for i in range(first, first + n):
+        line = lines[i]
+        try:
+            x, y, z = float(line[0:10]), float(line[10:20]), float(line[20:30])
+        except ValueError:
+            continue
+        p = R @ np.asarray([x, y, z], dtype=float) + t
+        lines[i] = f"{p[0]:10.4f}{p[1]:10.4f}{p[2]:10.4f}{line[30:]}"
+    return "\n".join(lines)
+
+
+def build_conformation_models(
+    group_cifs: list[Path],
+    target_id: str,
+    ligand_spec: dict,
+    workdir: Path,
+    *,
+    k: int,
+    diversity_rmsd: float,
+    affinity_nM: float | None,
+    parent: str,
+    separation: float = 0.0,
+) -> list[dict]:
+    """Assemble up to ``k`` MODELs from one conformational group of the cofold
+    ensemble. Each MODEL carries **its own** receptor (that structure's
+    conformation) plus that structure's own bound-ligand pose, so the pair is
+    always in a single coordinate frame.
+
+    Poses are ordered by ligand pLDDT and gated on pairwise heavy-atom RMSD
+    (compared after superposing receptors, since the frames differ).
+    """
+    import numpy as np
+
+    ranked = sorted(group_cifs, key=_ligand_plddt, reverse=True)
+    models: list[dict] = []
+    if not ranked:
+        return models
+
+    ref_map = _ca_map(ranked[0])
+    ref_keys = sorted(ref_map)
+    accepted_coords: list = []
+
+    for slot, cif in enumerate(ranked):
+        if len(models) >= k:
+            break
+        # Cofold structures collide on basename across seeds
+        # (``boltz_input_model_0_aligned.cif`` exists once per seed), so the
+        # scratch filename carries the ensemble index, not just the stem.
+        mdl_path = workdir / f"conf2_{slot:03d}_{cif.stem}.mol"
+        try:
+            written = extract_cofolded_ligand_mdl(
+                cif, mdl_path, title=f"conf2_{cif.stem}")
+        except Exception as exc:
+            print(f"    skip {cif.name}: ligand extraction failed "
+                  f"({type(exc).__name__}: {exc})")
+            continue
+        if written is None:
+            continue
+
+        coords = _ligand_coords_in_frame(cif, ref_map, ref_keys)
+        if coords is not None and accepted_coords:
+            too_close = False
+            for prev in accepted_coords:
+                if prev.shape != coords.shape:
+                    continue
+                rmsd = float(np.sqrt(((coords - prev) ** 2).sum(axis=1).mean()))
+                if rmsd < diversity_rmsd:
+                    too_close = True
+                    break
+            if too_close:
+                continue
+
+        pdb_path = workdir / f"conf2_{slot:03d}_{cif.stem}.pdb"
+        try:
+            cif_to_pdb_with_plddt(cif, pdb_path, target_id)
+            protein_lines = extract_pdb_atom_lines(pdb_path)
+        except Exception as exc:
+            print(f"    skip {cif.name}: receptor conversion failed "
+                  f"({type(exc).__name__}: {exc})")
+            continue
+        if not protein_lines:
+            continue
+
+        if coords is not None:
+            accepted_coords.append(coords)
+        models.append({
+            "protein_pdb_lines": protein_lines,
+            "parent": parent,
+            "remark": (f"conformation 2 (CA-RMSD {separation:.2f} A from "
+                       f"conformation 1) — cofold {cif.parent.name}/{cif.stem}"),
+            "ligands": [{
+                "ligand_number": ligand_spec["ligand_number"],
+                "ligand_name": ligand_spec["ligand_name"],
+                "ligand_mdl": mdl_path.read_text(),
+                "lscore": round(_ligand_plddt(cif), 3),
+                "smiles": ligand_spec.get("smiles"),
+            }],
+            "affinity_nM": affinity_nM,
+        })
+    return models
 
 
 def find_best_ligand_pose(
@@ -261,6 +940,86 @@ def find_best_ligand_pose(
     return best[0], best[1]
 
 
+def _pose_stereo_matches(mol, ref_smiles: str) -> bool:
+    """Does this pose's 3D geometry carry the released molecule's stereochemistry?
+
+    A docking pose is only as good as the conformer it started from, and an
+    embedding step can hand back the mirror image of a rigid centre — a
+    cyclopropane on T2414v1 came out as the wrong enantiomer in one of five
+    poses. Bond orders and charges can be restored from the SMILES afterwards;
+    chirality cannot, because it lives in the coordinates. So it has to be a
+    selection filter, not a fix-up. Fails open: a pose that cannot be mapped is
+    left to the other filters.
+    """
+    if mol is None or not ref_smiles:
+        return True
+    try:
+        from rdkit import Chem, RDLogger
+        from rdkit.Chem import AllChem
+        RDLogger.DisableLog("rdApp.*")
+        ref = Chem.MolFromSmiles(ref_smiles)
+        if ref is None:
+            return True
+        if not Chem.FindMolChiralCenters(ref, useLegacyImplementation=False):
+            return True
+        fixed = AllChem.AssignBondOrdersFromTemplate(ref, Chem.RemoveHs(Chem.Mol(mol)))
+        Chem.AssignStereochemistryFrom3D(fixed)
+        # Substructure match rather than atom-index pairing: the pose carries
+        # its own atom order (CIF/PDBQT order, not the template's), so zipping
+        # the two chiral-centre lists compares unrelated atoms. With
+        # ``useChirality`` a centre the released SMILES leaves unspecified
+        # matches either hand, which is what an unresolved compound means.
+        return fixed.HasSubstructMatch(ref, useChirality=True)
+    except Exception:
+        return True
+
+
+def _conform_mdl_to_reference(mdl_text: str, ref_smiles: str,
+                              where: str = "") -> tuple[str, list[str]]:
+    """Restore the released molecule's bond orders and formal charges on a pose.
+
+    A pose that went through PDBQT loses every formal charge — meeko writes no
+    charge block — so the same ligand comes back as a neutral amine or acid while
+    a cofold pose keeps its ``[NH3+]``/``[O-]``. Both describe the same
+    heavy-atom graph, and CASP validates connectivity, but one submission ought
+    not to disagree with itself about the molecule it is predicting.
+
+    ``AssignBondOrdersFromTemplate`` copies bond orders and charges from the
+    released SMILES onto the pose's own atoms, leaving coordinates untouched.
+    Stereochemistry is *not* copied: it is a property of the coordinates, so a
+    mismatch there is a wrong pose rather than a wrong annotation and is
+    reported for the caller to drop.
+    """
+    notes: list[str] = []
+    try:
+        from rdkit import Chem, RDLogger
+        from rdkit.Chem import AllChem
+        RDLogger.DisableLog("rdApp.*")
+    except ImportError:
+        return mdl_text, notes
+    ref = Chem.MolFromSmiles(ref_smiles) if ref_smiles else None
+    pose = Chem.MolFromMolBlock(mdl_text, sanitize=True, removeHs=True)
+    if ref is None or pose is None:
+        return mdl_text, notes
+    try:
+        fixed = AllChem.AssignBondOrdersFromTemplate(ref, pose)
+    except Exception as exc:
+        notes.append(f"{where}: could not map onto the released SMILES ({exc})")
+        return mdl_text, notes
+    Chem.AssignStereochemistryFrom3D(fixed)
+    # Order-independent, and silent about centres the released SMILES leaves
+    # unspecified: ``fixed`` keeps the pose's own atom order, so zipping the two
+    # chiral-centre lists positionally would compare unrelated atoms and report
+    # a mirror image for any molecule read from a CIF or PDB.
+    if not fixed.HasSubstructMatch(ref, useChirality=True):
+        notes.append(f"{where}: stereochemistry differs from the released SMILES "
+                     f"({Chem.MolToSmiles(fixed)} vs {Chem.MolToSmiles(ref)})")
+    name = pose.GetProp("_Name") if pose.HasProp("_Name") else ""
+    if name:
+        fixed.SetProp("_Name", name)
+    return _safe_v2000_molblock(fixed, kekulize=True).rstrip(), notes
+
+
 def _strip_h_mdl(mdl_text: str) -> str:
     """Remove explicit H atoms from a V2000 MDL block (and their bonds),
     renumbering atom indices. CASP ligand validation matches the heavy-atom
@@ -270,7 +1029,7 @@ def _strip_h_mdl(mdl_text: str) -> str:
     consistent, spec-aligned form ("hydrogens optional; we omit them")."""
     lines = mdl_text.split("\n")
     try:
-        ci = next(i for i, l in enumerate(lines) if l.rstrip().endswith("V2000"))
+        ci = next(i for i, ln in enumerate(lines) if ln.rstrip().endswith("V2000"))
     except StopIteration:
         return mdl_text
     na, nb = int(lines[ci][:3]), int(lines[ci][3:6])
@@ -495,6 +1254,7 @@ def build_lg_submission(
     models: list[dict],
     parent: str = "N/A",
     start_model_idx: int = 1,
+    model_labels: list[int] | None = None,
 ) -> str:
     """Assemble CASP17 LG format submission text per docs/casp17_lg_format.md.
 
@@ -520,14 +1280,33 @@ def build_lg_submission(
     (this is the CASP LG spec — a MODEL is the "whole complex at rank k").
     The function emits up to 5 MODELs with their own PARENT/ATOM/TER/LIGAND*/
     AFFNTY/END structure. MODEL 1 = primary prediction.
+
+    ``model_labels`` overrides the ``start_model_idx + offset`` numbering with
+    an explicit label per MODEL, which is how a multi-conformation target is
+    expressed. T2451 asks for conformation 1 as ``1,2,3,4,5`` and conformation
+    2 as ``6,7,8,9,0`` — note the literal ``MODEL 0``, and note that supplying
+    labels is the only way past the 5-MODEL cap. Without labels the cap holds,
+    because for every ordinary target the server drops MODEL 6 and up.
     """
     if not models:
         raise ValueError("build_lg_submission requires at least one model")
-    if len(models) > 5:
-        raise ValueError(
-            f"LG format allows at most 5 MODEL blocks; got {len(models)}. "
-            "Truncate to top-5 before calling."
-        )
+    if model_labels is None:
+        if len(models) > 5:
+            raise ValueError(
+                f"LG format allows at most 5 MODEL blocks; got {len(models)}. "
+                "Truncate to top-5 before calling, or pass model_labels for a "
+                "target whose organizer requested more."
+            )
+    else:
+        if len(model_labels) != len(models):
+            raise ValueError(
+                f"model_labels has {len(model_labels)} entries but there are "
+                f"{len(models)} MODELs — they must correspond 1:1."
+            )
+        if any(not isinstance(lb, int) or not (0 <= lb <= 9) for lb in model_labels):
+            raise ValueError(f"MODEL labels must be integers in 0..9; got {model_labels}")
+        if len(set(model_labels)) != len(model_labels):
+            raise ValueError(f"MODEL labels must be unique; got {model_labels}")
 
     # Each non-empty line of ``method`` becomes its own ``METHOD`` record so
     # multi-line method descriptions emit valid CASP-style continuations
@@ -545,7 +1324,7 @@ def build_lg_submission(
     ]
 
     for offset, model in enumerate(models):
-        idx = start_model_idx + offset
+        idx = model_labels[offset] if model_labels is not None else start_model_idx + offset
         ligand_entries = model.get("ligands") or []
         if not ligand_entries:
             raise ValueError(f"MODEL {idx} has no ligand entries")
@@ -577,6 +1356,12 @@ def build_lg_submission(
             if not mdl_text.endswith("M  END"):
                 mdl_text += "\nM  END"
             mdl_text = _strip_h_mdl(mdl_text)   # heavy-atom only (match SMILES)
+            if lig.get("smiles"):
+                mdl_text, notes = _conform_mdl_to_reference(
+                    mdl_text, str(lig["smiles"]),
+                    where=f"MODEL {model.get('model_number', '?')} ligand {ligand_name}")
+                for n in notes:
+                    print(f"  WARNING: {n}")
             lines.append(mdl_text)
 
         # Per-MODEL AFFNTY before END
@@ -634,6 +1419,9 @@ def _load_target_ligands(run_dir: Path) -> list[dict]:
             "ligand_id": str(lig.get("id") or f"L{i}"),
             "ligand_number": i,
             "ligand_name": "LIG",
+            # the released SMILES, so every emitted block agrees with it on
+            # bond orders and formal charges
+            "smiles": lig.get("smiles"),
         })
     return out
 
@@ -645,6 +1433,7 @@ def _select_poses_for_ligand(
     rmsd_threshold: float,
     primary: bool,
     anchors: list | None = None,
+    max_anchorless: int | None = 2,
 ) -> list:
     """Pick up to ``k`` diverse poses for one ligand from the shared pool.
 
@@ -655,6 +1444,9 @@ def _select_poses_for_ligand(
 
     When ``anchors`` (research / dominant-consensus pocket centres) are given,
     uses the anchored ranker so a dominant functional site is guaranteed a MODEL.
+    ``max_anchorless`` caps how many of the ``k`` MODELs may sit at no anchor at
+    all (poses that agree with neither the research briefing nor the template
+    consensus); ``None`` keeps the pre-hedge behaviour.
     """
     from compute_submission_scores import (  # type: ignore
         select_diverse_top_k, select_diverse_top_k_anchored,
@@ -669,6 +1461,7 @@ def _select_poses_for_ligand(
     if anchors:
         return select_diverse_top_k_anchored(
             filtered, anchors, k=k, rmsd_threshold=rmsd_threshold,
+            max_anchorless=max_anchorless,
         )
     return select_diverse_top_k(
         filtered, k=k, rmsd_threshold=rmsd_threshold,
@@ -703,6 +1496,80 @@ def _receptor_heavy_coords(cif_path: "Path"):
         arr = None
     _REC_HEAVY_CACHE[key] = arr
     return arr
+
+
+def _cofactor_heavy_coords(cif_path: "Path", ligand_smiles: list) -> "object":
+    """Heavy-atom coords of bound cofactors in the cofolding model.
+
+    ``_receptor_heavy_coords`` strips every non-polymer residue, so a pose that
+    sits inside an occupied cofactor site passes the receptor clash test. That
+    is not hypothetical: pdb2pqr drops any HETATM its AMBER force field cannot
+    parameterise, so L02's sinefungin never reached ``receptor.pdbqt`` and
+    docking scored its site as empty pocket.
+
+    Residues whose element counts match one of the target's own ligands are
+    excluded — those are the molecules being predicted, not obstacles.
+    Returns ``None`` when the model holds no cofactor.
+    """
+    try:
+        from collections import Counter
+
+        import gemmi
+        import numpy as np
+        from rdkit import Chem, RDLogger
+        RDLogger.DisableLog("rdApp.*")
+    except ImportError:
+        return None
+
+    def formula(symbols) -> tuple:
+        return tuple(sorted(Counter(s for s in symbols if s != "H").items()))
+
+    skip = set()
+    for smi in ligand_smiles:
+        m = Chem.MolFromSmiles(smi) if smi else None
+        if m is not None:
+            skip.add(formula(a.GetSymbol() for a in m.GetAtoms()))
+
+    try:
+        st = gemmi.read_structure(str(cif_path))
+    except Exception:
+        return None
+    pts = []
+    for model in st:
+        for chain in model:
+            for res in chain:
+                if res.name in {"HOH", "WAT", "DOD"}:
+                    continue
+                tab = gemmi.find_tabulated_residue(res.name)
+                if tab and (tab.is_amino_acid() or tab.is_nucleic_acid()):
+                    continue
+                heavy = [a for a in res if (a.element.name or "") != "H"]
+                if formula(a.element.name for a in heavy) in skip:
+                    continue
+                pts += [[a.pos.x, a.pos.y, a.pos.z] for a in heavy]
+        break
+    return np.asarray(pts, dtype=float) if pts else None
+
+
+def _pose_overlaps_cofactor(mol, cof, cutoff: float = 2.5) -> bool:
+    """True if any ligand heavy atom is closer to a cofactor atom than
+    ``cutoff``. One pair is enough — two separate molecules do not share
+    space, and 2.5 Å is below every real van der Waals contact."""
+    if mol is None or cof is None or len(cof) == 0:
+        return False
+    try:
+        import numpy as np
+        conf = mol.GetConformer()
+        pos = np.asarray([[conf.GetAtomPosition(i).x, conf.GetAtomPosition(i).y,
+                           conf.GetAtomPosition(i).z]
+                          for i, a in enumerate(mol.GetAtoms())
+                          if a.GetSymbol() != "H"], dtype=float)
+        if not len(pos):
+            return False
+        d = np.linalg.norm(pos[:, None, :] - cof[None, :, :], axis=-1)
+        return bool(d.min() < cutoff)
+    except Exception:
+        return False
 
 
 def _pose_clashes(mol, rec, cutoff: float = 2.0, min_n: int = 5) -> bool:
@@ -1084,32 +1951,14 @@ def _force_cofold_consensus(chosen: list, pool: list, k: int,
     return chosen + [best]
 
 
-def _force_active_site(chosen: list, pool: list, run_dir: "Path",
-                       cif_path: "Path", k: int, rmsd_threshold: float,
-                       n_min: int, cov: float = 8.0) -> list:
-    """Force >= ``n_min`` MODELs at the dominant active site.
-
-    Active site = top-template COM ∪ dominant template cluster (share ≥ 0.5) ∪
-    catalytic pocket (research residues). Where the true binding site scores low
-    (RMSD-Pred favours snug decoy pockets, so LSCORE selection fills the 5 MODELs
-    with decoys — e.g. T2414: 4/5 at minor consensus pockets), this pulls in the
-    best available active-site poses with spatial diversity, evicting the weakest
-    NON-active MODEL each time (MODEL 1 kept). Opt-in via ``--active-site-min``.
-    Fail-open."""
+def _active_site_anchors(run_dir: "Path", cif_path: "Path"):
+    """Active-site points for the forcing/ordering passes. ``[]`` when none."""
     try:
         import numpy as np
         from casp17.research_prior import (  # type: ignore
-            research_centers, template_com_centers)
-        from compute_submission_scores import (  # type: ignore
-            _load_pose_mol, _pose_coord_array, _pose_pair_rmsd)
+            dominant_site_mode, research_centers, template_com_centers)
     except Exception:
-        return chosen
-    if n_min <= 0 or not chosen:
-        return chosen
-    # active site = top-template bound-ligand COM (the meeting's "top template의
-    # catalytic site") ∪ catalytic-pocket centroid. The dominant *cluster*
-    # centroid is deliberately excluded — its consensus offset can sit several Å
-    # off the true site and count decoy sub-pockets as "active".
+        return []
     apts = []
     try:
         for a in template_com_centers(Path(run_dir)):
@@ -1119,8 +1968,80 @@ def _force_active_site(chosen: list, pool: list, run_dir: "Path",
                 for a in research_centers(Path(run_dir), Path(cif_path))]
         if cats:
             apts.append(np.mean(cats, axis=0))
+        # Fallback: no research briefing and no corroborated top-template COM
+        # (T2451 — its best-TM template's only "ligand" was a free CYS 15 Å from
+        # the real site). The template-pocket *mode* is then the sole grounded
+        # signal left, and unlike the cluster centroid it is a real pile-up.
+        if not apts:
+            for a in dominant_site_mode(Path(run_dir)):
+                apts.append(np.asarray(a.xyz, dtype=float))
+                print(f"  active-site anchor from template pocket {a.label} "
+                      "(no research / corroborated top-template COM)")
+    except Exception:
+        return []
+    return apts
+
+
+def _active_site_index(chosen: list, run_dir: "Path", cif_path: "Path",
+                       cov: float = 8.0) -> int | None:
+    """Index of the best-lscore chosen MODEL sitting at the active site.
+
+    Used by ``--active-site-first`` to make the primary prediction a pose the
+    templates support, on targets where LSCORE ranks a template-unsupported pose
+    first (T2451: MODEL 1 at 46 Å from every TM ≥ 0.7 template's ligand)."""
+    try:
+        import numpy as np
+        from compute_submission_scores import (  # type: ignore
+            _load_pose_mol, _pose_coord_array)
+    except Exception:
+        return None
+    apts = _active_site_anchors(run_dir, cif_path)
+    if not apts:
+        return None
+    mc: dict = {}
+    best = None
+    for i, p in enumerate(chosen):
+        arr = _pose_coord_array(_load_pose_mol(p, mc))
+        if arr is None:
+            continue
+        if min(float(np.linalg.norm(arr.mean(0) - ap)) for ap in apts) <= cov:
+            if best is None or (p.lscore or 0.0) > (chosen[best].lscore or 0.0):
+                best = i
+    return best
+
+
+def _force_active_site(chosen: list, pool: list, run_dir: "Path",
+                       cif_path: "Path", k: int, rmsd_threshold: float,
+                       n_min: int, cov: float = 8.0) -> list:
+    """Force >= ``n_min`` MODELs at the dominant active site.
+
+    Active site = top-template COM ∪ catalytic pocket (research residues), or —
+    when neither survives — the template-pocket density mode. Where the true
+    binding site scores low (RMSD-Pred favours snug decoy pockets, so LSCORE
+    selection fills the 5 MODELs with decoys — e.g. T2414: 4/5 at minor consensus
+    pockets), this pulls in the best available active-site poses with spatial
+    diversity, evicting the weakest NON-active MODEL each time (MODEL 1 kept).
+
+    This is the *hard* override. The anchored ranker's own coverage pass is soft:
+    it refuses to evict a higher-effective-score incumbent, so a site can hold
+    overwhelming template evidence and still take zero MODELs (T2451: 392 unique
+    PDBs on one site, every pose there scoring ≤ 0.15 against 0.68 decoys).
+
+    Opt-in via ``--active-site-min``. Fail-open."""
+    try:
+        import numpy as np
+        from compute_submission_scores import (  # type: ignore
+            _load_pose_mol, _pose_coord_array, _pose_pair_rmsd)
     except Exception:
         return chosen
+    if n_min <= 0 or not chosen:
+        return chosen
+    # active site = top-template bound-ligand COM (the meeting's "top template의
+    # catalytic site") ∪ catalytic-pocket centroid, else the template-pocket
+    # mode. The dominant cluster's *centroid* stays excluded — its consensus
+    # offset can sit several Å off the true site and count decoy sub-pockets as
+    # "active".
+    apts = _active_site_anchors(run_dir, cif_path)
     if not apts:
         return chosen
     mc: dict = {}
@@ -1294,13 +2215,38 @@ def _force_residue_contact(chosen: list, pool: list, run_dir: "Path",
     if n <= 0 or not resids or not chosen:
         return chosen
     want = {str(r) for r in resids}
+    # Resolve the residues against the receptor itself. Going through
+    # research_centers() only sees residues the briefing happened to name, so any
+    # other number silently resolved to nothing and the whole pass no-opped —
+    # which is how a request to cover T2455's second template site (28 unique
+    # PDB, 25.8 A from the primary one) came back with the selection unchanged.
+    pts: list = []
     try:
-        pts = [np.asarray(a.xyz, dtype=float)
-               for a in research_centers(Path(run_dir), Path(cif_path))
-               if any(re.search(rf"\b{r}\b|{r}$", a.label) for r in want)]
+        import gemmi  # type: ignore
+        st = gemmi.read_structure(str(cif_path))
+        st.setup_entities()
+        for model in st:
+            for chain in model:
+                for res in chain:
+                    if str(res.seqid.num) not in want:
+                        continue
+                    for atom in res:
+                        if atom.element.name != "H":
+                            pts.append(np.asarray(atom.pos.tolist(), dtype=float))
+            break
     except Exception:
-        return chosen
+        pts = []
     if not pts:
+        # briefing-named labels (e.g. "Cys178", "E34B") as the fallback
+        try:
+            pts = [np.asarray(a.xyz, dtype=float)
+                   for a in research_centers(Path(run_dir), Path(cif_path))
+                   if any(re.search(rf"\b{r}\b|{r}$", a.label) for r in want)]
+        except Exception:
+            return chosen
+    if not pts:
+        print(f"  residue-contact: none of {sorted(want)} found in the receptor "
+              f"or the research briefing — pass skipped")
         return chosen
     mc: dict = {}
 
@@ -1562,6 +2508,13 @@ def main() -> int:
                         help="disable research/dominant-consensus pocket anchoring "
                              "in pose selection (default: on — guarantees a MODEL "
                              "at a dominant functional site when one exists)")
+    parser.add_argument("--max-anchorless", type=int, default=2, metavar="N",
+                        help="cap how many MODELs may sit at NO pocket anchor "
+                             "(agreeing with neither the research briefing nor "
+                             "the template consensus). Strays beyond N are "
+                             "swapped for the best anchor-covering poses; the "
+                             "top-scoring stray stays as a hedge against a wrong "
+                             "prior. Default 2. Use -1 to disable.")
     parser.add_argument("--no-symflip", action="store_true",
                         help="disable pseudo-symmetry pose expansion (default: on — "
                              "adds the ~180°-flipped pose of a symmetric ligand at "
@@ -1579,6 +2532,19 @@ def main() -> int:
                              "(top-template / dominant cluster / catalytic pocket). "
                              "0 = off. Use when the true site scores low and LSCORE "
                              "selection fills the MODELs with decoy pockets (e.g. T2414).")
+    parser.add_argument("--active-site-radius", type=float, default=8.0, metavar="A",
+                        help="ligand-centroid radius counted as 'at the active site' "
+                             "for --active-site-min (default 8.0 Å). Raise it when the "
+                             "site's template ligands are much larger than the target's "
+                             "— a 16-atom fragment bound in a dinucleotide groove sits "
+                             "8-12 Å from the NAP/FAD centroid and is still at the site "
+                             "(T2451).")
+    parser.add_argument("--active-site-first", action="store_true",
+                        help="make the best active-site MODEL the primary "
+                             "(MODEL 1). Use when LSCORE ranks a pose the "
+                             "templates do not support first — T2451's MODEL 1 "
+                             "sat 46 Å from every TM>=0.7 template's ligand. "
+                             "No-op when no chosen MODEL is at the site.")
     parser.add_argument("--catalytic-regions", type=int, default=0, metavar="N",
                         help="split scattered catalytic residues into N spatial "
                              "regions (most-populated first) and force --per-region "
@@ -1600,7 +2566,32 @@ def main() -> int:
     parser.add_argument("--template-first", action="store_true",
                         help="promote the best-lscore Track-2 template-based pose to "
                              "MODEL 1 (template-guided primary; PARENT=<template>).")
+    parser.add_argument("--conformations", type=int, default=1, choices=[1, 2],
+                        help="number of receptor conformations to submit (default 1). "
+                             "2 emits MODELs 1-5 for conformation 1 and 6,7,8,9,0 for "
+                             "conformation 2, built by clustering the cofold ensemble "
+                             "into two receptor conformations. Only for targets whose "
+                             "CASP page asks for it (T2451: 'submit models for "
+                             "conformation 1 as models 1-5, and those for conformation "
+                             "2 as 6,7,8,9,0').")
+    parser.add_argument("--conformation2-template", type=Path, default=None,
+                        metavar="CIF",
+                        help="build conformation 2 from an experimental structure "
+                             "instead of the cofold ensemble: the predicted monomer "
+                             "is re-packed into this template's subunit arrangement "
+                             "and each ligand pose travels with the chain it binds. "
+                             "Use when cofolding sampled a single conformation but a "
+                             "PDB entry of the same protein shows another (T2451: 8ARV). "
+                             "Requires --conformations 2.")
+    parser.add_argument("--min-conformation-rmsd", type=float,
+                        default=_CONFORMATION_MIN_SEPARATION, metavar="A",
+                        help="warn when the two conformation groups differ by less "
+                             f"than this CA-RMSD (default {_CONFORMATION_MIN_SEPARATION} Å). "
+                             "Below it, cofolding sampled one conformation and the "
+                             "second MODEL group is near-duplicate.")
     args = parser.parse_args()
+    if args.max_anchorless is not None and args.max_anchorless < 0:
+        args.max_anchorless = None  # -1 = disable the hedge cap
 
     # CASP17 group convention (LCDD): the submission basename MUST be
     # '{target}_LCDD.lg'. Only the output directory is honoured; the
@@ -1698,6 +2689,33 @@ def main() -> int:
             if _dropped:
                 print(f"  clash filter: dropped {_dropped} receptor-clashing pose(s) "
                       f"({len(candidate_pool)} remain)")
+        # Same test against bound cofactors, which the receptor coords omit.
+        _cof = _cofactor_heavy_coords(
+            cif_path, [lg.get("smiles") for lg in target_ligands])
+        if _cof is not None and len(_cof):
+            _mc1: dict = {}
+            _before = len(candidate_pool)
+            candidate_pool = [p for p in candidate_pool
+                              if not _pose_overlaps_cofactor(_lpm(p, _mc1), _cof)]
+            _dropped = _before - len(candidate_pool)
+            if _dropped:
+                print(f"  cofactor filter: dropped {_dropped} pose(s) overlapping a "
+                      f"bound cofactor ({len(candidate_pool)} remain)")
+            # Wrong-enantiomer poses: the coordinates are of another molecule,
+            # and no post-hoc annotation can repair that.
+            _ref_smi = {str(lg.get("ligand_id")): lg.get("smiles")
+                        for lg in target_ligands if lg.get("smiles")}
+            if _ref_smi:
+                _before = len(candidate_pool)
+                candidate_pool = [
+                    p for p in candidate_pool
+                    if _pose_stereo_matches(_lpm(p, _mc0),
+                                            _ref_smi.get(str(p.ligand_id), ""))]
+                _bad = _before - len(candidate_pool)
+                if _bad:
+                    print(f"  stereo filter: dropped {_bad} pose(s) whose chirality "
+                          f"differs from the released SMILES "
+                          f"({len(candidate_pool)} remain)")
     except Exception as _e:  # fail-open — never block submission on the filter
         print(f"  clash filter skipped: {_e}")
 
@@ -1709,6 +2727,7 @@ def main() -> int:
             lig["ligand_id"], candidate_pool,
             k=args.top_k, rmsd_threshold=args.diversity_rmsd,
             primary=primary, anchors=anchors,
+            max_anchorless=args.max_anchorless,
         )
         # symmetric-ligand hedge: force in a REAL docked pose whose alternate
         # scissile group faces the catalytic anchor (opposite orientation), if
@@ -1734,7 +2753,8 @@ def main() -> int:
                         if (p.ligand_id == lig["ligand_id"]) or (primary and p.ligand_id is None)]
             chosen = _force_active_site(chosen, pool_lig, run_dir, cif_path,
                                         k=args.top_k, rmsd_threshold=args.diversity_rmsd,
-                                        n_min=args.active_site_min)
+                                        n_min=args.active_site_min,
+                                        cov=args.active_site_radius)
         # multi-region catalytic fill (opt-in): split scattered catalytic residues
         # into N regions and force --per-region MODELs at each (e.g. ATP + Cys178).
         if args.catalytic_regions > 0 and cif_path is not None:
@@ -1770,6 +2790,17 @@ def main() -> int:
                         if (p.ligand_id == lig["ligand_id"]) or (primary and p.ligand_id is None)]
             chosen = _force_covalent_pose(chosen, pool_lig, run_dir, cif_path,
                                           k=args.top_k, rmsd_threshold=args.diversity_rmsd)
+        # promote the best active-site pose to MODEL 1 (template-guided primary)
+        if args.active_site_first and chosen and cif_path is not None:
+            si = _active_site_index(chosen, run_dir, cif_path,
+                                    cov=args.active_site_radius)
+            if si is not None and si != 0:
+                chosen.insert(0, chosen.pop(si))
+                print(f"  MODEL 1 ← active-site pose (was MODEL {si + 1}); "
+                      "LSCORE order overridden by template evidence")
+            elif si is None:
+                print("  --active-site-first: no chosen MODEL is at the active "
+                      "site; order left alone")
         # promote a Track-2 template-based pose to MODEL 1 (template-guided primary)
         if args.template_first and chosen:
             ti = next((j for j, p in enumerate(chosen)
@@ -1810,6 +2841,7 @@ def main() -> int:
                         "ligand_name": lig["ligand_name"],
                         "ligand_mdl": mdl_text,
                         "lscore": pose.lscore,
+                        "smiles": lig.get("smiles"),
                     })
                     continue
                 except Exception as e:
@@ -1835,6 +2867,7 @@ def main() -> int:
                 "ligand_name": lig["ligand_name"],
                 "ligand_mdl": mdl_text,
                 "lscore": 0.10,
+                "smiles": lig.get("smiles"),
             })
 
         # Only accept MODEL if all ligands are represented
@@ -1867,6 +2900,81 @@ def main() -> int:
         print(f"  NOTE: only {len(models)} of {args.top_k} MODELs available; "
               "submission truncated.")
 
+    # 6b. Second receptor conformation (opt-in, e.g. T2451 v1/v2).
+    model_labels: list[int] | None = None
+    if args.conformations == 2:
+        if len(target_ligands) != 1:
+            raise SystemExit(
+                f"--conformations 2 needs a single-ligand target; {args.target_id} "
+                f"has {len(target_ligands)}. The conformation-2 MODELs come from "
+                "cofolded complexes, whose ligand extraction cannot separate "
+                "multiple ligands into distinct LIGAND blocks."
+            )
+        if args.conformation2_template is not None:
+            tpl = args.conformation2_template
+            if not tpl.exists():
+                raise SystemExit(f"--conformation2-template not found: {tpl}")
+            print(f"\nBuilding conformation 2 (MODELs 6,7,8,9,0) from {tpl.name}...")
+            conf2, sep = build_template_conformation_models(
+                models, tpl, workdir, parent=args.parent,
+            )
+            print(f"  quaternary separation: {sep:.2f} Å CA-RMSD from conformation 1")
+            if conf2 and sep < args.min_conformation_rmsd:
+                print(f"  WARNING: the re-packed assembly differs by only {sep:.2f} Å "
+                      f"(< {args.min_conformation_rmsd:.2f} Å) — this template is not a "
+                      "distinct conformation. Pick another template or "
+                      "pass --conformations 1.")
+            if not conf2:
+                print("  WARNING: no conformation-2 MODELs emitted; the file will "
+                      "carry MODELs 1-5 only.")
+            else:
+                labels1 = list(CONFORMATION_LABELS[0])[:len(models)]
+                labels2 = list(CONFORMATION_LABELS[1])[:len(conf2)]
+                for lb, m in zip(labels2, conf2):
+                    lig = m["ligands"][0]
+                    print(f"  MODEL {lb}: {lig['ligand_number']:03d}:"
+                          f"LSCORE={lig['lscore']:.3f}  {m['remark']}")
+                models = models + conf2
+                model_labels = labels1 + labels2
+                source_summary.append(f"conformation2_{tpl.stem}")
+        else:
+            print("\nBuilding conformation 2 (MODELs 6,7,8,9,0) from the cofold ensemble...")
+            ensemble = enumerate_cofold_cifs(run_dir)
+            print(f"  cofold structures found: {len(ensemble)}")
+            group1, group2, sep = split_conformations(ensemble, cif_path)
+            print(f"  conformation 1: {len(group1)} structures (docking receptor's group)")
+            print(f"  conformation 2: {len(group2)} structures")
+            print(f"  seed separation: {sep:.2f} Å CA-RMSD")
+            if not group2:
+                print("  WARNING: the cofold ensemble did not split into two "
+                      "conformations — no conformation-2 MODELs emitted. The file "
+                      "will carry MODELs 1-5 only.")
+            else:
+                if sep < args.min_conformation_rmsd:
+                    print(f"  WARNING: the two groups differ by only {sep:.2f} Å CA-RMSD "
+                          f"(< {args.min_conformation_rmsd:.2f} Å) — cofolding likely "
+                          "sampled ONE conformation, so MODELs 6,7,8,9,0 are near-copies "
+                          "of 1-5 rather than the second crystal form. Consider "
+                          "re-folding with more seeds, passing "
+                          "--conformation2-template, or --conformations 1.")
+                conf2 = build_conformation_models(
+                    group2, args.target_id, target_ligands[0], workdir,
+                    k=args.top_k, diversity_rmsd=args.diversity_rmsd,
+                    affinity_nM=affinity_nM, parent=args.parent, separation=sep,
+                )
+                labels1 = list(CONFORMATION_LABELS[0])[:len(models)]
+                labels2 = list(CONFORMATION_LABELS[1])[:len(conf2)]
+                for lb, m in zip(labels2, conf2):
+                    lig = m["ligands"][0]
+                    print(f"  MODEL {lb}: {lig['ligand_number']:03d}:"
+                          f"LSCORE={lig['lscore']:.3f}  {m['remark']}")
+                if len(conf2) < args.top_k:
+                    print(f"  NOTE: conformation 2 yielded {len(conf2)} of "
+                          f"{args.top_k} MODELs (diverse cofold poses ran out).")
+                models = models + conf2
+                model_labels = labels1 + labels2
+                source_summary.append("cofold_conformation2")
+
     # 7. Write LG
     source_tag = "+".join(dict.fromkeys(source_summary)) or "auto"
     method_full = (
@@ -1881,6 +2989,7 @@ def main() -> int:
         method=method_full,
         models=models,
         parent=args.parent,
+        model_labels=model_labels,
     )
 
     args.output.write_text(submission)

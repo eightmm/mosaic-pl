@@ -1,7 +1,44 @@
-# CASP17 Protein-Ligand Hub
+# Mosaic-PL
 
-Unified Python workspace for CASP17 protein-ligand structure prediction and docking pipelines.
-Orchestrates external ML models (Boltz2/2x, Protenix v2, AlphaFold3), **union template search (MMseqs2 + Foldseek)** with cross-source pocket consensus, binding site prediction (P2Rank, SwinSite, **template-consensus pockets**), docking (Vina, AutoDock-GPU, Protenix-Dock), and post-analysis (BA-Pred, RMSD-Pred).
+**Mosaic-PL** is LCDD's multi-source workflow for CASP17 protein-ligand structure and pose prediction. It preserves complementary hypotheses from co-folding, template transfer, binding-site prediction, and multi-track docking, then ranks diverse poses with RMSD-Pred. LCDD remains the CASP group name.
+
+## At A Glance
+
+- **Co-folding ensemble:** Boltz-2, Boltz-2x, Protenix-v2, and AlphaFold 3.
+- **Template-guided pockets:** local RCSB sequence search (MMseqs2) and structure search (Foldseek) are unioned; bound-ligand centroids are transferred only after structural alignment and clustered into consensus pockets.
+- **Independent pose generation:** co-folded, P2Rank, SwinSite, and template-consensus pockets drive Vina and AutoDock-GPU tracks; MCS-guided ligand alignment is an additional, conditional track.
+- **Pose selection:** receptor-frame RMSD-Pred scoring (`LSCORE = 1 - P(RMSD > 2 A)`) selects up to five diverse models for CASP LG output.
+
+## Quick Start
+
+```bash
+git clone https://github.com/eightmm/CASP17.git
+cd CASP17
+uv sync
+
+# Validate a supplied YAML and prepare the Slurm workflow.
+uv run casp17-pl validate-run \
+  --input examples/full_pipeline_test.yaml \
+  --config examples/full_pipeline_config.yaml \
+  --stages template-search-sequence cofolding docking
+uv run casp17-pl run-wrapper \
+  --input examples/full_pipeline_test.yaml \
+  --config examples/full_pipeline_config.yaml \
+  --stages template-search-sequence cofolding docking \
+  --submit
+```
+
+External models, RCSB search databases, and GPU inference are configured separately. See [Setup](#setup), [Pipeline Stages Detail](#pipeline-stages-detail), and [Configuration](#configuration) before submitting a job.
+
+---
+
+## Scope
+
+Mosaic-PL orchestrates external ML models (Boltz2/2x, Protenix v2, AlphaFold3), **union template search (MMseqs2 + Foldseek)** with cross-source pocket consensus, binding-site prediction (P2Rank, SwinSite, **template-consensus pockets**), docking (Vina, AutoDock-GPU, Protenix-Dock), and post-analysis (BA-Pred, RMSD-Pred).
+
+## Research Workflows
+
+The repository also contains reproducible analysis and validation utilities for co-folding diversity, template-pose transfer, frame consistency, ligand-series scoring, and CASP LG/TS submission checks. See [Research Workflows](docs/research_workflows.md) for the supported analysis paths and their required local data.
 
 ## Full Pipeline Overview
 
@@ -124,7 +161,7 @@ sudo apt-get install -y libboost-all-dev autoconf automake libtool
 ### Installation
 
 ```bash
-git clone <repo-url> CASP17 && cd CASP17
+git clone https://github.com/eightmm/CASP17.git CASP17 && cd CASP17
 bash scripts/install_external_models.sh              # all tools + models
 srun --partition=6000ada --gres=gpu:1 bash scripts/build_autodock_gpu.sh  # GPU build
 bash scripts/install_external_models.sh --verify      # verify all
@@ -157,7 +194,7 @@ bash scripts/build_search_dbs.sh                      # MMseqs2 + Foldseek DBs
 | Foldseek structure DB | 7.7 GB | 251,422 RCSB structures (3Di+AA preindexed) |
 | RCSB ligand index | SQLite | 251k entries, 2.5M ligand instances, CCD classification |
 
-## Quick Start
+## Detailed Quick Start
 
 ### Full pipeline (one command)
 
@@ -600,6 +637,7 @@ protenix_dock:
 
 slurm:
   partition: 6000ada
+  qos: normal
   gpus: 1
   mem: 64G
   time: 06:00:00

@@ -60,8 +60,61 @@ def load_submitted() -> set[str]:
     return {ln.strip() for ln in STATE.read_text().splitlines() if ln.strip()}
 
 
-def submit(wrapper: str) -> bool:
-    r = subprocess.run(["sbatch", wrapper], capture_output=True, text=True)
+# Fragment runs stay on the partition their wrapper pins (6000ada): that GPU
+# pool is reserved for cofolding+docking, while `test` is left to the rescoring
+# workers. Kept for reference / manual overrides.
+FRAGMENT_PARTITIONS = [
+    ("6000ada", ["--gres=gpu:1"]),
+    ("heavy", ["--gres=gpu:h100:1"]),
+    ("heavy", ["--gres=gpu:6000pro_maxq:1"]),
+    ("test", ["--gres=gpu:a5000:1"]),
+]
+
+
+def _free_gpus(partition: str, kind: str | None) -> int:
+    """GPUs configured minus allocated across the partition's nodes."""
+    import re
+    nodes = subprocess.run(["sinfo", "-h", "-p", partition, "-o", "%N"],
+                           capture_output=True, text=True).stdout.strip()
+    if not nodes:
+        return 0
+    total = 0
+    for node in subprocess.run(["scontrol", "show", "hostnames", nodes],
+                               capture_output=True, text=True).stdout.split():
+        txt = subprocess.run(["scontrol", "show", "node", node],
+                             capture_output=True, text=True).stdout
+
+        def count(field: str) -> int:
+            m = re.search(rf"{field}=([^\s]*)", txt)
+            if not m:
+                return 0
+            tres = m.group(1)
+            if kind:
+                t = re.search(rf"gres/gpu:{re.escape(kind)}=(\d+)", tres)
+                if t:
+                    return int(t.group(1))
+                if kind not in txt:
+                    return 0
+            g = re.search(r"gres/gpu=(\d+)", tres)
+            return int(g.group(1)) if g else 0
+
+        total += max(0, count("CfgTRES") - count("AllocTRES"))
+    return total
+
+
+def pick_partition() -> list[str]:
+    """sbatch args for a partition with a free GPU, else [] (plain submit)."""
+    import re
+    for partition, gres in FRAGMENT_PARTITIONS:
+        m = re.match(r"--gres=gpu:([^:]+):\d+", gres[0])
+        kind = m.group(1) if m else None
+        if _free_gpus(partition, kind) > 0:
+            return ["-p", partition, *gres]
+    return []
+
+
+def submit(wrapper: str, extra: list[str] | None = None) -> bool:
+    r = subprocess.run(["sbatch", *(extra or []), wrapper], capture_output=True, text=True)
     if r.returncode == 0:
         print(f"[feed] submitted {wrapper.split('/holo/')[-1]} :: {r.stdout.strip()}", flush=True)
         with STATE.open("a") as fh:

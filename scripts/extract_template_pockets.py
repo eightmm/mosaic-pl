@@ -109,6 +109,12 @@ def _candidate_ccds(row: dict) -> set[str]:
     return {x.strip().upper() for x in raw.split(";") if x.strip()}
 
 
+#: Heavy-atom contact radius used to attribute a bound ligand to its host
+#: protomer. 6 Aa is past a hydrogen bond and well inside a packing contact,
+#: so the chain that actually cradles the ligand wins by a wide margin.
+_HOST_CONTACT_A = 6.0
+
+
 def _ligand_centroids(cif_path: Path, candidate_ccds: set[str]) -> list[dict]:
     """For every residue in the CIF whose name is a candidate CCD, return its
     heavy-atom centroid + element count. Multiple binding sites for the same
@@ -118,6 +124,18 @@ def _ligand_centroids(cif_path: Path, candidate_ccds: set[str]) -> list[dict]:
     structure = gemmi.read_structure(str(cif_path))
     pockets: list[dict] = []
     for model in structure:
+        # Polymer atoms per chain, so each ligand can be attributed to the
+        # protomer it actually touches. A ligand's own asym id is not a
+        # reliable host: mmCIF gives HETATM residues their own label_asym_id,
+        # and the chain a hit row reports may be an entity id ("1") that names
+        # no chain at all. Contact count is the physical answer.
+        poly: dict[str, list] = {}
+        for chain in model:
+            pts = [a.pos for res in chain
+                   if res.entity_type == gemmi.EntityType.Polymer
+                   for a in res if a.element.atomic_number > 1]
+            if pts:
+                poly[chain.name] = pts
         for chain in model:
             for residue in chain:
                 if residue.name.upper() not in candidate_ccds:
@@ -131,9 +149,18 @@ def _ligand_centroids(cif_path: Path, candidate_ccds: set[str]) -> list[dict]:
                 cx = sum(a.pos.x for a in heavy) / len(heavy)
                 cy = sum(a.pos.y for a in heavy) / len(heavy)
                 cz = sum(a.pos.z for a in heavy) / len(heavy)
+                best_host, best_n = None, 0
+                for cname, pts in poly.items():
+                    n = sum(1 for a in heavy for q in pts
+                            if a.pos.dist(q) <= _HOST_CONTACT_A)
+                    if n > best_n:
+                        best_host, best_n = cname, n
                 pockets.append({
                     "ccd": residue.name.upper(),
                     "chain": chain.name,
+                    "host_chain": best_host or chain.name,
+                    "host_contacts": best_n,
+                    "seqid": residue.seqid.num,
                     "n_heavy": len(heavy),
                     "x": cx, "y": cy, "z": cz,
                 })
@@ -276,6 +303,13 @@ def main() -> int:
     print(f"[pockets] processing {len(rows)} template hits (max_templates={args.max_templates})")
 
     pockets: list[PocketPoint] = []
+    #: (pdb_id, host chain) -> USalign result, so the duplicate hit rows the
+    #: union filter emits for one entry (mmseqs entity id + foldseek auth
+    #: chains) share one alignment each instead of repeating it.
+    align_cache: dict[tuple[str, str], tuple | None] = {}
+    #: (pdb_id, host chain, ccd, seqid) already emitted — one pocket per
+    #: physical ligand instance, however many rows point at it.
+    seen_instances: set[tuple[str, str, str, int]] = set()
     n_aligned = 0
     n_failed_cif = 0
     n_failed_align = 0
@@ -284,7 +318,6 @@ def main() -> int:
 
     for i, row in enumerate(rows, 1):
         pdb_id = (row.get("pdb_id") or "").lower()
-        chain_id = row.get("chain_id") or ""
         candidate_ccds = _candidate_ccds(row)
         if not pdb_id or not candidate_ccds:
             continue
@@ -300,63 +333,80 @@ def main() -> int:
             n_failed_cif += 1
             continue
 
-        # Chain-specific alignment. Foldseek/mmseqs report a (pdb_id, chain_id)
-        # pair as the hit — that chain is the one whose fold matched the query.
-        # Pre-extract that single chain and run USalign on the chain-only PDB
-        # so the returned R/t is guaranteed to correspond to that protomer's
-        # frame, regardless of how many homologous chains the full CIF has.
-        # Falls back to whole-CIF alignment when the chain isn't extractable
-        # (synthetic asym ids, missing chain in the model, etc.) so this
-        # tightening never silently drops a valid hit.
-        host_chain = (chain_id or "").upper()
-        chain_pdb = None
-        if host_chain:
-            chain_pdb = _extract_chain_pdb(
-                cif, host_chain, work_dir / f"{pdb_id}_{host_chain}.pdb"
-            )
-        align_input = chain_pdb if chain_pdb is not None else cif
-        align = run_usalign(align_input, reference_cif)
-        if align is None:
-            n_failed_align += 1
-            continue
-        R, t_vec, tm_score, rmsd_aligned = align
-        if tm_score < args.min_tmscore:
-            n_low_quality_align += 1
-            continue
-        n_aligned += 1
-
+        # Per-protomer alignment. Every bound ligand is placed by the transform
+        # of the chain that actually cradles it, not by one transform for the
+        # whole entry. Aligning once and reusing that R/t threw the other
+        # protomers' copies into solvent: on L01 that produced two phantom
+        # clusters (7WK/7X9 chain-B copies, 1 and 21 receptor heavy atoms
+        # within 8 Aa against 59 and 36 for the chain-A copies of the same
+        # site) and half of every run's pockets. It reached selection as a
+        # weight-1.20 anchor sitting in open solvent in 7 of 10 L01 complexes.
+        #
+        # A hit row's ``chain_id`` cannot drive this: mmseqs reports the entity
+        # id ("1") where foldseek reports auth chains ("A"/"B"), so the same
+        # entry arrives three times and the entity row matches no chain at all.
+        # Alignments are cached per (pdb_id, host chain) so those duplicate
+        # rows cost one USalign each rather than one per row.
         ligand_centroids = _ligand_centroids(cif, candidate_ccds)
-        # Keep only ligands physically attached to the host chain — those are
-        # the ones the chain-only USalign transform places correctly. Other
-        # protomers' ligands need their own (different) transform.
-        kept = [lig for lig in ligand_centroids if lig["chain"].upper() == host_chain]
-        if not kept and ligand_centroids:
-            # Single-chain CIFs sometimes carry synthetic asym ids that don't
-            # match the foldseek-reported ``chain_id``. In that case the host
-            # filter would wipe everything out; fall through to all ligands
-            # and let the surface-margin filter in cluster_template_pockets
-            # reject any whose transformed centroid lands outside the protein.
-            kept = ligand_centroids
-        for lig in kept:
-            tx, ty, tz = transform_point(R, t_vec, lig["x"], lig["y"], lig["z"])
-            pockets.append(PocketPoint(
-                template_pdb_id=pdb_id,
-                template_chain=chain_id,
-                ligand_ccd=lig["ccd"],
-                ligand_chain=lig["chain"],
-                ligand_n_heavy=lig["n_heavy"],
-                centroid_x=round(tx, 3),
-                centroid_y=round(ty, 3),
-                centroid_z=round(tz, 3),
-                alignment_tmscore=round(float(tm_score), 4),
-                alignment_rmsd=round(float(rmsd_aligned), 3),
-                in_mmseqs=row.get("in_mmseqs", "0") == "1",
-                in_foldseek=row.get("in_foldseek", "0") == "1",
-                pident=_safe_float(row.get("pident")),
-                qtmscore=_safe_float(row.get("qtmscore")),
-                best_tanimoto=_safe_float(row.get("best_tanimoto")),
-                best_mcs_coverage=_safe_float(row.get("best_mcs_coverage")),
-            ))
+        if not ligand_centroids:
+            continue
+
+        by_host: dict[str, list[dict]] = {}
+        for lig in ligand_centroids:
+            by_host.setdefault(lig["host_chain"], []).append(lig)
+
+        row_aligned = False
+        for host_chain, ligs in by_host.items():
+            ck = (pdb_id, host_chain.upper())
+            if ck in align_cache:
+                align = align_cache[ck]
+            else:
+                chain_pdb = _extract_chain_pdb(
+                    cif, host_chain, work_dir / f"{pdb_id}_{host_chain}.pdb"
+                )
+                # Whole-CIF fallback only for genuinely single-chain entries,
+                # where there is no other protomer to confuse the transform.
+                align_input = chain_pdb if chain_pdb is not None else cif
+                align = run_usalign(align_input, reference_cif)
+                align_cache[ck] = align
+            if align is None:
+                n_failed_align += 1
+                continue
+            R, t_vec, tm_score, rmsd_aligned = align
+            if tm_score < args.min_tmscore:
+                n_low_quality_align += 1
+                continue
+            row_aligned = True
+
+            for lig in ligs:
+                # One pocket per physical ligand instance. Without this the
+                # A-row, B-row and entity-row of the same entry each emit the
+                # same copies and inflate every cluster's evidence count.
+                ik = (pdb_id, host_chain.upper(), lig["ccd"], lig["seqid"])
+                if ik in seen_instances:
+                    continue
+                seen_instances.add(ik)
+                tx, ty, tz = transform_point(R, t_vec, lig["x"], lig["y"], lig["z"])
+                pockets.append(PocketPoint(
+                    template_pdb_id=pdb_id,
+                    template_chain=host_chain,
+                    ligand_ccd=lig["ccd"],
+                    ligand_chain=lig["chain"],
+                    ligand_n_heavy=lig["n_heavy"],
+                    centroid_x=round(tx, 3),
+                    centroid_y=round(ty, 3),
+                    centroid_z=round(tz, 3),
+                    alignment_tmscore=round(float(tm_score), 4),
+                    alignment_rmsd=round(float(rmsd_aligned), 3),
+                    in_mmseqs=row.get("in_mmseqs", "0") == "1",
+                    in_foldseek=row.get("in_foldseek", "0") == "1",
+                    pident=_safe_float(row.get("pident")),
+                    qtmscore=_safe_float(row.get("qtmscore")),
+                    best_tanimoto=_safe_float(row.get("best_tanimoto")),
+                    best_mcs_coverage=_safe_float(row.get("best_mcs_coverage")),
+                ))
+        if row_aligned:
+            n_aligned += 1
 
         if i % 10 == 0:
             elapsed = time.time() - t0

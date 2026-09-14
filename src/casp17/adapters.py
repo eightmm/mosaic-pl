@@ -174,7 +174,12 @@ def prepare_boltz(common: CommonInput, config: RunnerConfig, run_dir: Path) -> l
         primary_smi = (first_ligand or {}).get("smiles") or ""
         if primary_smi and _boltz_affinity_compatible(primary_smi):
             ligand_ids = [_entity_ids(_entity(e)[1]) for e in common.sequences if _entity(e)[0] == "ligand"]
-            if ligand_ids:
+            # Boltz refuses affinity on a ligand present in several copies
+            # ("Cannot compute affinity for a ligand that has multiple
+            # copies!") and skips the whole input — no structures, exit 0.
+            # Structures matter more than the affinity number, so drop the
+            # property instead of the run.
+            if ligand_ids and len(ligand_ids[0]) == 1:
                 spec["properties"] = [{"affinity": {"binder": ligand_ids[0][0]}}]
 
     input_path = run_dir / "inputs" / "boltz_input.yaml"

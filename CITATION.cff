@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use Mosaic-PL, please cite this software."
+title: "Mosaic-PL: Multi-Source Protein-Ligand Structure and Pose Prediction"
+type: software
+repository-code: "https://github.com/eightmm/CASP17"
+keywords:
+  - protein-ligand prediction
+  - molecular docking
+  - binding-site prediction
+  - CASP17
+authors:
+  - family-names: Sim
+    given-names: Jaemin
+  - family-names: Kim
+    given-names: Dongwoo
+  - family-names: Jang
+    given-names: Myunghyun
+  - family-names: Kim
+    given-names: Haelyn
+  - family-names: Hwang
+    given-names: Untaek
+  - family-names: Kim
+    given-names: MinJong
+  - family-names: Kim
+    given-names: Hobeom
+  - family-names: Byun
+    given-names: Junyoung
+  - family-names: Lee
+    given-names: Juyong

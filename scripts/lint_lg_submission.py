@@ -312,11 +312,40 @@ def _check_mdl_body(report: Report, mdl_lines: list[str], where: str) -> None:
 
 _SINGLE_MODEL_FILENAME_RE = re.compile(r"_([1-5])\.lg$", re.I)
 
+#: MODEL label groups for a two-conformation target (T2451). Group 2 ends in 0,
+#: so the sequence is not monotonic and cannot be checked with ``range()``.
+_CONFORMATION_LABELS = ((1, 2, 3, 4, 5), (6, 7, 8, 9, 0))
+
+
+def _numbering_ok(nums: list[int], allow_conformations: bool = False) -> bool:
+    """True when the MODEL numbers are a layout CASP accepts.
+
+    Default is the plain ``1..n`` with n <= 5. ``allow_conformations`` also
+    accepts conformation 1 as a prefix of ``1,2,3,4,5`` followed by
+    conformation 2 as a prefix of ``6,7,8,9,0``.
+
+    The second layout is opt-in on purpose: ``1,2,3,4,5,6`` is ambiguous — it
+    is either a one-MODEL conformation-2 group or a plain overflow past the
+    5-MODEL cap, and only the target page settles which. Defaulting to strict
+    keeps every ordinary target's overflow an error.
+    """
+    if len(nums) <= 5 and nums == list(range(1, len(nums) + 1)):
+        return True
+    if not allow_conformations:
+        return False
+    g1, g2 = _CONFORMATION_LABELS
+    for split in range(1, min(len(nums), len(g1)) + 1):
+        head, tail = nums[:split], nums[split:]
+        if head == list(g1[:split]) and tail == list(g2[:len(tail)]):
+            return True
+    return False
+
 
 def _check_cross_models(
     report: Report,
     blocks: list[tuple[int, int, list[str]]],
     file_path: Path | None = None,
+    allow_conformations: bool = False,
 ) -> None:
     if not blocks:
         report.err("MODEL/NONE", "no MODEL blocks found")
@@ -349,12 +378,22 @@ def _check_cross_models(
                 f"MODEL number {blocks[0][1]}",
             )
     else:
-        # Review file (multi-MODEL allowed up to 5).
-        if len(blocks) > 5:
-            report.err("MODEL/COUNT", f"more than 5 MODEL blocks ({len(blocks)})")
+        # Review file: normally 1..n with n <= 5. A target whose CASP page asks
+        # for two crystal conformations gets a second group — T2451: "submit
+        # models for conformation 1 as models 1-5, and those for conformation 2
+        # as 6,7,8,9,0". That layout is the only accepted way past 5 MODELs.
         nums = [n for _, n, _ in blocks]
-        if nums != list(range(1, len(nums) + 1)):
-            report.warn("MODEL/NUMBERING", f"MODEL numbers are {nums} (expected 1..{len(nums)})")
+        if not _numbering_ok(nums, allow_conformations):
+            if len(blocks) > 5:
+                report.err(
+                    "MODEL/COUNT",
+                    f"{len(blocks)} MODEL blocks numbered {nums} — over the "
+                    "5-MODEL cap and not the conformation layout "
+                    "(1..5 then 6,7,8,9,0)",
+                )
+            else:
+                report.warn("MODEL/NUMBERING",
+                            f"MODEL numbers are {nums} (expected 1..{len(nums)})")
 
     # Each MODEL must contain the same set of ligand_number values.
     ligand_sets = []
@@ -428,7 +467,7 @@ def _check_receptor(
 
 # ---------- driver ----------------------------------------------------------
 
-def lint(path: Path) -> Report:
+def lint(path: Path, conformations: int = 1) -> Report:
     report = Report(path=path)
     text = path.read_text()
     if "ENDMDL" in text:
@@ -440,7 +479,8 @@ def lint(path: Path) -> Report:
     for midx, mnum, body in blocks:
         n_lig = _check_model(report, midx, mnum, body)
         report.n_ligands_per_model.append(n_lig)
-    _check_cross_models(report, blocks, file_path=path)
+    _check_cross_models(report, blocks, file_path=path,
+                        allow_conformations=conformations >= 2)
     _check_receptor(report, blocks, target_id)
     return report
 
@@ -450,6 +490,10 @@ def main() -> int:
     parser.add_argument("paths", nargs="+", type=Path, help="LG file(s) to lint")
     parser.add_argument("--strict", action="store_true",
                         help="Treat WARN as ERROR (exit non-zero on any issue)")
+    parser.add_argument("--conformations", type=int, default=1, choices=[1, 2],
+                        help="2 accepts the multi-conformation MODEL layout "
+                             "(1-5 then 6,7,8,9,0) that a target page can request, "
+                             "e.g. T2451. Default 1 keeps the strict 5-MODEL cap.")
     args = parser.parse_args()
 
     n_errors = 0
@@ -459,7 +503,7 @@ def main() -> int:
             print(f"[ERROR] {p}: file not found", file=sys.stderr)
             n_errors += 1
             continue
-        report = lint(p)
+        report = lint(p, conformations=args.conformations)
         print(f"\n=== {p} ===")
         print(f"  MODELs: {report.n_models}")
         print(f"  ligands per MODEL: {report.n_ligands_per_model}")

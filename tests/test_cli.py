@@ -17,6 +17,7 @@ from casp17.orchestrator import (
     write_example_config,
 )
 from casp17.validation import validate_run
+from casp17.script_builder import build_sbatch_header
 
 
 def test_parser_has_status_command() -> None:
@@ -112,7 +113,9 @@ def test_write_example_config_populates_defaults(tmp_path: Path) -> None:
     assert config["alphafold3"]["num_diffusion_samples"] == 5
     assert config["vina"]["receptor_pdbqt"] == "/path/to/receptor.pdbqt"
     assert config["vina"]["size_x"] == 20.0
-    assert config["slurm"]["partition"] == "gpu"
+    assert config["slurm"]["partition"] == "6000ada"
+    assert config["slurm"]["qos"] == "normal"
+    assert "cpus_per_task" not in config["slurm"]
 
     fast_config_path = tmp_path / "runner_config.fast.yaml"
     write_example_config(fast_config_path, preset="fast")
@@ -120,6 +123,13 @@ def test_write_example_config_populates_defaults(tmp_path: Path) -> None:
     assert fast_config["preset"] == "fast"
     assert fast_config["boltz"]["max_parallel_samples"] == 8
     assert fast_config["alphafold3"]["num_recycles"] == 3
+
+
+def test_sbatch_header_uses_partition_defaults_for_cpus() -> None:
+    header = "\n".join(build_sbatch_header("test-job", RunnerConfig.from_dict({})))
+    assert "#SBATCH --partition=6000ada" in header
+    assert "#SBATCH --qos=normal" in header
+    assert "--cpus-per-task" not in header
 
 
 def test_prepare_template_search_sequence_stage(tmp_path: Path) -> None:
