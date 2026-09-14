@@ -4,10 +4,10 @@
 
 ## At A Glance
 
-- **Co-folding ensemble:** Boltz-2, Boltz-2x, Protenix, and AlphaFold 3.
+- **Co-folding ensemble:** Boltz-2, Protenix, and AlphaFold 3, with both unguided and potential-guided Boltz-2 sampling (the latter called Boltz-2x in this workflow).
 - **Template-guided pockets:** local RCSB sequence search (MMseqs2) and structure search (Foldseek) are unioned; bound-ligand centroids are transferred only after structural alignment and clustered into consensus pockets.
 - **Independent pose generation:** co-folded, P2Rank, SwinSite, and template-consensus pockets drive Vina and AutoDock-GPU tracks; MCS-guided ligand alignment is an additional, conditional track.
-- **Pose selection:** receptor-frame RMSD-Pred scoring (`LSCORE = 1 - P(RMSD > 2 A)`) selects up to five diverse models for CASP LG output.
+- **Pose selection:** receptor-frame RMSD-Pred scoring (`LSCORE = 1 - P(RMSD > 2 A)`) supplies the baseline ranking. Research and template pocket anchors, clash screening, and target-specific site/orientation coverage guide the final set of up to five CASP LG models.
 
 ## Quick Start
 
@@ -50,7 +50,7 @@ The repository also contains reproducible analysis and validation utilities for 
     ┌─────────────▼─────────────┐  ┌─────────────────────────────┐
     │  Stage 1a: Sequence Search │  │  Stage 1b: Structure Search │
     │  MMseqs2 (488k seqs DB)   │  │  Foldseek (251k struct DB)  │
-    │  → mmseqs_hits.tsv        │  │  query = best cofold cif    │
+    │  → mmseqs_hits.tsv        │  │  query = priority cofold CIF │
     └─────────────┬─────────────┘  │  → foldseek_hits.tsv        │
                   │                  └─────────────┬───────────────┘
                   │                                │
@@ -60,10 +60,10 @@ The repository also contains reproducible analysis and validation utilities for 
        │  Stage 1c: Template Bridges (auto, after both searches) │
        │  • Union filter — mmseqs ∪ foldseek by (pdb_id, chain)  │
        │    NO MCS gate. Tanimoto/MCS = metadata only.            │
-       │  • Pocket extraction — gemmi CA align template→cofold   │
+       │  • Pocket extraction — USalign template→cofold   │
        │    → bound-ligand centroids in cofold frame              │
        │  • Pocket clustering — single-link 5 Å, weighted by     │
-       │    (in_mmseqs + in_foldseek) + max(qtmscore, pident/100)│
+       │    search support + protein/ligand similarity│
        │    → top-K consensus centroids                           │
        └───────────────────────────┬────────────────────────────┘
                                    │
@@ -353,7 +353,7 @@ Run **both** sequence and structure searches to recover as many templates as pos
 - Output: `outputs/template_search_sequence/mmseqs_hits.tsv`
 
 **1b · Structure (Foldseek)** — `easy-search` against `data/search_dbs/structure/rcsb_structDB`
-- Query selection is automatic from co-folding output (`query_from_cofolding=true`, priority `[alphafold3, boltz, protenix]`).
+- Query selection uses the first available structure in sorted path order from the configured model priority (`query_from_cofolding=true`); it does not globally compare confidence scores across all structures.
 - Stage-dependency validation prevents structure search from running before co-folding.
 - `--max-seqs 500` prioritizes recall; unlike MMseqs2, Foldseek has no native identity/coverage cutoff here.
 - Output: `outputs/template_search_structure/foldseek_hits.tsv`
@@ -375,7 +375,7 @@ hits = filter_hits_with_ligands(
 Three steps run automatically:
 1. **Union filter** (`run_template_filter.py`): deduplicate the MMseqs2/Foldseek union and annotate ligands. There is **no MCS gate**. Foldseek `qtmscore` is an estimate and is not pre-filtered (default `qtmscore_min=0`); every hit proceeds to USalign for the actual TM-score decision.
 2. **Pocket extraction** (`extract_template_pockets.py`): structurally align the top `--max-templates 2000` hits (default) to the co-folded model with **USalign**. Drop hits below `--min-tmscore` (default 0.5, canonical same-fold). Write each bound candidate-ligand heavy-atom centroid to `template_pockets.json`. Typical runtime is **~17 min per target** (~0.5 s/template x 2000 measured with USalign).
-3. **Pocket clustering** (`cluster_template_pockets.py`): use **greedy first-match centroid** clustering. Each new pocket joins the first cluster within `--cutoff` A (default 5), or starts a new cluster. This is not single-link clustering; evidence-ordering at extraction makes stronger hits become cluster seeds. Weight is `(in_mmseqs + in_foldseek) + max(alignment_tmscore, qtmscore, pident/100)`. The top-K clusters (default 5; new-pipeline default 10) are written to `template_pocket_clusters.json`, and each centroid becomes a `template_consensus_N` binding-site source.
+3. **Pocket clustering** (`cluster_template_pockets.py`): filter transferred centroids by proximity to receptor atoms (default surface margin 10 A), then apply **hierarchical single-linkage clustering** at `--cutoff 5`. Cluster centroids are evidence-weighted means. Per-pocket weight is `(in_mmseqs + in_foldseek) + max(alignment_tmscore, qtmscore, pident/100) + max(best_tanimoto, best_mcs_coverage)`. The standard filter leaves MCS coverage at zero and computes MCS only for the selected ligand-alignment track. The top-K clusters (default 10) are written to `template_pocket_clusters.json` and become candidate `template_consensus_N` binding-site sources.
 
 **Threshold summary**:
 - **`extract_template_pockets --min-tmscore 0.5`**: the only quality gate, using the actual USalign TM-score.
@@ -555,7 +555,7 @@ python scripts/make_casp_submission.py \
   - Filter Boltz sources with `binder_prob < 0.5`
   - Median across each source → equal-weight average → `10^avg` = Kd (nM)
 
-**Best pose selection**: Pick pose with highest LSCORE (lowest RMSD-Pred prob > 2Å).
+**Pose selection**: LSCORE supplies the baseline ranking with a 2 A heavy-atom RMSD diversity threshold. The submission builder screens receptor clashes and, when research/template anchors are available, applies site coverage and ligand-size-dependent bonuses. Conditional orientation/site rules can promote candidates and change MODEL order; the final order is not necessarily descending raw LSCORE.
 
 **LG format output**:
 ```
@@ -667,7 +667,7 @@ experiments/runs/<target>/
 │           └── docking_prep_summary.json
 ├── outputs/
 │   ├── template_search_sequence/    # mmseqs_hits.tsv + filtered_hits.tsv (union)
-│   ├── template_search_structure/   # foldseek_hits.tsv (query=best cofold cif)
+│   ├── template_search_structure/   # foldseek_hits.tsv (query=priority cofold CIF)
 │   ├── template_pockets/            # per-instance pocket centers + top-K cluster centroids
 │   │   ├── template_pockets.json
 │   │   └── template_pocket_clusters.json

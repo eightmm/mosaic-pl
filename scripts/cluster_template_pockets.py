@@ -3,16 +3,17 @@
 
 After ``extract_template_pockets.py`` produces ``template_pockets.json`` (a
 flat list of bound-ligand centroids in the cofolding frame), this script
-runs greedy first-match clustering on the running weighted centroid and emits
-the top-K cluster centroids with evidence scores. Each centroid becomes a
+runs hierarchical single-linkage clustering and emits the top-K
+evidence-weighted cluster centroids with evidence scores. Each centroid becomes a
 ``template_consensus_N`` source in ``docking_prep_summary.binding_site_predictions``
 downstream.
 
 Pocket-point evidence weight:
 
-    w = (in_mmseqs + in_foldseek) + max(alignment_tmscore, pident/100)
+    w = (in_mmseqs + in_foldseek) + max(alignment_tmscore, qtmscore, pident/100)
+        + max(best_tanimoto, best_mcs_coverage)
 
-Range ≈ [0, 3]. Both-source hits + high structural/sequence similarity get
+Range ≈ [0, 4]. Search support, protein similarity, and ligand similarity give
 the highest weight. ``alignment_tmscore`` is USalign's actual TM-score
 from the pocket-extraction step (the real quantity, not foldseek's
 estimate); using it makes mmseqs-only hits — which have ``qtmscore=0``
@@ -23,7 +24,7 @@ Usage::
     python cluster_template_pockets.py \
         --pockets-json experiments/runs/<target>/outputs/template_pockets/template_pockets.json \
         --cutoff 5.0 \
-        --top-k 5
+        --top-k 10
 
 Output (next to input by default)::
 

@@ -19,7 +19,7 @@ flowchart TB
         B2["Boltz-2"] --- B2X["Boltz-2x"] --- PTX["Protenix"] --- AF3["AF3"]
     end
 
-    FS["1b. foldseek\nrcsb_structDB (251k structs)\nquery = best cofold cif\n→ foldseek_hits.tsv"]
+    FS["1b. foldseek\nrcsb_structDB (251k structs)\nquery = priority-selected cofold CIF\n→ foldseek_hits.tsv"]
 
     subgraph SB["Template bridges (auto)"]
         direction LR
@@ -42,7 +42,7 @@ flowchart TB
 
     INPUT --> MM
     INPUT --> S2
-    S2 -->|"best cofold cif"| FS
+    S2 -->|"priority-selected cofold CIF"| FS
     MM --> SB
     FS --> SB
     S2 --> AL
@@ -67,9 +67,9 @@ flowchart TB
 template-search-sequence (mmseqs)
   → co-folding (Boltz-2 → Boltz-2x → Protenix → AF3) with MSA cross-tool reuse
     └── bridge: AF3 unified MSA (jackhmmer + hmmsearch + templates) → Boltz / Protenix / AF3 모두 동일 a3m + cif 공유 (msa_pipeline.enabled=true)
-  → template-search-structure (foldseek, query = best cofold cif)
-    └── bridge: union filter → pocket extraction → pocket clustering
-  → bridge: align cofolding outputs (Kabsch to common frame) → *_aligned.cif
+  → template-search-structure (foldseek, query = priority-selected cofold CIF)
+  → bridge: align cofolding outputs to a common receptor frame → *_aligned.cif
+  → bridge: union filter → pocket extraction → pocket clustering
   → bridge: docking prep (≤3 cofold cluster + ≤6 predictor top-K + ≤10 template-consensus = 최대 19 binding-site sources)
   → docking (Track 1: Vina/ADG × ≤19 sources × 5 seeds; PxDock opt-in via `protenix_dock.enabled=true`)
   → multi-track docking (Track 2 + Track 3, conditional)
@@ -118,7 +118,7 @@ template-search-sequence (mmseqs)
 | Output | `outputs/template_search_sequence/mmseqs_hits.tsv` (14-col) |
 | Time | ~3 s |
 
-#### 1-2. foldseek structure search (query = best cofold cif)
+#### 1-2. foldseek structure search (query = priority-selected cofold CIF)
 
 | | |
 |---|---|
@@ -151,7 +151,7 @@ template-search-sequence (mmseqs)
 - **Chain-specific alignment** (`_extract_chain_pdb`): foldseek/mmseqs hit 은 `(pdb_id, chain_id)` 쌍으로 오고 `chain_id` 가 query fold 에 매칭된 protomer. multi-chain template 의 chain-mapping ambiguity 를 없애기 위해 host chain 의 polymer 원자만 단일-chain PDB 로 추출해 USalign reference 로 사용. PDB 포맷이 1-char chain id 만 허용하므로 추출 시 `"A"` 로 rename (`8qrt_CCC` 같은 multi-char asym id 도 동일하게 처리됨). 반환되는 R/t 는 그 protomer frame 으로 보장. Chain 이 CIF 에 없으면 (synthetic asym id, missing chain 등) whole-CIF alignment 로 fallback.
 - **Host-chain ligand 만 보존**: 정렬 후 ligand centroid 도 `lig.chain == host_chain` 인 것만 남김. 다른 protomer 의 ligand 는 다른 R/t 가 필요하므로 별도 hit row 로 들어옴. Host filter 가 모두 비우는 케이스 (single-chain CIF + synthetic asym id) 만 fallback 으로 ligand 전체 통과 — downstream cluster 단계의 surface-margin filter 가 잘못 transform 된 것을 정리.
 - **Output**: `outputs/template_pockets/template_pockets.json` (flat list — 한 row = 한 ligand-instance pocket point. homotetramer 는 4 record). 필드: `template_pdb_id, template_chain, ligand_ccd, ligand_chain, ligand_n_heavy, centroid_(x|y|z)` (cofold frame) `, alignment_tmscore, alignment_rmsd, in_mmseqs, in_foldseek, pident, qtmscore, best_tanimoto, best_mcs_coverage` + 최상단에 `reference_cif` (cluster 단계의 surface-margin filter 입력)
-- **Quality gate**: `--min-tmscore 0.4` (default). canonical 0.5 보다 약간 낮춰서 foldseek `qtmscore_min=0.5` 통과 hit 을 이중 penalise 하지 않음
+- **Quality gate**: `--min-tmscore 0.5` (default), using the reference-normalized USalign TM-score. Foldseek `qtmscore_min=0.0` is disabled by default; it is not a second quality gate.
 - **Default `--max-templates 2000`** — USalign 실측 ~0.5 s/template (300 aa 기준) × 2000 ≈ 17 min/타겟. foldseek `max_hits=2000` 와 매칭. 보통 단백질에서 TM ≥ 0.5 통과 template 50–300 개라 대부분은 게이트에서 reject — pool 확대해도 cluster 결과 안정적
 
 #### 1-5. Pocket clustering (top-K consensus)
@@ -165,11 +165,13 @@ template-search-sequence (mmseqs)
   - `struct_sim = max(alignment_tmscore, qtmscore, pident/100)` (0 ~ 1) — mmseqs-only hit 도 USalign actual TM 으로 평가됨
   - `lig_sim = max(best_tanimoto, best_mcs_coverage)` (0 ~ 1) — query SMILES 와 chemical similarity. Tanimoto 는 fingerprint global 유사도, MCS coverage (filter 가 0 으로 두므로 cluster 단계에선 사실상 Tanimoto 만) 는 scaffold 공유 — `max` 로 작은 fragment-MCS 와 큰 분자 Tanimoto 둘 다 펜로 당겨짐. Lig-sim 부스트의 의미: 동일 fold 라도 ligand 가 query 와 chemically 닮은 cluster 가 진짜 active site 일 가능성이 큼.
 - **Cluster centroid**: weighted mean (`Σ w·xyz / Σ w`, w=0 fallback 시 unweighted)
-- **Cluster `evidence_score`**: `Σ weight`. 정렬 후 top-K (`--top-k 5` default) 보존
+- **Cluster `evidence_score`**: `Σ weight`. 정렬 후 top-K (`--top-k 10` default) 보존
 - **Per-cluster metadata**: `n_members, n_unique_pdb, evidence_score, spread_angstrom, in_both_sources, in_mmseqs_only, in_foldseek_only, best_alignment_tmscore, best_qtmscore, best_pident, best_tanimoto, best_mcs_coverage, best_ligand_similarity`
 - **Output**: `outputs/template_pockets/template_pocket_clusters.json` — 다음 단계 (`prepare_docking_inputs.py`) 가 읽어 `template_consensus_{1..10}` binding-site source 를 등록
 
 ---
+
+For the current protein-ligand methods abstract and code-to-claim mapping, see [Implementation Audit](methods_implementation_audit.md). Final submission selection includes research/template anchors and conditional site/orientation coverage in addition to LSCORE ranking.
 
 ### Stage 2 — Co-folding
 
@@ -345,7 +347,7 @@ Stage 1-5 에서 만든 `template_pocket_clusters.json` 의 top-K cluster centro
   - **`source_status`** (commit `5fb2039`+) — observability 용 진단 블록. 어느 카테고리의 source 가 등록 0 이었는지 (silent skip 추적), `n_cofold_placements_total`, `cofold_min_members_floor`, `n_dropped_ligands_at_prep`, `dockable_chains_from_yaml` 모두 한 곳. RNA target 처럼 swinsite/p2rank 가 비어 있는 케이스 즉시 파악 가능
 
 > **Design rationale**:
-> 1. **Cofold clusters** — co-fold 25 seeds × 4 models 가 단일 frame 에서 어디에 ligand 를 놓는지가 가장 직접적 신호. 단일 best cifold centroid 만 쓰던 옛 design 은 multi-pocket / inter-model 불일치를 잡지 못함. `cluster_template_pockets.py` 와 동일 greedy first-match centroid 알고리즘을 재사용해 0 cost 에 가까운 확장.
+> 1. **Cofold clusters** — co-fold 25 seeds × 4 models 가 단일 frame 에서 어디에 ligand 를 놓는지가 가장 직접적 신호. 단일 best cifold centroid 만 쓰던 옛 design 은 multi-pocket / inter-model 불일치를 잡지 못함. Cofold centroids use greedy first-match clustering; template pockets use single-linkage clustering.
 > 2. **Template-consensus 가 backup** — 한 cofold cluster 가 잘못된 pocket 을 잡아도 (e.g. CASP16 L2001: 100 placements 가 모두 35 Å off — 같은 fold 의 모든 모델이 동일하게 빗나감) RCSB 의 실험적으로 검증된 binding pose 좌표가 독립 backup 으로 제공됨.
 
 ---

@@ -81,6 +81,7 @@ config/casp_slack_webhook.disabled_by_request
 PROJECT.md
 docs/status.md
 docs/CASP17_*_abstract_draft.docx
+docs/CASP17_*_abstract_draft.txt
 docs/figures/index.html
 experiments/backups/
 experiments/scorer_gpu_verify/
