@@ -239,44 +239,44 @@ srun --partition=6000ada --gres=gpu:1 \
 
 ## Batch (multi-target benchmark)
 
-499-target novel2025 식 benchmark 를 돌릴 때의 **공식 워크플로**. 단일-타깃은 위의 Quick Start 로 충분, 이하는 N≥수십 타깃 batch 전용.
+The **standard workflow** for the 499-target Novel2025 benchmark. The Quick Start above is sufficient for a single target; the following steps are intended for batches of tens or more targets.
 
 ```
-[입력 yaml 일괄 생성] → [wrapper array dispatch] → [pose-pool 분석] → [LG 평가]
+[bulk YAML generation] → [wrapper array dispatch] → [pose-pool analysis] → [LG evaluation]
 ```
 
-### 1. 입력 yaml 일괄 생성
+### 1. Generate input YAML files in bulk
 
 ```bash
-# experiments/novel2025_test/pipeline/*.yaml  생성 (RCSB 또는 SMILES 리스트에서)
+# Generate experiments/novel2025_test/pipeline/*.yaml from RCSB or a SMILES list.
 .venv/bin/python experiments/novel2025_test/build_inputs.py \
     --rcsb-index ~/DB/RCSB/processed/rcsb_index.db \
     --output-dir experiments/novel2025_test/pipeline/ \
     --max-deposition-date 2025-01-01
 
-# 또는 직접: cluster_targets_100.csv 의 target 리스트 기반
-# 499 타깃 = mmseqs easy-cluster 100% → 246 unique enzyme. headline SR 은
-# cluster_rep_only 또는 per-target 둘 다 보고. (novel2025_batch_location memory 참조)
+# Alternatively, build directly from the target list in cluster_targets_100.csv.
+# The 499 targets correspond to 246 unique enzymes after 100% MMseqs easy-cluster.
+# Report headline SR for both cluster_rep_only and per-target views.
 ```
 
 ### 2. Wrapper array dispatch (SLURM)
 
-`run_wrapper.sbatch.sh` 가 타깃마다 자동 생성됨. 일괄 sbatch:
+`run_wrapper.sbatch.sh` is generated automatically for each target. Submit the batch as follows:
 
 ```bash
-# 단일 타깃당 sbatch (개별 GPU 잡)
+# One sbatch submission per target (individual GPU jobs).
 for t in $(ls experiments/novel2025_runs/runs); do
     sbatch experiments/novel2025_runs/runs/$t/$t/scripts/run_wrapper.sbatch.sh
 done
 
-# 또는 template→docking 만 다시 (cofold 살아 있을 때):
+# Or rerun only template search through docking when co-folded structures are available:
 sbatch --array=0-498%16 experiments/novel2025_test/rerun_template_to_dock.sbatch.sh
 ```
 
-### 3. Pose-pool 분석 (Oracle SR + per-scorer SR)
+### 3. Analyze the pose pool (oracle SR and per-scorer SR)
 
 ```bash
-# Per-pose true RMSD 계산 + 모든 scorer top-1/top-5 집계
+# Compute per-pose true RMSD and aggregate top-1/top-5 results for every scorer.
 .venv/bin/python experiments/novel2025_test/score_per_metric.py \
     --submissions-dir experiments/novel2025_runs/submissions \
     --runs-dir experiments/novel2025_runs/runs \
@@ -284,59 +284,59 @@ sbatch --array=0-498%16 experiments/novel2025_test/rerun_template_to_dock.sbatch
     --work-dir experiments/novel2025_runs/_per_metric_work
 ```
 
-출력:
-- `per_pose_scores.csv` — 한 행 = 한 pose × 모든 score (~1.3 M rows for 499 타깃)
-- `per_metric_summary.txt` — scorer 별 (`rmsd_pred / lscore / iptm / ptm / plddt / conf / boltz_aff / ba_pred / oracle`) top-1/top-5 SR by zone
+Outputs:
+- `per_pose_scores.csv`: one row per pose with every score (~1.3 M rows for 499 targets).
+- `per_metric_summary.txt`: per-scorer (`rmsd_pred / lscore / iptm / ptm / plddt / conf / boltz_aff / ba_pred / oracle`) top-1/top-5 SR by zone.
 
-**Oracle SR 4가지 카운팅** (멀티-cofactor 타깃 처리):
-- `ANY-ligand`: 타깃당 모든 ligand 풀에서 best → cofactor 인플레이션 됨, **부적합**
-- `ALL-ligand`: 타깃의 모든 ligand 가 sub-2Å 일 때만 hit (가장 엄격)
-- `PRIMARY '_L' only`: L (관심 ligand) 만 평가 — CASP-comparable, **권장 헤드라인**
-- `PER-(target, ligand)`: 각 (target, lig_id) 한 행 — PoseBusters/PLINDER 식
+**Four oracle-SR definitions** for multi-cofactor targets:
+- `ANY-ligand`: the best result across all ligand pools for a target; inflated by cofactors and **not appropriate**.
+- `ALL-ligand`: a hit only when every ligand in the target is below 2 A; the strictest definition.
+- `PRIMARY '_L' only`: evaluate only L, the ligand of interest; CASP-comparable and the **recommended headline metric**.
+- `PER-(target, ligand)`: one row per `(target, lig_id)` pair, following PoseBusters/PLINDER-style evaluation.
 
-**중요**: `score_per_metric.py` 의 `pose_rmsd` 는 `rdMolAlign.CalcRMS` 사용. **`GetBestRMS` 금지** (ligand 를 내부 Kabsch 로 재정렬해 pocket placement 오류 숨김). 자세한 규칙은 `docs/per_pose_rmsd_method.md` 의 ⚠ 블록.
+**Important:** `score_per_metric.py` uses `rdMolAlign.CalcRMS` for `pose_rmsd`. Do **not** use `GetBestRMS`, which internally realigns the ligand with Kabsch and can conceal pocket-placement errors. See the warning block in `docs/per_pose_rmsd_method.md` for the full rule.
 
-**멀티-ligand-aware ref 매칭** (`evaluate_run`): pose 이름 suffix `_L`/`_L2`/`_L3` 으로 prep ligand 매칭 → SMILES canonical → candidate_ccd 선택. FAD+NAP+cofactor 같은 타깃에서 wrong-ref MCS fallback hang 을 막음.
+**Multi-ligand-aware reference matching** (`evaluate_run`): map `_L`/`_L2`/`_L3` pose-name suffixes to prepared ligands, canonicalize SMILES, then select the candidate CCD. This prevents wrong-reference MCS fallback hangs in targets with FAD, NAP, or other cofactors.
 
-### 4. LG submission 평가 (MODEL 1 / MODEL 1-5 SR)
+### 4. Evaluate the LG submission (MODEL 1 and MODEL 1-5 SR)
 
 ```bash
-# 1) LG 재생성 (도킹 결과 새로 반영)
+# 1) Regenerate LG files with updated docking results.
 sbatch --array=0-498%16 experiments/novel2025_runs/regen_lg.sbatch.sh
 
-# 2) Crystal vs LG MODEL 비교 — top1<2Å / best5<2Å SR (by zone)
+# 2) Compare crystal and LG MODEL results: top-1 <2 A / best-of-5 <2 A SR by zone.
 .venv/bin/python experiments/novel2025_test/evaluate.py \
     --submissions-dir experiments/novel2025_runs/submissions \
     --output-json experiments/novel2025_runs/evaluation.json
 ```
 
-`evaluate.py` 는 각 `*.lg` 의 MODEL 1..5 를 crystal ligand 와 비교 → JSON + stdout summary 출력.
+`evaluate.py` compares MODEL 1..5 in every `*.lg` file with the crystal ligand and writes a JSON result plus a standard-output summary.
 
-### 5. Frame consistency 감사 (배치 QA)
+### 5. Audit frame consistency (batch QA)
 
-도킹된 모든 pose 가 단백질 receptor frame 에 정렬되어 있는지 검증:
+Verify that every docked pose is aligned to the protein receptor frame:
 
 ```bash
-# 전체 batch 한 번에 (수십초)
+# Run once for the complete batch (tens of seconds).
 .venv/bin/python scripts/check_frame_consistency.py \
     --runs-dir experiments/novel2025_runs/runs \
     --output-tsv /tmp/frame_check.tsv
 
-# random 50 sample 으로 자세한 진단 (receptor↔cofold, cofold pair, family centroid)
+# Detailed diagnosis on a random sample of 50 (receptor-to-cofold, cofold pairs, and family centroids).
 .venv/bin/python scripts/audit_frame_50.py \
     --runs-dir experiments/novel2025_runs/runs --n 50
 ```
 
-발견되는 issue class:
-- `A: cofold ref unaligned` — prep 가 `*_aligned.cif` 가 아닌 raw cif 받음 (5/4 fix `018b78f` 후 0이어야 정상)
-- `B: binding-site source > rec_extent+30 Å` — frame 버그 시그니처
-- `D: cofolding_1 ↔ template_consensus_1 > 30 Å` — cross-source mismatch hint (실제 multi-pocket 일 수도)
-- `E: alignment rmsd_after > 5 Å` — cofold conformational divergence (frame 버그 아님)
+Issue classes:
+- `A: cofold ref unaligned`: preparation received a raw CIF rather than `*_aligned.cif`; this should be zero after fix `018b78f`.
+- `B: binding-site source > rec_extent+30 A`: signature of a frame bug.
+- `D: cofolding_1 <-> template_consensus_1 > 30 A`: cross-source mismatch signal that may also indicate true multi-pocket behavior.
+- `E: alignment rmsd_after > 5 A`: co-folded conformational divergence, not a frame bug.
 
-### 6. Batch 분석 보고서 생성
+### 6. Generate the batch analysis report
 
 ```bash
-# Cluster-level + zone-level SR 표 + Markdown 보고서
+# Generate cluster-level and zone-level SR tables plus a Markdown report.
 .venv/bin/python scripts/generate_novel2025_report.py \
     --per-pose-csv experiments/novel2025_runs/per_pose_scores.csv \
     --cluster-csv experiments/novel2025_test/cluster_targets_100.csv \
@@ -347,15 +347,15 @@ sbatch --array=0-498%16 experiments/novel2025_runs/regen_lg.sbatch.sh
 
 ### Stage 1: Template Search (Union — sequence + structure)
 
-서열 검색과 구조 검색을 **둘 다 돌려서** 최대한 많은 template 을 모은다. MCS/Tanimoto 는 metadata 로만 보존 — gating 은 lig-MCS-align (Track 3) 에서만.
+Run **both** sequence and structure searches to recover as many templates as possible. MCS/Tanimoto values are retained only as metadata; gating is applied only in lig-MCS-align (Track 3).
 
 **1a · Sequence (MMseqs2)** — `easy-search` against `data/search_dbs/sequence/rcsb_seqDB`
 - Output: `outputs/template_search_sequence/mmseqs_hits.tsv`
 
 **1b · Structure (Foldseek)** — `easy-search` against `data/search_dbs/structure/rcsb_structDB`
-- Query 자동 선택: cofolding 결과 (`query_from_cofolding=true`, priority `[alphafold3, boltz, protenix]`)
-- Stage 의존성 검증이 cofold 보다 먼저 도는 순서를 자동 차단
-- `--max-seqs 500` (recall 우선 — mmseqs 와 달리 native 한 identity/coverage cut 없음)
+- Query selection is automatic from co-folding output (`query_from_cofolding=true`, priority `[alphafold3, boltz, protenix]`).
+- Stage-dependency validation prevents structure search from running before co-folding.
+- `--max-seqs 500` prioritizes recall; unlike MMseqs2, Foldseek has no native identity/coverage cutoff here.
 - Output: `outputs/template_search_structure/foldseek_hits.tsv`
 
 **1c · Template bridges (auto, after both searches)**
@@ -372,15 +372,15 @@ hits = filter_hits_with_ligands(
 # Sort key: evidence_breadth (2 sources > 1) > qtmscore > pident > n_ligands > tanimoto > mcs
 ```
 
-3 단계로 자동 실행:
-1. **Union filter** (`run_template_filter.py`) — mmseqs ∪ foldseek dedup, ligand annotation. **MCS 게이트 없음**. foldseek 의 qtmscore 는 estimate 라 pre-filter 안 함 (default `qtmscore_min=0`); 모든 hit 이 다음 단계로 흘러가 USalign 이 진짜 TM 으로 결정.
-2. **Pocket extraction** (`extract_template_pockets.py`) — top `--max-templates 2000` (default) hit 을 **USalign** 으로 cofold model 에 align (structure-based). actual TM-score < `--min-tmscore` (default 0.5 = canonical same-fold) 면 drop. bound candidate ligand heavy-atom centroid → `template_pockets.json`. **~17 min/타겟** (USalign 실측 ~0.5 s/template × 2000).
-3. **Pocket clustering** (`cluster_template_pockets.py`) — **greedy first-match centroid** clustering (각 새 pocket 이 `--cutoff` Å (default 5) 안 최초 cluster 에 합류, 없으면 새 cluster 시작). Single-link 아님 — order-sensitive 라 extract 단계에서 evidence 로 사전 정렬해서 strong hit 이 cluster seed 가 되게 함. weight = `(in_mmseqs + in_foldseek) + max(alignment_tmscore, qtmscore, pident/100)`. Top-K (default 5; 새 파이프라인 default 10) → `template_pocket_clusters.json`. 각 cluster centroid 가 다음 단계에서 `template_consensus_N` binding-site source 로 등록됨.
+Three steps run automatically:
+1. **Union filter** (`run_template_filter.py`): deduplicate the MMseqs2/Foldseek union and annotate ligands. There is **no MCS gate**. Foldseek `qtmscore` is an estimate and is not pre-filtered (default `qtmscore_min=0`); every hit proceeds to USalign for the actual TM-score decision.
+2. **Pocket extraction** (`extract_template_pockets.py`): structurally align the top `--max-templates 2000` hits (default) to the co-folded model with **USalign**. Drop hits below `--min-tmscore` (default 0.5, canonical same-fold). Write each bound candidate-ligand heavy-atom centroid to `template_pockets.json`. Typical runtime is **~17 min per target** (~0.5 s/template x 2000 measured with USalign).
+3. **Pocket clustering** (`cluster_template_pockets.py`): use **greedy first-match centroid** clustering. Each new pocket joins the first cluster within `--cutoff` A (default 5), or starts a new cluster. This is not single-link clustering; evidence-ordering at extraction makes stronger hits become cluster seeds. Weight is `(in_mmseqs + in_foldseek) + max(alignment_tmscore, qtmscore, pident/100)`. The top-K clusters (default 5; new-pipeline default 10) are written to `template_pocket_clusters.json`, and each centroid becomes a `template_consensus_N` binding-site source.
 
-**Threshold 정리**:
-- **`extract_template_pockets --min-tmscore 0.5`** — 유일한 quality gate (USalign 의 actual TM)
-- `template_search_sequence.mcs_threshold` (default `0.5`) — **Track 3 (lig-align) 만** gating
-- `template_search_structure.qtmscore_min` (default `0.0`) — disabled; cosmetic 용
+**Threshold summary**:
+- **`extract_template_pockets --min-tmscore 0.5`**: the only quality gate, using the actual USalign TM-score.
+- `template_search_sequence.mcs_threshold` (default `0.5`): gates **only Track 3 (lig-align)**.
+- `template_search_structure.qtmscore_min` (default `0.0`): disabled; retained for display only.
 
 ### Stage 2: Co-folding
 
@@ -411,7 +411,7 @@ Measured on RTX 6000 Ada with `cofolding_seeds=[42,101,202,303,404]`, `diffusion
 
 ### Stage 3: (deprecated) Cross-model Foldseek consensus
 
-이전 버전의 cross-model consensus 는 Stage 1b (foldseek easy-search, query=best cofold cif) + Stage 1c (mmseqs ∪ foldseek union filter) 가 대체. 자세한 내용은 위의 Stage 1 참조.
+The previous cross-model consensus was superseded by Stage 1b (Foldseek easy-search with the best co-folded CIF as query) and Stage 1c (the MMseqs2/Foldseek union filter). See Stage 1 above for details.
 
 ### Stage 4: Docking Preparation (Automatic Bridge)
 
@@ -428,18 +428,18 @@ Runs automatically between cofolding and docking in the wrapper pipeline.
 | SDF → PDBQT | meeko | `ligand_L.pdbqt` |
 | Binding site sources | up to 19 (cofolding_{1..3} + p2rank_{1..3} + swinsite_{1..3} + template_consensus_{1..10}) | `binding_site_predictions` dict in summary JSON |
 
-**Binding site sources** (각각 독립 docking variant 로 fan-out — winner-take-all 아님):
+**Binding-site sources** fan out into independent docking variants; they are not winner-take-all:
 
-1. **Cofolding centroids 1..3** — `compute_submission_scores` 가 cofold 모델 pose cluster 의 top-3 centroid (4d3ee27)
-2. **P2Rank 1..3** — surface geometry pocket predictor, top-3 pocket (Java, 6e58e01)
-3. **SwinSite 1..3** — Swin-Unet ML pocket predictor, top-3 (`.venvs/pred`, 6e58e01)
-4. **template_consensus_1..10** — `cluster_template_pockets.py` 가 만든 top-K (default 10) cluster centroid (mmseqs+foldseek union template 의 bound-ligand 위치 합의)
+1. **Cofolding centroids 1..3**: the top three centroids from co-folded-model pose clusters, computed by `compute_submission_scores` (`4d3ee27`).
+2. **P2Rank 1..3**: the top three pockets from the surface-geometry predictor (Java, `6e58e01`).
+3. **SwinSite 1..3**: the top three pockets from the Swin-Unet ML predictor (`.venvs/pred`, `6e58e01`).
+4. **template_consensus_1..10**: top-K cluster centroids (default 10) produced by `cluster_template_pockets.py` from consensus bound-ligand positions across the MMseqs2/Foldseek template union.
 
-소스 수는 타깃마다 다름: P2Rank/SwinSite 가 1개 pocket 만 찾으면 그 source 는 1개, template hit 없으면 `template_consensus_*` 는 0개. 일부 variant 는 `bs_preds.get(BOX_SOURCE) → None` 일 때 `sys.exit(0)` 으로 clean skip.
+The source count varies by target: a P2Rank or SwinSite source has one variant when it finds one pocket, and `template_consensus_*` has none when no template hit is available. Variants cleanly skip with `sys.exit(0)` when `bs_preds.get(BOX_SOURCE)` is `None`.
 
-**Bridge 순서 (5/4 `018b78f` 이후 고정)**: `align_cofolding_outputs → _emit_template_bridges → prepare_docking_inputs`. 이전엔 align 이 마지막에 돌아서 `template_consensus_*` centroid 가 unaligned frame 에 박혔던 회귀 있었음 — 다시는 그 순서로 가지 말 것.
+**Fixed bridge order since `018b78f` (May 4):** `align_cofolding_outputs → _emit_template_bridges → prepare_docking_inputs`. Running alignment last previously placed `template_consensus_*` centroids in an unaligned frame. Do not change this order.
 
-**Fallback box pick** (`box_method` — protenix-dock 같은 단일-box 도구가 사용): `cofolding > strong consensus (n_unique_pdb ≥ 2) > swinsite > p2rank > weak consensus`.
+**Fallback box selection** (`box_method`, used by single-box tools such as Protenix-Dock): `cofolding > strong consensus (n_unique_pdb >= 2) > swinsite > p2rank > weak consensus`.
 
 **Unified box**: 22.5 Å × 22.5 Å × 22.5 Å, grid spacing 0.375 Å.
 
@@ -449,19 +449,19 @@ Runs automatically between cofolding and docking in the wrapper pipeline.
 
 #### Track 1 (always): Cofolding-based docking — **per-source fan-out**
 
-각 binding-site source 마다 vina/adg variant 를 별도로 돌림. 한 source 가 pocket 을 못 찾으면 (e.g. P2Rank/SwinSite 가 1개만 찾음, template hit 없는 타겟의 `template_consensus_*`) 해당 variant 만 `sys.exit(0)` 으로 clean skip. PxDock 는 `b7dd9d5` 이후 default OFF (`protenix_dock.enabled: false`); 그 자리는 evidence 가 강한 cluster 에 한해 비활성.
+Run a separate Vina/ADG variant for each binding-site source. If a source has no pocket (for example, P2Rank/SwinSite has only one result or a target has no `template_consensus_*` hit), only that variant cleanly exits with `sys.exit(0)`. PxDock is disabled by default since `b7dd9d5` (`protenix_dock.enabled: false`) and is enabled only for high-evidence clusters.
 
-| Tool | Variant 수 | Type | Output |
-|------|-----------|------|--------|
+| Tool | Variants | Type | Output |
+|------|----------|------|--------|
 | **Vina** | up to 19 (`vina_{cofolding_{1..3},p2rank_{1..3},swinsite_{1..3},template_consensus_{1..10}}`) | Python API CPU | `outputs/{variant}/seed_<seed>/ligand_<lid>/docked.pdbqt` |
-| **AutoDock-GPU** | up to 19 (same 19 sources) | CUDA GPU | `outputs/{variant}/seed_<seed>/ligand_<lid>/docking.dlg` |
-| **Protenix-Dock** | OFF by default | CPU force field | (활성화 시: `outputs/protenix_dock/poses_<lid>.sdf`) |
+| **AutoDock-GPU** | up to 19 (the same 19 sources) | CUDA GPU | `outputs/{variant}/seed_<seed>/ligand_<lid>/docking.dlg` |
+| **Protenix-Dock** | Disabled by default | CPU force field | When enabled: `outputs/protenix_dock/poses_<lid>.sdf` |
 
-ADG wrapper 는 추가로 **런타임에 ligand pdbqt 를 파싱**해서 `ligand_types` / grid map 을 동적 구성 — F/Cl/Br/P/I/Si 등 비표준 원자 타입도 자동 대응. 모든 도구는 `docking_prep_summary.json` 에서 receptor/ligand/box 를 runtime 에 읽음.
+The ADG wrapper also parses each ligand PDBQT **at runtime** to construct `ligand_types` and grid maps dynamically, including nonstandard atom types such as F, Cl, Br, P, I, and Si. Every tool reads receptor, ligand, and box information from `docking_prep_summary.json` at runtime.
 
 #### Track 2 (any template, **no MCS gate**): Template-based Box Docking
 
-Template ligand 가 query 와 닮을 필요 없음 — pocket geometry 만 빌리는 것이 목적. `filtered_hits.tsv` 에서 `num_ligands > 0` 인 상위 3 template (sort key 가 evidence_breadth × similarity 이라 both-source / 높은 qtm 우선).
+A template ligand need not resemble the query; this track transfers only pocket geometry. It uses the top three templates in `filtered_hits.tsv` with `num_ligands > 0`, prioritizing broader evidence and higher similarity (both-source/high-QTM hits first).
 
 | Step | Script | Output |
 |------|--------|--------|
@@ -763,21 +763,21 @@ Full run artifacts + slurm logs are preserved under `experiments/runs/archive/20
 
 ## Known Issues / Recent Fixes (2026-05)
 
-이 batch (`experiments/novel2025_runs/` 499-target novel2025) 에서 발견·수정한 버그. 다시 회귀하지 않게 박아둠.
+The following bugs were found and fixed in the 499-target Novel2025 batch (`experiments/novel2025_runs/`). They are documented to prevent regression.
 
-| 일자 | 위치 | 증상 | 수정 |
+| Date | Location | Symptom | Fix |
 |---|---|---|---|
-| 2026-05-04 (`018b78f`) | `src/casp17/script_builder.py` 브릿지 순서 | `_emit_template_bridges` 가 `align_cofolding_outputs` 이전에 fire → `extract_template_pockets` 가 unaligned cif 사용 → `template_consensus_*` centroid 가 wrong frame. 217/462 타깃의 ADG TC variant 사실상 0 pose 생성. | 순서 `align → template-bridges → docking-prep` 로 고정. fallback warning 3곳 추가. `scripts/check_frame_consistency.py` 로 회귀 감시. **다시는 이 순서 바꾸지 말 것.** |
-| 2026-05-11 | `scripts/prepare_docking_inputs.py:1153` | `args.output_dir` 가 상대경로로 들어오면 `docking_prep_summary.json` 의 `receptor_pdbqt` 도 상대경로로 저장 → ADG runner 가 `cwd=lig_grid_dir` 에서 autogrid 호출 시 receptor.pdbqt 못 찾음 → `template_consensus_*` 변종 silent fail (try/except 가 에러 잡아서 "ok" 출력). | `args.output_dir = args.output_dir.resolve()` 강제 절대화. adapter ADG runner template 도 `Path(receptor).resolve()` 안전망. autogrid 에러 발생 시 stderr + `FAILED` 마커. |
-| 2026-05-11 | `src/casp17/geometry.py:pose_rmsd` | `GetSubstructMatches(uniquify=False)` 자체 enumeration 이 symmetric ligand 에서 hang. SIGALRM 180s 가 RDKit C-extension 안에선 안 먹힘. score job 12h timeout. | `rdMolAlign.CalcRMS` 로 교체 (symmetric-aware, no alignment, C++ permutation cap 내장). `docs/per_pose_rmsd_method.md` 에 ⚠ 규칙: `GetBestRMS` 금지 + `GetSubstructMatches(uniquify=False)` 금지. |
-| 2026-05-12 | `experiments/novel2025_test/score_per_metric.py:evaluate_run` | `candidate_ccd_codes[0]` 한 개만 ref_lig 로 로드 → 멀티-cofactor 타깃 (FAD+NAP, B12+ligand 등) 의 L2/L3 pose 가 wrong ref 와 비교 → atom-count mismatch → `_mcs_rmsd` fallback 의 `FindMCS` 가 30s timeout 만료 후 통과 → 1000 pose × 31s = 8h+ 또는 hang. | prep['ligands'] 의 SMILES 로 candidate_ccd canonical 매칭 → `lig_id_to_ref` 맵. pose source `_L`/`_L2` suffix 로 ref 선택. 8z15 (FAD+NAP+A1D7V) 검증: hang → 223s 완료. |
+| 2026-05-04 (`018b78f`) | `src/casp17/script_builder.py` bridge order | `_emit_template_bridges` ran before `align_cofolding_outputs`, so `extract_template_pockets` used an unaligned CIF and placed `template_consensus_*` centroids in the wrong frame. ADG template-consensus variants produced effectively zero poses for 217/462 targets. | Fixed the order as `align -> template-bridges -> docking-prep`, added three fallback warnings, and monitor it with `scripts/check_frame_consistency.py`. **Do not change this order.** |
+| 2026-05-11 | `scripts/prepare_docking_inputs.py:1153` | A relative `args.output_dir` wrote a relative `receptor_pdbqt` to `docking_prep_summary.json`; the ADG runner then could not find it when calling AutoGrid with `cwd=lig_grid_dir`. Template-consensus variants failed silently because the exception handler printed "ok". | Force `args.output_dir = args.output_dir.resolve()`, add `Path(receptor).resolve()` as an ADG-runner safeguard, and emit stderr plus a `FAILED` marker on AutoGrid errors. |
+| 2026-05-11 | `src/casp17/geometry.py:pose_rmsd` | `GetSubstructMatches(uniquify=False)` enumeration hung on symmetric ligands. SIGALRM could not interrupt the RDKit C extension, causing 12-hour score-job timeouts. | Replaced it with `rdMolAlign.CalcRMS` (symmetry-aware, no alignment, C++ permutation cap). `docs/per_pose_rmsd_method.md` prohibits `GetBestRMS` and `GetSubstructMatches(uniquify=False)`. |
+| 2026-05-12 | `experiments/novel2025_test/score_per_metric.py:evaluate_run` | Loading only `candidate_ccd_codes[0]` as `ref_lig` compared L2/L3 poses against the wrong reference in multi-cofactor targets, causing atom-count mismatches and 30-second `FindMCS` fallback timeouts per pose. | Canonically match candidate CCDs to prepared-ligand SMILES, build a `lig_id_to_ref` map, and select references from `_L`/`_L2` suffixes. Validation on 8z15 (FAD+NAP+A1D7V) changed a hang to 223-second completion. |
 
-### 아직 미해결
+### Remaining issues
 
-- **AD4 cofactor atom type** (`c65797b` 의 후유): receptor.pdbqt 에 metal/cofactor 원자 (CG, Co, Hg, K, Na, Ni) 가 보존되는데 autogrid4 force-field 매핑 테이블에 없는 type → "Unknown receptor type" 에러 → 그 타깃의 모든 ADG variant silent fail. 약 13% (71/534 slurm err) 타깃 영향. 수정 방안 후보:
-  - prep 에서 unknown atom 만 strip (받 docking 비대응 cofactor 만)
-  - autogrid 파라미터 테이블 보강 (Pro-tip: `~/.autodock/AD4_parameters.dat` 같은 user-level 매핑)
-- **Score per-target 180s timeout**: 매우 큰 cofactor (FAD/COA/B12/long-chain fatty-acid/거대 sugar) 가 들어간 타깃에서 여전히 hit. 9개 타깃 (`9dsv 9emt 9ifw 9mgt 9mh5 9n1b 9uo2 9vjx 9zno`) 은 timeout 1800s 로 따로 재실행 필요.
+- **AD4 cofactor atom types** (from `c65797b`): `receptor.pdbqt` retains metal/cofactor atoms (CG, Co, Hg, K, Na, Ni) that are not present in the AutoGrid4 force-field mapping table. This produces "Unknown receptor type" errors and silently fails all ADG variants for affected targets, approximately 13% (71/534 Slurm errors). Candidate fixes:
+  - Strip only unknown, docking-unsupported cofactor atoms during preparation.
+  - Extend the AutoGrid parameter table, for example with a user-level mapping in `~/.autodock/AD4_parameters.dat`.
+- **Per-target scoring 180-second timeout:** this still occurs for very large cofactors (FAD, COA, B12, long-chain fatty acids, and large sugars). The nine affected targets (`9dsv 9emt 9ifw 9mgt 9mh5 9n1b 9uo2 9vjx 9zno`) need a separate rerun with a 1800-second timeout.
 
 ## Development
 
