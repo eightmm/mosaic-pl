@@ -133,14 +133,14 @@ uv pip install --python .venvs/boltz/bin/python cuequivariance-torch cuequivaria
 ok "Boltz2 installed"
 
 # ---------------------------------------------------------------------------
-# [2/5] Protenix (v1.0.0 checkpoint)
+# [2/5] Protenix
 # ---------------------------------------------------------------------------
-banner "[2/5] Installing Protenix (v1.0.0 checkpoint)"
+banner "[2/5] Installing Protenix"
 
 uv pip install --python .venvs/protenix/bin/python -e external/Protenix
 uv pip install --python .venvs/protenix/bin/python ninja
 uv pip install --python .venvs/protenix/bin/python cuequivariance-torch cuequivariance-ops-torch-cu12
-ok "Protenix installed with the v1.0.0 checkpoint"
+ok "Protenix installed"
 
 # ---------------------------------------------------------------------------
 # [3/5] AlphaFold3
@@ -288,7 +288,7 @@ banner "Installation Complete"
 cat <<'EOF'
   Installed:
     • Boltz2           (.venvs/boltz)
-    • Protenix (v1.0.0 checkpoint) (.venvs/protenix)
+    • Protenix (.venvs/protenix)
     • AlphaFold3       (.venvs/alphafold3)
     • Protenix-Dock    (.venvs/protenix-dock)
     • Vina             (.venvs/protenix-dock)
