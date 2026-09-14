@@ -12,8 +12,8 @@
 ## Quick Start
 
 ```bash
-git clone https://github.com/eightmm/CASP17.git
-cd CASP17
+git clone https://github.com/eightmm/mosaic-pl.git
+cd mosaic-pl
 uv sync
 
 # Validate a supplied YAML and prepare the Slurm workflow.
@@ -161,7 +161,7 @@ sudo apt-get install -y libboost-all-dev autoconf automake libtool
 ### Installation
 
 ```bash
-git clone https://github.com/eightmm/CASP17.git CASP17 && cd CASP17
+git clone https://github.com/eightmm/mosaic-pl.git mosaic-pl && cd mosaic-pl
 bash scripts/install_external_models.sh              # all tools + models
 srun --partition=6000ada --gres=gpu:1 bash scripts/build_autodock_gpu.sh  # GPU build
 bash scripts/install_external_models.sh --verify      # verify all

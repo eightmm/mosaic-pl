@@ -2,7 +2,7 @@ cff-version: 1.2.0
 message: "If you use Mosaic-PL, please cite this software."
 title: "Mosaic-PL: Multi-Source Protein-Ligand Structure and Pose Prediction"
 type: software
-repository-code: "https://github.com/eightmm/CASP17"
+repository-code: "https://github.com/eightmm/mosaic-pl"
 keywords:
   - protein-ligand prediction
   - molecular docking
