@@ -1,6 +1,6 @@
-# Mosaic-PL
+# Mosaic-PL for CASP17
 
-**Mosaic-PL** is LCDD's multi-source workflow for CASP17 protein-ligand structure and pose prediction. It preserves complementary hypotheses from co-folding, template transfer, binding-site prediction, and multi-track docking, then ranks diverse poses with RMSD-Pred. LCDD remains the CASP group name.
+**Mosaic-PL** is LCDD's CASP17 protein-ligand prediction method. Its multi-source workflow preserves complementary hypotheses from co-folding, template transfer, binding-site prediction, and multi-track docking, then ranks diverse poses with RMSD-Pred. LCDD remains the CASP group name.
 
 ## At A Glance
 
