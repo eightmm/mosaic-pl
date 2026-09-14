@@ -4,7 +4,7 @@
 
 ## At A Glance
 
-- **Co-folding ensemble:** Boltz-2, Boltz-2x, Protenix-v2, and AlphaFold 3.
+- **Co-folding ensemble:** Boltz-2, Boltz-2x, Protenix (v1.0.0 checkpoint), and AlphaFold 3.
 - **Template-guided pockets:** local RCSB sequence search (MMseqs2) and structure search (Foldseek) are unioned; bound-ligand centroids are transferred only after structural alignment and clustered into consensus pockets.
 - **Independent pose generation:** co-folded, P2Rank, SwinSite, and template-consensus pockets drive Vina and AutoDock-GPU tracks; MCS-guided ligand alignment is an additional, conditional track.
 - **Pose selection:** receptor-frame RMSD-Pred scoring (`LSCORE = 1 - P(RMSD > 2 A)`) selects up to five diverse models for CASP LG output.
@@ -34,7 +34,7 @@ External models, RCSB search databases, and GPU inference are configured separat
 
 ## Scope
 
-Mosaic-PL orchestrates external ML models (Boltz2/2x, Protenix v2, AlphaFold3), **union template search (MMseqs2 + Foldseek)** with cross-source pocket consensus, binding-site prediction (P2Rank, SwinSite, **template-consensus pockets**), docking (Vina, AutoDock-GPU, Protenix-Dock), and post-analysis (BA-Pred, RMSD-Pred).
+Mosaic-PL orchestrates external ML models (Boltz2/2x, Protenix (v1.0.0 checkpoint), AlphaFold3), **union template search (MMseqs2 + Foldseek)** with cross-source pocket consensus, binding-site prediction (P2Rank, SwinSite, **template-consensus pockets**), docking (Vina, AutoDock-GPU, Protenix-Dock), and post-analysis (BA-Pred, RMSD-Pred).
 
 ## Research Workflows
 
@@ -173,7 +173,7 @@ bash scripts/build_search_dbs.sh                      # MMseqs2 + Foldseek DBs
 | Tool | venv / Location | Purpose |
 |------|----------------|---------|
 | Boltz2 | `.venvs/boltz` (Py3.12) | Co-folding + affinity |
-| Protenix v2 | `.venvs/protenix` (Py3.12) | Co-folding |
+| Protenix (v1.0.0 checkpoint) | `.venvs/protenix` (Py3.12) | Co-folding |
 | AlphaFold3 | `.venvs/alphafold3` (Py3.12) | Co-folding (JAX) |
 | Protenix-Dock | `.venvs/protenix-dock` (micromamba) | Classical docking |
 | Vina | `.venvs/protenix-dock` (shared) | Classical docking |
@@ -491,7 +491,7 @@ Cofolding and Track 1 docking run with multiple seeds for pose diversity:
 | Stage | Multi-seed | Details |
 |-------|-----------|---------|
 | Boltz-2 / Boltz-2x | 5 seeds × 5 samples | 25 structures per model |
-| Protenix v2 | 5 seeds × 5 samples | 25 structures |
+| Protenix (v1.0.0 checkpoint) | 5 seeds × 5 samples | 25 structures |
 | AlphaFold3 | native `num_seeds` × `num_diffusion_samples` | 25 structures |
 | Vina | 5 seeds | via `DOCK_SEED` env var |
 | AutoDock-GPU | 5 seeds | via `DOCK_SEED` env var |
@@ -602,7 +602,7 @@ boltz:
 
 protenix:
   enabled: true
-  model_name: protenix-v2       # or protenix_base_default_v1.0.0
+  model_name: protenix_base_default_v1.0.0
   use_tfg_guidance: false
 
 alphafold3:
@@ -742,7 +742,7 @@ Full pipeline measured on CASP16 L2000 (cathepsin target, split into L2001 / L20
 | Template search (MMseqs2 + ligand filter) | 13s | 3s | ✓ |
 | Boltz-2 (5 seeds × 5 samples) | 622s | 600s | ✓ |
 | Boltz-2x (5 seeds × 5 samples) | 740s | 680s | ✓ |
-| Protenix v2 (5 seeds × 5 samples) | 492s | 484s | ✓ |
+| Protenix (v1.0.0 checkpoint) (5 seeds × 5 samples) | 492s | 484s | ✓ |
 | Bridge: Boltz MSA → AF3 | <1s | <1s | ✓ |
 | AlphaFold3 (25 structures) | 353s | 393s | ✓ |
 | Bridge: Docking prep (auto-select + SwinSite/P2Rank + SMILES→SDF/PDBQT) | <5s | <5s | ✓ |

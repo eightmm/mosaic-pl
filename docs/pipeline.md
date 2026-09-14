@@ -87,7 +87,7 @@ template-search-sequence (mmseqs)
 | 도구 | 위치 | Python | 핵심 의존성 | 주요 SLURM 파티션 |
 |---|---|---|---|---|
 | Boltz-2 / Boltz-2x | `.venvs/boltz` | 3.12 | torch 2.11 + CUDA 13.0 + cuequivariance | `6000ada`, `heavy` |
-| Protenix v2 | `.venvs/protenix` | 3.12 | torch 2.7 + CUDA 12.6 + cuequivariance | `6000ada`, `heavy` |
+| Protenix (v1.0.0 checkpoint) | `.venvs/protenix` | 3.12 | torch 2.7 + CUDA 12.6 + cuequivariance | `6000ada`, `heavy` |
 | AlphaFold3 | `.venvs/alphafold3` | 3.12 | JAX + 자체 CUDA `LD_LIBRARY_PATH` runner (`run_alphafold3.sh`) | `6000ada` (sm_86 ~ sm_89) |
 | Protenix-Dock + Vina | `.venvs/protenix-dock` | 3.11 micromamba | ambertools / tleap (conda-only) + pxdock | `6000ada` |
 | AutoDock-GPU + autogrid4 | `.local/bin/` | — | CUDA 바이너리 + C++ 바이너리 (별도 venv 없음) | `6000ada` |
@@ -180,7 +180,7 @@ template-search-sequence (mmseqs)
 |---|---|---:|---|
 | Boltz-2 | `.venvs/boltz` | ~10 min | 구조 + confidence + MSA + affinity |
 | Boltz-2x | `.venvs/boltz` | ~12 min | + `use_potentials=true` (constraints) |
-| Protenix v2 | `.venvs/protenix` | ~8 min | 구조 + confidence |
+| Protenix (v1.0.0 checkpoint) | `.venvs/protenix` | ~8 min | 구조 + confidence |
 | AlphaFold3 | `.venvs/alphafold3` | ~6 min | + ranking, native multi-seed (loop 불필요) |
 
 > RTX 6000 Ada 단일 GPU, CASP16 L2001/L2002 기준. `cofolding_seeds=[42,101,202,303,404]`.
@@ -656,7 +656,7 @@ gantt
     section Co-folding
     Boltz-2 (5×5)                :13, 635
     Boltz-2x (5×5)               :635, 1375
-    Protenix v2 (5×5)            :1375, 1867
+    Protenix (v1.0.0 checkpoint) (5×5)            :1375, 1867
     AF3 (25 structs)             :1870, 2223
 
     section Docking
@@ -674,7 +674,7 @@ gantt
 | Template search (mmseqs + filter) | 13 s | 3 s | foldseek 추가 시 +30 s ~ 2 min |
 | Boltz-2 (25 structs) | 622 s | 600 s | + affinity |
 | Boltz-2x (25 structs) | 740 s | 680 s | + affinity + potentials |
-| Protenix v2 (25 structs) | 492 s | 484 s | |
+| Protenix (v1.0.0 checkpoint) (25 structs) | 492 s | 484 s | |
 | AlphaFold3 (25 structs) | 353 s | 393 s | |
 | Docking prep bridge | <5 s | <5 s | |
 | Vina (5 seeds × N variants) | 254 s | 130 s | |

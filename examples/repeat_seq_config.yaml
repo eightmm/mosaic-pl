@@ -18,7 +18,7 @@ boltz:
 protenix:
   enabled: true
   binary: .venvs/protenix/bin/protenix
-  model_name: protenix-v2
+  model_name: protenix_base_default_v1.0.0
   cycle: 10
   step: 200
   sample: 5

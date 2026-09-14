@@ -261,7 +261,7 @@ class BoltzConfig:
 class ProtenixConfig:
     enabled: bool = True
     binary: str = ".venvs/protenix/bin/protenix"
-    model_name: str = "protenix-v2"
+    model_name: str = "protenix_base_default_v1.0.0"
     cycle: int = 10
     step: int = 200
     sample: int = 5
@@ -299,7 +299,7 @@ class ProtenixConfig:
         return cls(
             enabled=_to_bool(data.get("enabled"), True),
             binary=str(data.get("binary", ".venvs/protenix/bin/protenix")),
-            model_name=str(data.get("model_name", "protenix-v2")),
+            model_name=str(data.get("model_name", "protenix_base_default_v1.0.0")),
             cycle=int(data.get("cycle", 10)),
             step=int(data.get("step", 200)),
             sample=int(data.get("sample", 5)),
